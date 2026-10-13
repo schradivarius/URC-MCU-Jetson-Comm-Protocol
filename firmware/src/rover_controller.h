@@ -1,27 +1,18 @@
 // rover_controller.h -- The rover's command/safety state machine.
 //
 // PURE C++. No Arduino.h, no FlexCAN, no hardware, and the clock is injected.
-// That is the whole point: this is the safety-critical code, so it must be
-// testable natively with a fake clock rather than only observable by watching
-// a board. tests/cpp/test_controller.cpp drives it with time it controls.
+// That is the point: this is the safety-critical code, so it must be testable
+// natively with a fake clock rather than only observable by watching a board.
 //
-// This file is a near line-for-line port of the CircuitPython controller.py.
-// It survived the move from UART to CAN untouched in substance, because none
-// of it ever knew how bytes reached it -- which is exactly why it was a
-// separate module in the first place.
-//
-// THE ONE REAL DIFFERENCE FROM THE PYTHON VERSION: millis() WRAPS.
-//   CircuitPython's time.monotonic_ns() is a 64-bit nanosecond counter that
-//   will not wrap in any mission this rover survives, so plain subtraction was
-//   safe. Arduino/Teensy millis() is uint32_t and wraps every ~49.7 days.
-//
-//   Unsigned subtraction handles that correctly ON ITS OWN -- (now - then) is
-//   computed modulo 2^32, so it stays right across the wrap, provided the
-//   real interval is under 49.7 days. What is NOT safe is comparing
-//   timestamps directly (now > deadline), which breaks the moment the counter
-//   wraps past the deadline. So every time comparison in this file is written
-//   as an elapsed-time subtraction, never as a comparison of two timestamps.
-//   test_controller.cpp exercises this across the wrap boundary explicitly.
+// THE millis() WRAP, which the CircuitPython original did not have
+//   CircuitPython's monotonic_ns() is a 64-bit nanosecond counter that will not
+//   wrap in any mission this rover survives. Arduino millis() is uint32_t and
+//   wraps every ~49.7 days. Unsigned subtraction handles that correctly on its
+//   own -- (now - then) is computed modulo 2^32 -- but comparing timestamps
+//   directly (now >= then + timeout) does NOT: it breaks the moment the counter
+//   wraps past the deadline. So every time comparison here is an elapsed-time
+//   SUBTRACTION, never a comparison of two timestamps. The same reasoning
+//   applies to sequence numbers; see seqDelta().
 
 #ifndef ROVER_CONTROLLER_H
 #define ROVER_CONTROLLER_H
@@ -32,13 +23,13 @@
 
 namespace rover {
 
-// Injected clock. On the Teensy this is `millis`. In tests it is a counter
-// the test advances by hand, so watchdog behaviour is checked deterministically
+// Injected clock. On the Teensy this is `millis`. In tests it is a counter the
+// test advances by hand, so watchdog behaviour is checked deterministically
 // instead of with sleeps.
 typedef uint32_t (*MillisFn)();
 
-static const uint32_t DEFAULT_WATCHDOG_TIMEOUT_MS = 300;
-static const uint32_t DEFAULT_TELEMETRY_PERIOD_MS = 50;  // 20 Hz
+// DEFAULT_WATCHDOG_TIMEOUT_MS, DEFAULT_TELEMETRY_PERIOD_MS and
+// LINK_DEGRADED_HOLD_MS come from rover_config.h (via rover_protocol.h).
 
 class RoverController {
 public:
@@ -46,58 +37,127 @@ public:
                              uint32_t watchdog_timeout_ms = DEFAULT_WATCHDOG_TIMEOUT_MS,
                              uint32_t telemetry_period_ms = DEFAULT_TELEMETRY_PERIOD_MS);
 
-    // Feed one received CAN frame. Returns true if it was a CONTROL frame that
-    // was accepted (correct id AND correct DLC). Anything else is ignored and
-    // -- critically -- does NOT refresh the watchdog.
+    // Feed one received CAN frame. Returns true only if it was a CONTROL frame
+    // that fully validated (right id, right DLC, good CRC, known mode, clean
+    // flags, drive/steer within CMD_MIN..CMD_MAX). Anything else is ignored
+    // and -- critically -- does NOT refresh the command watchdog.
     bool ingestFrame(uint32_t can_id, const uint8_t* buf, uint8_t len);
 
-    // Milliseconds since the last accepted CONTROL frame, or CMD_AGE_UNKNOWN.
-    uint16_t cmdAgeMs() const;
+    // --- safety ----------------------------------------------------------
 
-    // True if no valid CONTROL frame has arrived within the watchdog timeout.
-    // True at boot, before anything has ever arrived.
+    uint16_t cmdAgeMs() const;
     bool watchdogTripped() const;
 
-    // The mode the rover is actually executing: the commanded mode, or
-    // MODE_FAULT when a link that mode needs is gone -- the Jetson (heartbeat
-    // lost, any mode) or the operator (C2 lost while in TELEOP). Autonomy
-    // keeps running without C2. See PROTOCOL.md section 3.1.
+    // The mode the rover is actually EXECUTING, which is not always the one it
+    // was commanded: MODE_FAULT when a link that mode needs is gone -- the
+    // Jetson (comm timeout, any mode, including before the first frame) or the
+    // operator (C2 lost while in TELEOP). Otherwise the commanded mode.
+    // Recomputed on every call, not latched: once the link is back, the rover
+    // is in whatever mode was last commanded.
     uint8_t activeMode() const;
 
-    // THE fail-safe decision, and the one place "should the rover be moving?"
-    // is answered: only while the active mode permits motion (a whitelist,
-    // issue #4) and the stop flag is clear.
+    // THE fail-safe decision. An explicit stop flag, an active mode that does
+    // not positively permit motion (which covers SAFE, a comm timeout and a
+    // lost C2 link in TELEOP, via MODE_FAULT) and an autonomy abort while in
+    // AUTONOMOUS all force a stop through this one function, so there is
+    // exactly one place where "should the rover be moving?" is answered.
+    //
+    // The comm timeout and the C2 rule are deliberately different. A silent
+    // Jetson stops the rover in EVERY mode, because nothing is driving it. C2
+    // loss stops it only in TELEOP, because an autonomous Jetson keeps driving
+    // perfectly well without the base station -- and the autonomy course is
+    // laid out so that it has to.
+    //
+    // The mode test is a whitelist (modePermitsMotion), not "== SAFE":
+    // asking only about SAFE let every undefined mode read as drivable.
     bool effectiveStop() const;
-
-    // The status light for the active mode (PROTOCOL.md section 3.4).
-    uint8_t indicatorState() const;
 
     // The drive/steer actually permitted right now: zeroed under stop, so a
     // caller cannot accidentally act on a stale command.
     void commandedOutputs(int16_t& drive, int16_t& steer) const;
 
+    // --- transmit scheduling ---------------------------------------------
+
     // True once per telemetry period. Self-pacing, and it will not burst out a
-    // backlog after a stalled loop.
+    // backlog after a stalled loop. Advances the telemetry sequence number, so
+    // call it ONCE per cycle and stamp all four frames with telemetrySeq().
     bool telemetryDue();
 
-    // Assemble the status frame, OR-ing in JETSON_HEARTBEAT_LOST when the watchdog has
-    // tripped so the fault can never be reported inconsistently with cmdAgeMs.
-    TelemetryStatus buildStatus(int16_t steer_fb, int16_t current_ca,
-                                uint8_t sensor_faults = 0,
-                                uint8_t extra_faults = 0) const;
+    // The sequence number for the current cycle. All four telemetry frames of
+    // one cycle share it, which is how the Jetson tells a coherent snapshot
+    // from one torn across two cycles.
+    uint8_t telemetrySeq() const { return telemetry_seq_; }
+
+    // --- telemetry builders ----------------------------------------------
+
+    TelemetryDriveL buildDriveL(int32_t enc_left, int16_t steer_fb) const;
+    TelemetryDriveR buildDriveR(int32_t enc_right) const;
+    TelemetryPower  buildPower(int16_t current_ca, int16_t voltage_cv,
+                               uint16_t sensor_faults = 0,
+                               uint16_t extra_faults = 0) const;
+    TelemetryState  buildState(uint8_t controller_health = CTRL_HEALTH_NOT_REPORTED) const;
+
+    // Every fault the controller itself knows about, OR-ed together. Exposed
+    // so the firmware can report the same word it acts on.
+    uint16_t faultWord(uint16_t sensor_faults = 0, uint16_t extra_faults = 0) const;
+
+    // --- link and indicator state ----------------------------------------
+
+    // LINK_* for the Jetson link, derived from the command watchdog and from
+    // recent sequence gaps or CRC errors. NOT merged with the C2 link: the
+    // 2027 autonomy course deliberately includes areas with no C2
+    // line-of-sight while onboard autonomy keeps working, so collapsing the
+    // two would stop the rover exactly where it is supposed to keep going.
+    uint8_t jetsonLinkState() const;
+
+    // LINK_* for the base-station (C2) link. REPORTED, never derived from the
+    // Jetson link: the controller has no radio and cannot observe C2 at all,
+    // so this is only ever the c2_lost bit the Jetson forwarded.
+    //
+    // PLACEHOLDER FOR THE PLANNED CONTROLLER-SIDE RADIO: this function is the
+    // single swap point. c2_link is already a locally-measurable enum in a
+    // byte of its own -- jetson_link beside it is measured locally using the
+    // same four values -- so measuring C2 here instead of taking it from the
+    // wire changes no byte of any frame. Read PROTOCOL.md 3.5.2 first: the
+    // three open questions are policy, not format, and the debounce one is
+    // the one that bites. A raw local reading has none of the smoothing
+    // C2Monitor applies on the Jetson today, so marginal RF would stop and
+    // release a TELEOP rover repeatedly.
+    //
+    // It goes LINK_NOT_REPORTED in two cases, both of them honest "we do not
+    // know" rather than a misleading LINK_OK:
+    //   * no valid CONTROL frame has ever arrived -- nobody has told us;
+    //   * the command watchdog has tripped -- what we were told is STALE. A
+    //     clear bit from ten seconds ago does not mean C2 is fine now, and a
+    //     set bit does not mean it is still down.
+    uint8_t c2LinkState() const;
+
+    // What the status indicator should actually show. URC scores this light on
+    // what the rover is ACTUALLY doing, and the controller knows its own mode,
+    // so the Jetson's request is honoured only where it agrees with that mode.
+    // See PROTOCOL.md 3.5 for the rule table.
+    uint8_t indicatorState() const;
+
+    // --- accessors --------------------------------------------------------
 
     const ControlMsg& lastControl() const { return last_control_; }
+    bool autonomyAbort() const { return last_control_.autonomy_abort; }
+    bool returnRequest() const { return last_control_.return_request; }
+    bool c2Lost() const { return last_control_.c2_lost; }
+
     uint32_t controlFramesAccepted() const { return control_frames_accepted_; }
     uint32_t framesIgnored() const { return frames_ignored_; }
+    uint32_t seqGapsSeen() const { return seq_gaps_seen_; }
+    uint32_t crcErrorsSeen() const { return crc_errors_seen_; }
+    uint32_t framesLostEstimate() const { return frames_lost_estimate_; }
 
-    // True when the most recent frame addressed to CAN_ID_CONTROL could not be
-    // interpreted (wrong DLC, or a mode this firmware does not define). Clears
-    // when a valid frame arrives, so it reports a live condition rather than
-    // latching for the session. Surfaced as FAULT_PROTOCOL_ERROR.
-    bool protocolError() const { return protocol_error_; }
+    // The reason the most recent frame on CAN_ID_CONTROL was rejected, or
+    // DECODE_OK if it was accepted.
+    DecodeResult lastDecodeResult() const { return last_decode_; }
 
 private:
     uint32_t elapsedSinceControl() const;
+    bool recentlyDegraded() const;
 
     MillisFn now_ms_;
     uint32_t watchdog_timeout_ms_;
@@ -107,9 +167,23 @@ private:
     bool       have_control_;
     uint32_t   last_control_ms_;
     uint32_t   next_telemetry_ms_;
+    uint8_t    telemetry_seq_;
+
+    bool       have_seq_;
+    uint8_t    last_seq_;
+
+    DecodeResult last_decode_;
+    bool       protocol_error_;
+    bool       crc_error_;
+    bool       seq_gap_;
+    uint32_t   last_degraded_ms_;
+    bool       ever_degraded_;
+
     uint32_t   control_frames_accepted_;
     uint32_t   frames_ignored_;
-    bool       protocol_error_;
+    uint32_t   seq_gaps_seen_;
+    uint32_t   crc_errors_seen_;
+    uint32_t   frames_lost_estimate_;
 };
 
 }  // namespace rover
