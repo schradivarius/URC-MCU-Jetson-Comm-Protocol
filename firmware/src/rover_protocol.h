@@ -169,7 +169,10 @@ enum : uint16_t {
 static const int32_t INT32_MIN_V = -2147483647 - 1;
 static const int32_t INT32_MAX_V = 2147483647;
 
-bool isKnownMode(uint8_t mode);
+// isCommandableMode: may the Jetson send this mode in CONTROL? SAFE is a
+// legitimate command meaning "do not move"; FAULT is not -- only the
+// controller enters it (RoverController::activeMode()).
+bool isCommandableMode(uint8_t mode);
 bool modePermitsMotion(uint8_t mode);
 bool isKnownIndicator(uint8_t indicator);
 

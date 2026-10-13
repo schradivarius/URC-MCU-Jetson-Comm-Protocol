@@ -36,9 +36,10 @@ SHARED = {
     "CAN_ID_TELEM_DRIVE_R":  "CAN_ID_TELEM_DRIVE_R",
     "CAN_ID_TELEM_POWER":    "CAN_ID_TELEM_POWER",
     "CAN_ID_TELEM_STATE":    "CAN_ID_TELEM_STATE",
-    "MODE_DISABLED":         "MODE_DISABLED",
-    "MODE_MANUAL":           "MODE_MANUAL",
+    "MODE_SAFE":             "MODE_SAFE",
+    "MODE_TELEOP":           "MODE_TELEOP",
     "MODE_AUTONOMOUS":       "MODE_AUTONOMOUS",
+    "MODE_FAULT":            "MODE_FAULT",
     "CMD_MIN":               "CMD_MIN",
     "CMD_MAX":               "CMD_MAX",
 }
@@ -106,9 +107,10 @@ class TestConfigSync(unittest.TestCase):
             self.assertIn(name, self.cpp,
                           "%s belongs in rover_config.h" % name)
 
-    def test_mode_max_is_the_highest_defined_mode(self):
+    def test_mode_max_is_the_highest_commandable_mode(self):
         # C++ defines MODE_MAX as MODE_AUTONOMOUS (checked by name above).
-        self.assertEqual(cfg.MODE_MAX, max(rp.KNOWN_MODES))
+        # MODE_FAULT is higher but is never sent, so it does not count.
+        self.assertEqual(cfg.MODE_MAX, max(rp.COMMANDABLE_MODES))
 
     def test_link_timeout_is_longer_than_a_telemetry_period(self):
         # Otherwise the Jetson would report the link down between two
@@ -122,7 +124,7 @@ class TestConfigSync(unittest.TestCase):
     def test_c2_timeout_is_longer_than_the_command_watchdog(self):
         # A radio drops packets far more often than a CAN bus, so the C2
         # timeout must not be as tight as the command watchdog. If these ever
-        # converge, a single radio hiccup starts stopping the rover in MANUAL.
+        # converge, a single radio hiccup starts stopping the rover in TELEOP.
         self.assertGreater(cfg.C2_TIMEOUT_S * 1000, cfg.WATCHDOG_TIMEOUT_MS)
 
     def test_c2_monitor_defaults_to_the_configured_timeout(self):

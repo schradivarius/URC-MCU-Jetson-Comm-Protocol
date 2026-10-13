@@ -37,7 +37,7 @@ static bool sendControl(RoverController& ctl, int16_t drive, int16_t steer,
 
 static bool sendWithSeq(RoverController& ctl, uint8_t seq, int16_t drive = 400) {
     ControlMsg m;
-    m.drive_cmd = drive; m.steer_cmd = 0; m.mode = MODE_MANUAL;
+    m.drive_cmd = drive; m.steer_cmd = 0; m.mode = MODE_TELEOP;
     m.stop = false; m.autonomy_abort = false; m.return_request = false;
     m.c2_lost = false;
     m.indicator_request = INDICATOR_OFF; m.seq = seq;
@@ -47,12 +47,13 @@ static bool sendWithSeq(RoverController& ctl, uint8_t seq, int16_t drive = 400) 
 
 // --- boot and basic release -------------------------------------------------
 
-static void boots_stopped_and_disabled() {
+static void boots_stopped_and_safe() {
     RoverController ctl = freshController();
     CHECK(ctl.effectiveStop());
     CHECK(ctl.watchdogTripped());
     CHECK_EQ(ctl.cmdAgeMs(), CMD_AGE_UNKNOWN);
-    CHECK_EQ(ctl.lastControl().mode, MODE_DISABLED);
+    CHECK_EQ(ctl.lastControl().mode, MODE_SAFE);
+    CHECK_EQ(ctl.activeMode(), MODE_FAULT);   // nobody has spoken yet
     CHECK_EQ(ctl.jetsonLinkState(), LINK_LOST);
     int16_t d, s; ctl.commandedOutputs(d, s);
     CHECK_EQ(d, 0); CHECK_EQ(s, 0);
@@ -60,7 +61,7 @@ static void boots_stopped_and_disabled() {
 
 static void valid_control_releases_the_stop() {
     RoverController ctl = freshController();
-    CHECK(sendControl(ctl, 500, 100, MODE_MANUAL, false));
+    CHECK(sendControl(ctl, 500, 100, MODE_TELEOP, false));
     CHECK(!ctl.effectiveStop());
     CHECK_EQ(ctl.jetsonLinkState(), LINK_OK);
     int16_t d, s; ctl.commandedOutputs(d, s);
@@ -71,7 +72,7 @@ static void valid_control_releases_the_stop() {
 
 static void watchdog_trips_exactly_at_the_boundary() {
     RoverController ctl = freshController();
-    sendControl(ctl, 500, 0, MODE_MANUAL, false);
+    sendControl(ctl, 500, 0, MODE_TELEOP, false);
     advance(299);
     CHECK(!ctl.watchdogTripped());
     advance(1);
@@ -86,7 +87,7 @@ static void watchdog_is_correct_across_millis_wraparound() {
     // FAILS against a timestamp comparison (now >= then + timeout) -- verified
     // by building one deliberately.
     RoverController ctl = freshController(0xFFFFFF00u);
-    sendControl(ctl, 500, 0, MODE_MANUAL, false);
+    sendControl(ctl, 500, 0, MODE_TELEOP, false);
 
     // CRITICAL pre-wrap check. A naive deadline (last + 300) has itself
     // wrapped to a tiny number here, so a huge pre-wrap `now` compares greater
@@ -107,7 +108,7 @@ static void watchdog_is_correct_across_millis_wraparound() {
 // --- the stop triggers ------------------------------------------------------
 
 static void explicit_stop_flag_wins_in_any_mode() {
-    const uint8_t modes[] = {MODE_MANUAL, MODE_AUTONOMOUS};
+    const uint8_t modes[] = {MODE_TELEOP, MODE_AUTONOMOUS};
     for (uint8_t mode : modes) {
         RoverController ctl = freshController();
         sendControl(ctl, 1000, 500, mode, true);
@@ -119,15 +120,15 @@ static void explicit_stop_flag_wins_in_any_mode() {
 
 static void stop_is_releasable_without_a_mode_change() {
     RoverController ctl = freshController();
-    sendControl(ctl, 500, 0, MODE_MANUAL, true);
+    sendControl(ctl, 500, 0, MODE_TELEOP, true);
     CHECK(ctl.effectiveStop());
-    sendControl(ctl, 500, 0, MODE_MANUAL, false);
+    sendControl(ctl, 500, 0, MODE_TELEOP, false);
     CHECK(!ctl.effectiveStop());
 }
 
 static void disabled_mode_forces_stop_at_full_throttle() {
     RoverController ctl = freshController();
-    sendControl(ctl, 1000, 1000, MODE_DISABLED, false);
+    sendControl(ctl, 1000, 1000, MODE_SAFE, false);
     CHECK(ctl.effectiveStop());
 }
 
@@ -158,10 +159,10 @@ static void autonomy_abort_stops_an_autonomous_rover() {
 }
 
 static void autonomy_abort_does_not_stop_a_teleoperated_rover() {
-    // In MANUAL the operator is already driving; there is no autonomous task
+    // In TELEOP the operator is already driving; there is no autonomous task
     // to abort, and stopping would surprise them mid-manoeuvre.
     RoverController ctl = freshController();
-    sendControl(ctl, 800, 0, MODE_MANUAL, false, /*abort=*/true);
+    sendControl(ctl, 800, 0, MODE_TELEOP, false, /*abort=*/true);
     CHECK(ctl.autonomyAbort());
     CHECK(!ctl.effectiveStop());
     int16_t d, s; ctl.commandedOutputs(d, s);
@@ -180,7 +181,7 @@ static void return_request_is_carried_but_does_not_stop() {
 
 static void wrong_dlc_does_not_refresh_the_watchdog() {
     RoverController ctl = freshController();
-    sendControl(ctl, 500, 0, MODE_MANUAL, false);
+    sendControl(ctl, 500, 0, MODE_TELEOP, false);
     advance(290);
     uint8_t buf[8] = {0};
     CHECK(!ctl.ingestFrame(CAN_ID_CONTROL, buf, 4));
@@ -193,11 +194,11 @@ static void a_bad_crc_does_not_refresh_the_watchdog() {
     // The app-layer CRC's whole purpose: a frame corrupted in the software
     // path is rejected, and a rejected frame must not keep the rover alive.
     RoverController ctl = freshController();
-    sendControl(ctl, 500, 0, MODE_MANUAL, false);
+    sendControl(ctl, 500, 0, MODE_TELEOP, false);
     advance(290);
     for (int i = 0; i < 5; ++i) {
         ControlMsg m;
-        m.drive_cmd = 1000; m.steer_cmd = 0; m.mode = MODE_MANUAL;
+        m.drive_cmd = 1000; m.steer_cmd = 0; m.mode = MODE_TELEOP;
         m.stop = false; m.autonomy_abort = false; m.return_request = false;
         m.indicator_request = INDICATOR_OFF; m.seq = static_cast<uint8_t>(i);
         uint8_t buf[8] = {0};
@@ -214,11 +215,11 @@ static void a_bad_crc_does_not_refresh_the_watchdog() {
 
 static void foreign_can_id_does_not_refresh_the_watchdog() {
     RoverController ctl = freshController();
-    sendControl(ctl, 500, 0, MODE_MANUAL, false);
+    sendControl(ctl, 500, 0, MODE_TELEOP, false);
     advance(290);
     uint8_t buf[8] = {0};
     ControlMsg m;
-    m.drive_cmd = 999; m.steer_cmd = 0; m.mode = MODE_MANUAL;
+    m.drive_cmd = 999; m.steer_cmd = 0; m.mode = MODE_TELEOP;
     m.stop = false; m.autonomy_abort = false; m.return_request = false;
     m.indicator_request = INDICATOR_OFF; m.seq = 9;
     encodeControl(m, buf);
@@ -230,7 +231,7 @@ static void foreign_can_id_does_not_refresh_the_watchdog() {
 
 static void out_of_range_command_never_moves_the_rover() {
     RoverController ctl = freshController();
-    CHECK(!sendControl(ctl, CMD_MAX + 1, 0, MODE_MANUAL, false));
+    CHECK(!sendControl(ctl, CMD_MAX + 1, 0, MODE_TELEOP, false));
     int16_t drive = -1, steer = -1;
     ctl.commandedOutputs(drive, steer);
     CHECK_EQ(drive, 0);
@@ -242,10 +243,10 @@ static void out_of_range_command_does_not_refresh_the_watchdog() {
     // disagrees with us about the scale must not be able to keep the rover
     // alive on commands we never understood.
     RoverController ctl = freshController();
-    CHECK(sendControl(ctl, 500, 0, MODE_MANUAL, false));
+    CHECK(sendControl(ctl, 500, 0, MODE_TELEOP, false));
     advance(290);
     CHECK(!ctl.watchdogTripped());
-    for (int i = 0; i < 5; ++i) sendControl(ctl, 30000, 0, MODE_MANUAL, false);
+    for (int i = 0; i < 5; ++i) sendControl(ctl, 30000, 0, MODE_TELEOP, false);
     advance(20);
     CHECK(ctl.watchdogTripped());
     CHECK_EQ(ctl.lastControl().drive_cmd, 500);     // not overwritten
@@ -255,10 +256,10 @@ static void out_of_range_command_is_reported_as_a_protocol_error() {
     // A stop must be explainable. A rover that halts while telemetry reads
     // "no faults" is its own hazard.
     RoverController ctl = freshController();
-    sendControl(ctl, 0, CMD_MIN - 1, MODE_MANUAL, false);
+    sendControl(ctl, 0, CMD_MIN - 1, MODE_TELEOP, false);
     CHECK(ctl.faultWord() & FAULT_PROTOCOL_ERROR);
     CHECK(!(ctl.faultWord() & FAULT_CRC_ERROR));    // not a corruption fault
-    CHECK(sendControl(ctl, 0, CMD_MIN, MODE_MANUAL, false));   // full scale is fine
+    CHECK(sendControl(ctl, 0, CMD_MIN, MODE_TELEOP, false));   // full scale is fine
     CHECK(!(ctl.faultWord() & FAULT_PROTOCOL_ERROR));          // and self-clears
 }
 
@@ -266,7 +267,7 @@ static void a_foreign_id_is_not_a_fault() {
     // Other traffic on a shared bus is normal. Flagging it would make the
     // protocol-error bit permanently on and therefore useless.
     RoverController ctl = freshController();
-    sendControl(ctl, 400, 0, MODE_MANUAL, false);
+    sendControl(ctl, 400, 0, MODE_TELEOP, false);
     uint8_t buf[8] = {0};
     ctl.ingestFrame(0x321, buf, 8);
     CHECK(!(ctl.faultWord() & FAULT_PROTOCOL_ERROR));
@@ -373,7 +374,7 @@ static void the_c2_link_is_never_derived_from_the_jetson_link() {
 }
 
 static void c2_loss_stops_a_teleoperated_rover_but_not_an_autonomous_one() {
-    // The asymmetry is the whole point. In MANUAL the operator's commands can
+    // The asymmetry is the whole point. In TELEOP the operator's commands can
     // no longer arrive, so nobody is driving. In AUTONOMOUS the Jetson IS
     // driving, and is provably alive or the watchdog would have stopped us.
     RoverController ctl = freshController();
@@ -385,7 +386,7 @@ static void c2_loss_stops_a_teleoperated_rover_but_not_an_autonomous_one() {
     ctl.commandedOutputs(drive, steer);
     CHECK_EQ(drive, 800);
 
-    sendControl(ctl, 800, 0, MODE_MANUAL, false, false, false,
+    sendControl(ctl, 800, 0, MODE_TELEOP, false, false, false,
                 INDICATOR_TELEOP, /*c2_lost=*/true);
     CHECK(ctl.effectiveStop());
     ctl.commandedOutputs(drive, steer);
@@ -393,16 +394,16 @@ static void c2_loss_stops_a_teleoperated_rover_but_not_an_autonomous_one() {
 
     // And it releases again when the Jetson says the link is back, without a
     // mode round trip.
-    sendControl(ctl, 800, 0, MODE_MANUAL, false, false, false,
+    sendControl(ctl, 800, 0, MODE_TELEOP, false, false, false,
                 INDICATOR_TELEOP, /*c2_lost=*/false);
     CHECK(!ctl.effectiveStop());
 }
 
 static void the_c2_fault_is_raised_in_every_mode() {
-    // It only stops the rover in MANUAL, but during an autonomous run it is
+    // It only stops the rover in TELEOP, but during an autonomous run it is
     // the single sign that the rover is out of contact, so it must be
     // reported whether or not it changes the driving.
-    const uint8_t modes[] = {MODE_DISABLED, MODE_MANUAL, MODE_AUTONOMOUS};
+    const uint8_t modes[] = {MODE_SAFE, MODE_TELEOP, MODE_AUTONOMOUS};
     for (uint8_t mode : modes) {
         RoverController ctl = freshController();
         sendControl(ctl, 0, 0, mode, false, false, false, INDICATOR_OFF,
@@ -442,8 +443,104 @@ static void state_echoes_the_mode_the_controller_believes_in() {
     RoverController ctl = freshController();
     sendControl(ctl, 500, 0, MODE_AUTONOMOUS, false);
     CHECK_EQ(ctl.buildState().mode, MODE_AUTONOMOUS);
-    sendControl(ctl, 0, 0, MODE_DISABLED, false);
-    CHECK_EQ(ctl.buildState().mode, MODE_DISABLED);
+    sendControl(ctl, 0, 0, MODE_SAFE, false);
+    CHECK_EQ(ctl.buildState().mode, MODE_SAFE);
+}
+
+// --- active mode: what the rover is actually executing ----------------------
+
+static void active_mode_follows_the_commanded_mode() {
+    const uint8_t modes[] = {MODE_SAFE, MODE_TELEOP, MODE_AUTONOMOUS};
+    for (uint8_t mode : modes) {
+        RoverController ctl = freshController();
+        sendControl(ctl, 500, 0, mode, false);
+        CHECK_EQ(ctl.activeMode(), mode);
+    }
+}
+
+static void comm_timeout_is_a_fault_in_every_mode() {
+    const uint8_t modes[] = {MODE_SAFE, MODE_TELEOP, MODE_AUTONOMOUS};
+    for (uint8_t mode : modes) {
+        RoverController ctl = freshController();
+        sendControl(ctl, 500, 0, mode, false);
+        advance(DEFAULT_WATCHDOG_TIMEOUT_MS - 1);
+        CHECK_EQ(ctl.activeMode(), mode);          // one ms early: still fine
+        advance(1);
+        CHECK_EQ(ctl.activeMode(), MODE_FAULT);
+    }
+}
+
+static void fault_clears_when_commands_resume() {
+    // Not latched: the controller reports what it is doing NOW.
+    RoverController ctl = freshController();
+    sendControl(ctl, 500, 0, MODE_TELEOP, false);
+    advance(DEFAULT_WATCHDOG_TIMEOUT_MS);
+    CHECK_EQ(ctl.activeMode(), MODE_FAULT);
+    sendControl(ctl, 500, 0, MODE_TELEOP, false);
+    CHECK_EQ(ctl.activeMode(), MODE_TELEOP);
+}
+
+static void c2_loss_faults_teleop_but_not_autonomy() {
+    RoverController ctl = freshController();
+    sendControl(ctl, 500, 0, MODE_TELEOP, false, false, false,
+                INDICATOR_TELEOP, /*c2_lost=*/true);
+    CHECK_EQ(ctl.activeMode(), MODE_FAULT);
+    CHECK(ctl.effectiveStop());
+
+    sendControl(ctl, 500, 0, MODE_AUTONOMOUS, false, false, false,
+                INDICATOR_AUTONOMOUS, /*c2_lost=*/true);
+    CHECK_EQ(ctl.activeMode(), MODE_AUTONOMOUS);
+    CHECK(!ctl.effectiveStop());
+}
+
+static void a_pause_or_abort_is_not_a_fault() {
+    // Commanded stops: the rover is still in the mode it was told, just held.
+    RoverController ctl = freshController();
+    sendControl(ctl, 500, 0, MODE_AUTONOMOUS, /*stop=*/true);
+    CHECK(ctl.effectiveStop());
+    CHECK_EQ(ctl.activeMode(), MODE_AUTONOMOUS);
+
+    sendControl(ctl, 500, 0, MODE_AUTONOMOUS, false, /*abort=*/true);
+    CHECK(ctl.effectiveStop());
+    CHECK_EQ(ctl.activeMode(), MODE_AUTONOMOUS);
+}
+
+static void fault_cannot_be_commanded() {
+    RoverController ctl = freshController();
+    sendControl(ctl, 500, 0, MODE_TELEOP, false);
+    CHECK(!sendControl(ctl, 500, 0, MODE_FAULT, false));
+    CHECK(ctl.faultWord() & FAULT_PROTOCOL_ERROR);
+    CHECK_EQ(ctl.activeMode(), MODE_TELEOP);       // last valid command, until the watchdog
+}
+
+static void stop_decision_is_unchanged_by_active_mode() {
+    // effectiveStop() is now written in terms of activeMode(). Prove it gives
+    // exactly the answer the previous explicit formula gave, in every
+    // combination that formula looked at, so the refactor cannot have moved
+    // the line between stopped and driving.
+    const uint8_t modes[] = {MODE_SAFE, MODE_TELEOP, MODE_AUTONOMOUS};
+    const uint32_t ages[] = {0, DEFAULT_WATCHDOG_TIMEOUT_MS - 1,
+                             DEFAULT_WATCHDOG_TIMEOUT_MS};
+    for (int booted = 0; booted <= 1; ++booted)
+    for (uint8_t mode : modes)
+    for (int stop = 0; stop <= 1; ++stop)
+    for (int abort = 0; abort <= 1; ++abort)
+    for (int c2 = 0; c2 <= 1; ++c2)
+    for (uint32_t age : ages) {
+        RoverController ctl = freshController(0xFFFFFF80u);   // straddles the wrap
+        if (booted) {
+            sendControl(ctl, 500, 0, mode, stop != 0, abort != 0, false,
+                        INDICATOR_OFF, c2 != 0);
+        }
+        advance(age);
+        const ControlMsg& m = ctl.lastControl();
+        const bool old_formula = ctl.watchdogTripped()
+            || m.stop
+            || !modePermitsMotion(m.mode)
+            || (m.autonomy_abort && m.mode == MODE_AUTONOMOUS)
+            || (m.c2_lost && m.mode == MODE_TELEOP);
+        CHECK_EQ(ctl.effectiveStop(), old_formula);
+    }
 }
 
 static void the_indicator_follows_the_mode_the_controller_is_in() {
@@ -463,15 +560,15 @@ static void the_indicator_follows_the_mode_the_controller_is_in() {
     CHECK_EQ(ctl.indicatorState(), INDICATOR_ARRIVED);
 
     // A human-driven rover never shows red or green, whatever is asked for.
-    sendControl(ctl, 500, 0, MODE_MANUAL, false, false, false,
+    sendControl(ctl, 500, 0, MODE_TELEOP, false, false, false,
                 INDICATOR_AUTONOMOUS);
     CHECK_EQ(ctl.indicatorState(), INDICATOR_TELEOP);
-    sendControl(ctl, 500, 0, MODE_MANUAL, false, false, false,
+    sendControl(ctl, 500, 0, MODE_TELEOP, false, false, false,
                 INDICATOR_ARRIVED);
     CHECK_EQ(ctl.indicatorState(), INDICATOR_TELEOP);
 
-    // DISABLED is a legitimate idle state, not a fault.
-    sendControl(ctl, 0, 0, MODE_DISABLED, false, false, false,
+    // SAFE is a legitimate idle state, not a fault.
+    sendControl(ctl, 0, 0, MODE_SAFE, false, false, false,
                 INDICATOR_AUTONOMOUS);
     CHECK_EQ(ctl.indicatorState(), INDICATOR_OFF);
 }
@@ -486,9 +583,9 @@ static void the_indicator_shows_fault_when_nothing_is_driving() {
     CHECK_EQ(ctl.indicatorState(), INDICATOR_FAULT);
     CHECK_EQ(ctl.buildState().indicator_state, INDICATOR_FAULT);
 
-    // C2 lost in MANUAL is the other case where nobody is driving.
+    // C2 lost in TELEOP is the other case where nobody is driving.
     RoverController ctl2 = freshController();
-    sendControl(ctl2, 500, 0, MODE_MANUAL, false, false, false,
+    sendControl(ctl2, 500, 0, MODE_TELEOP, false, false, false,
                 INDICATOR_TELEOP, /*c2_lost=*/true);
     CHECK_EQ(ctl2.indicatorState(), INDICATOR_FAULT);
 }
@@ -519,7 +616,7 @@ static void power_reports_the_same_fault_word_the_controller_acts_on() {
 
 static void drive_r_carries_the_command_age() {
     RoverController ctl = freshController();
-    sendControl(ctl, 500, 0, MODE_MANUAL, false);
+    sendControl(ctl, 500, 0, MODE_TELEOP, false);
     advance(120);
     CHECK_EQ(ctl.buildDriveR(4242).cmd_age_ms, 120);
     CHECK_EQ(ctl.buildDriveR(4242).enc_right, 4242);
@@ -573,7 +670,7 @@ static void telemetry_pacing_is_correct_across_wraparound() {
 
 int main() {
     std::printf("test_controller\n");
-    RUN_TEST(boots_stopped_and_disabled);
+    RUN_TEST(boots_stopped_and_safe);
     RUN_TEST(valid_control_releases_the_stop);
     RUN_TEST(watchdog_trips_exactly_at_the_boundary);
     RUN_TEST(watchdog_is_correct_across_millis_wraparound);
@@ -603,6 +700,13 @@ int main() {
     RUN_TEST(the_c2_fault_is_raised_in_every_mode);
     RUN_TEST(a_stale_c2_bit_is_reported_as_unknown_not_as_ok_or_lost);
     RUN_TEST(state_echoes_the_mode_the_controller_believes_in);
+    RUN_TEST(active_mode_follows_the_commanded_mode);
+    RUN_TEST(comm_timeout_is_a_fault_in_every_mode);
+    RUN_TEST(fault_clears_when_commands_resume);
+    RUN_TEST(c2_loss_faults_teleop_but_not_autonomy);
+    RUN_TEST(a_pause_or_abort_is_not_a_fault);
+    RUN_TEST(fault_cannot_be_commanded);
+    RUN_TEST(stop_decision_is_unchanged_by_active_mode);
     RUN_TEST(the_indicator_follows_the_mode_the_controller_is_in);
     RUN_TEST(the_indicator_shows_fault_when_nothing_is_driving);
     RUN_TEST(a_non_stopping_fault_does_not_blank_the_indicator);

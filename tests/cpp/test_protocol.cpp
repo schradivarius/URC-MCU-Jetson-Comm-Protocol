@@ -115,11 +115,11 @@ static void out_of_range_commands_are_rejected_at_decode() {
     for (int16_t v : bad) {
         uint8_t buf[8] = {0};
         ControlMsg out;
-        encodeControl(makeControl(v, 0, MODE_MANUAL, false, false, false,
+        encodeControl(makeControl(v, 0, MODE_TELEOP, false, false, false,
                                   INDICATOR_OFF, 0), buf);
         CHECK_EQ(decodeControl(CAN_ID_CONTROL, buf, FRAME_DLC, out),
                  DECODE_BAD_RANGE);
-        encodeControl(makeControl(0, v, MODE_MANUAL, false, false, false,
+        encodeControl(makeControl(0, v, MODE_TELEOP, false, false, false,
                                   INDICATOR_OFF, 0), buf);
         CHECK_EQ(decodeControl(CAN_ID_CONTROL, buf, FRAME_DLC, out),
                  DECODE_BAD_RANGE);
@@ -131,7 +131,7 @@ static void the_encoder_still_writes_any_int16() {
     // closed. The encoder stays a faithful serialiser so a test can put a
     // hostile value on the bus.
     uint8_t buf[8] = {0};
-    CHECK_EQ(encodeControl(makeControl(-32768, 32767, MODE_MANUAL, false,
+    CHECK_EQ(encodeControl(makeControl(-32768, 32767, MODE_TELEOP, false,
                                        false, false, INDICATOR_OFF, 0), buf),
              FRAME_DLC);
     CHECK_EQ(buf[0], 0x00); CHECK_EQ(buf[1], 0x80);   // int16 extremes still
@@ -140,20 +140,20 @@ static void the_encoder_still_writes_any_int16() {
 
 static void control_round_trips_every_field() {
     const ControlMsg cases[] = {
-        makeControl(0, 0, MODE_DISABLED, true, false, false, INDICATOR_OFF, 0),
+        makeControl(0, 0, MODE_SAFE, true, false, false, INDICATOR_OFF, 0),
         makeControl(1000, -1000, MODE_AUTONOMOUS, false, false, false,
                     INDICATOR_AUTONOMOUS, 1),
-        makeControl(-1000, 1000, MODE_MANUAL, true, true, true,
+        makeControl(-1000, 1000, MODE_TELEOP, true, true, true,
                     INDICATOR_ARRIVED, 255),
         // Was the int16 extremes case. Those no longer decode -- they are
         // outside CMD_MIN..CMD_MAX, see
         // out_of_range_commands_are_rejected_at_decode -- so this case keeps
         // the flag and indicator combination with in-range commands.
-        makeControl(-999, 999, MODE_MANUAL, false, true, false,
+        makeControl(-999, 999, MODE_TELEOP, false, true, false,
                     INDICATOR_FAULT, 128),
         makeControl(250, -50, MODE_AUTONOMOUS, false, false, false,
                     INDICATOR_AUTONOMOUS, 64, /*c2_lost=*/true),
-        makeControl(0, 0, MODE_MANUAL, true, true, true,
+        makeControl(0, 0, MODE_TELEOP, true, true, true,
                     INDICATOR_ARRIVED, 65, /*c2_lost=*/true),  // every flag set
     };
     for (const ControlMsg& in : cases) {
@@ -178,7 +178,7 @@ static void control_flags_are_independent() {
     // makes two flags move together. Set each alone and check the others stay
     // clear.
     for (int which = 0; which < 4; ++which) {
-        ControlMsg in = makeControl(0, 0, MODE_MANUAL,
+        ControlMsg in = makeControl(0, 0, MODE_TELEOP,
                                     which == 0, which == 1, which == 2,
                                     INDICATOR_OFF, 0, /*c2_lost=*/which == 3);
         uint8_t buf[8] = {0};
@@ -196,7 +196,7 @@ static void control_flags_are_independent() {
 static void indicator_request_survives_alongside_flags() {
     // The indicator lives in bits 3-5 of the same byte as the three booleans.
     for (uint8_t ind = 0; ind <= INDICATOR_FAULT; ++ind) {
-        ControlMsg in = makeControl(0, 0, MODE_MANUAL, true, true, true, ind, 0);
+        ControlMsg in = makeControl(0, 0, MODE_TELEOP, true, true, true, ind, 0);
         uint8_t buf[8] = {0};
         encodeControl(in, buf);
         ControlMsg out;
@@ -275,7 +275,7 @@ static void telemetry_state_round_trips() {
 
 static void wrong_dlc_is_rejected() {
     uint8_t buf[8] = {0};
-    encodeControl(makeControl(100, 0, MODE_MANUAL, false, false, false,
+    encodeControl(makeControl(100, 0, MODE_TELEOP, false, false, false,
                               INDICATOR_OFF, 0), buf);
     ControlMsg out;
     for (uint8_t len = 0; len <= 8; ++len) {
@@ -290,7 +290,7 @@ static void a_corrupted_byte_is_caught_by_the_app_layer_crc() {
     // the sender assembled them, which is precisely the software-path failure
     // domain the application-layer CRC exists to cover.
     uint8_t good[8] = {0};
-    encodeControl(makeControl(500, -200, MODE_MANUAL, false, false, false,
+    encodeControl(makeControl(500, -200, MODE_TELEOP, false, false, false,
                               INDICATOR_TELEOP, 11), good);
     ControlMsg out;
     for (int byte = 0; byte < 7; ++byte) {          // every byte the CRC covers
@@ -309,7 +309,7 @@ static void a_frame_on_the_wrong_can_id_fails() {
     // id -- or a telemetry frame mistakenly transmitted with CONTROL's id --
     // must not validate.
     uint8_t buf[8] = {0};
-    encodeControl(makeControl(900, 0, MODE_MANUAL, false, false, false,
+    encodeControl(makeControl(900, 0, MODE_TELEOP, false, false, false,
                               INDICATOR_OFF, 5), buf);
     ControlMsg out;
     CHECK_EQ(decodeControl(CAN_ID_CONTROL, buf, FRAME_DLC, out), DECODE_OK);
@@ -318,25 +318,45 @@ static void a_frame_on_the_wrong_can_id_fails() {
 }
 
 static void mode_predicates_cover_all_256_values() {
-    // `mode` is a uint8: 256 values, 3 defined. An earlier version asked
-    // "is mode == DISABLED?" and stopped only then, so every undefined value
+    // `mode` is a uint8: 256 values, 3 commandable. An earlier version asked
+    // "is mode == SAFE?" and stopped only then, so every undefined value
     // read as drivable and permitted full throttle. Exhaustive here because
     // 256 cases is cheap and the cost of missing one is a moving rover.
     for (int m = 0; m <= 255; ++m) {
         const uint8_t mode = static_cast<uint8_t>(m);
-        const bool known = (m == MODE_DISABLED || m == MODE_MANUAL || m == MODE_AUTONOMOUS);
-        const bool drivable = (m == MODE_MANUAL || m == MODE_AUTONOMOUS);
-        CHECK_EQ(isKnownMode(mode), known);
+        const bool commandable = (m == MODE_SAFE || m == MODE_TELEOP || m == MODE_AUTONOMOUS);
+        const bool drivable = (m == MODE_TELEOP || m == MODE_AUTONOMOUS);
+        CHECK_EQ(isCommandableMode(mode), commandable);
         CHECK_EQ(modePermitsMotion(mode), drivable);
     }
 }
 
-static void disabled_is_known_but_not_drivable() {
-    // The distinction the earlier bug turned on: DISABLED is a LEGITIMATE
+static void safe_is_commandable_but_not_drivable() {
+    // The distinction the earlier bug turned on: SAFE is a LEGITIMATE
     // command (decode accepts it) that forbids motion. An undefined value is a
     // PROTOCOL ERROR (decode rejects it).
-    CHECK(isKnownMode(MODE_DISABLED));
-    CHECK(!modePermitsMotion(MODE_DISABLED));
+    CHECK(isCommandableMode(MODE_SAFE));
+    CHECK(!modePermitsMotion(MODE_SAFE));
+}
+
+static void fault_is_never_commanded_or_driven() {
+    // FAULT is a state the controller enters on its own. A Jetson that sends
+    // it is confused about the protocol, exactly like an undefined value.
+    CHECK(!isCommandableMode(MODE_FAULT));
+    CHECK(!modePermitsMotion(MODE_FAULT));
+    ControlMsg out;
+    uint8_t buf[8] = {0};
+    encodeControl(makeControl(100, 0, MODE_FAULT, false, false, false,
+                              INDICATOR_OFF, 0), buf);
+    CHECK_EQ(decodeControl(CAN_ID_CONTROL, buf, FRAME_DLC, out), DECODE_BAD_MODE);
+}
+
+static void mode_values_are_fixed_on_the_wire() {
+    // Names may change; the bytes on the bus must not.
+    CHECK_EQ(MODE_SAFE, 0);
+    CHECK_EQ(MODE_TELEOP, 1);
+    CHECK_EQ(MODE_AUTONOMOUS, 2);
+    CHECK_EQ(MODE_FAULT, 3);
 }
 
 static void undefined_mode_is_rejected_at_decode() {
@@ -355,7 +375,7 @@ static void reserved_flag_bits_are_rejected() {
     // Only bit 7 is reserved now: bit 6 carries c2_lost.
     ControlMsg out;
     uint8_t buf[8] = {0};
-    encodeControl(makeControl(0, 0, MODE_MANUAL, false, false, false,
+    encodeControl(makeControl(0, 0, MODE_TELEOP, false, false, false,
                               INDICATOR_OFF, 0), buf);
     buf[5] |= CTRL_FLAG_RESERVED_MASK;
     buf[FRAME_CRC_OFFSET] = frameCrc8(CAN_ID_CONTROL, buf, FRAME_SEQ_OFFSET + 1);
@@ -368,7 +388,7 @@ static void the_c2_flag_bit_is_a_field_not_a_reserved_bit() {
     // must decode as c2_lost, not reject the frame.
     ControlMsg out;
     uint8_t buf[8] = {0};
-    encodeControl(makeControl(0, 0, MODE_MANUAL, false, false, false,
+    encodeControl(makeControl(0, 0, MODE_TELEOP, false, false, false,
                               INDICATOR_OFF, 0, /*c2_lost=*/true), buf);
     CHECK_EQ(buf[5] & CTRL_FLAG_C2_LOST, CTRL_FLAG_C2_LOST);
     CHECK_EQ(buf[5] & CTRL_FLAG_RESERVED_MASK, 0);
@@ -388,7 +408,7 @@ static void undefined_indicator_request_is_rejected() {
     ControlMsg out;
     for (uint8_t ind = 5; ind <= 7; ++ind) {
         uint8_t buf[8] = {0};
-        encodeControl(makeControl(0, 0, MODE_MANUAL, false, false, false, ind, 0), buf);
+        encodeControl(makeControl(0, 0, MODE_TELEOP, false, false, false, ind, 0), buf);
         CHECK_EQ(decodeControl(CAN_ID_CONTROL, buf, FRAME_DLC, out),
                  DECODE_BAD_INDICATOR);
     }
@@ -403,7 +423,7 @@ static void every_frame_is_exactly_eight_bytes() {
     CHECK_EQ(FRAME_DLC, 8);
     CHECK_EQ(FRAME_PAYLOAD + 2, FRAME_DLC);     // payload + seq + crc
     uint8_t buf[8] = {0};
-    CHECK_EQ(encodeControl(makeControl(0,0,MODE_MANUAL,0,0,0,0,0), buf), 8);
+    CHECK_EQ(encodeControl(makeControl(0,0,MODE_TELEOP,0,0,0,0,0), buf), 8);
     TelemetryDriveL dl = {0, 0};
     CHECK_EQ(encodeTelemetryDriveL(dl, 0, buf), 8);
     TelemetryDriveR dr = {0, 0};
@@ -496,7 +516,9 @@ int main() {
     RUN_TEST(a_corrupted_byte_is_caught_by_the_app_layer_crc);
     RUN_TEST(a_frame_on_the_wrong_can_id_fails);
     RUN_TEST(mode_predicates_cover_all_256_values);
-    RUN_TEST(disabled_is_known_but_not_drivable);
+    RUN_TEST(safe_is_commandable_but_not_drivable);
+    RUN_TEST(fault_is_never_commanded_or_driven);
+    RUN_TEST(mode_values_are_fixed_on_the_wire);
     RUN_TEST(undefined_mode_is_rejected_at_decode);
     RUN_TEST(reserved_flag_bits_are_rejected);
     RUN_TEST(the_c2_flag_bit_is_a_field_not_a_reserved_bit);

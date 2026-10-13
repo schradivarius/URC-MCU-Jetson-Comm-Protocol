@@ -41,7 +41,7 @@ class RoverFixture(unittest.TestCase):
         """Send CONTROL at 20 Hz (or stay silent) for `seconds`, polling."""
         kw.setdefault("drive_cmd", 400)
         kw.setdefault("steer_cmd", 100)
-        kw.setdefault("mode", rp.MODE_MANUAL)
+        kw.setdefault("mode", rp.MODE_TELEOP)
         kw.setdefault("c2_lost", False)
         end = time.monotonic() + seconds
         while time.monotonic() < end:
@@ -115,7 +115,7 @@ class TestEndToEnd(RoverFixture):
         self.assertGreater(s["enc_left"], 0, "rover never moved")
         self.assertGreater(s["current_a"], 0)
         self.assertGreater(s["voltage_v"], 20.0)
-        self.assertEqual(s["mode"], rp.MODE_MANUAL)
+        self.assertEqual(s["mode"], rp.MODE_TELEOP)
         self.assertEqual(s["jetson_link"], rp.LINK_OK)
         self.assertEqual(s["indicator_state"], rp.INDICATOR_TELEOP)
 
@@ -158,10 +158,10 @@ class TestEndToEnd(RoverFixture):
         self.assertGreater(self.snap()["enc_left"], halted)
 
     def test_disabled_mode_never_moves(self):
-        self.drive(0.6, drive_cmd=1000, steer_cmd=1000, mode=rp.MODE_DISABLED)
+        self.drive(0.6, drive_cmd=1000, steer_cmd=1000, mode=rp.MODE_SAFE)
         self.assertEqual(self.snap()["enc_left"], 0)
         self.assertEqual(self.snap()["current_ca"], 0)
-        self.assertEqual(self.snap()["mode"], rp.MODE_DISABLED)
+        self.assertEqual(self.snap()["mode"], rp.MODE_SAFE)
 
 
 class TestNewCommandFields(RoverFixture):
@@ -179,9 +179,9 @@ class TestNewCommandFields(RoverFixture):
         self.assertEqual(self.snap()["current_ca"], 0)
 
     def test_autonomy_abort_does_not_stop_a_teleoperated_rover(self):
-        # In MANUAL the operator is already driving; there is no autonomous
+        # In TELEOP the operator is already driving; there is no autonomous
         # task to abort, and stopping would surprise them mid-manoeuvre.
-        self.drive(0.6, drive_cmd=600, mode=rp.MODE_MANUAL, autonomy_abort=True)
+        self.drive(0.6, drive_cmd=600, mode=rp.MODE_TELEOP, autonomy_abort=True)
         self.assertGreater(self.snap()["enc_left"], 0)
         self.assertGreater(self.snap()["current_ca"], 0)
 
@@ -191,7 +191,7 @@ class TestNewCommandFields(RoverFixture):
         # state is how an operator sees whether it was honoured.
         for requested in (rp.INDICATOR_TELEOP, rp.INDICATOR_AUTONOMOUS,
                           rp.INDICATOR_ARRIVED):
-            self.drive(0.4, mode=rp.MODE_MANUAL, indicator_request=requested)
+            self.drive(0.4, mode=rp.MODE_TELEOP, indicator_request=requested)
             self.assertEqual(self.snap()["indicator_state"], rp.INDICATOR_TELEOP,
                              "a teleoperated rover showed %d" % requested)
 
@@ -204,13 +204,13 @@ class TestNewCommandFields(RoverFixture):
                    indicator_request=rp.INDICATOR_ARRIVED)
         self.assertEqual(self.snap()["indicator_state"], rp.INDICATOR_ARRIVED)
 
-        self.drive(0.4, mode=rp.MODE_DISABLED,
+        self.drive(0.4, mode=rp.MODE_SAFE,
                    indicator_request=rp.INDICATOR_AUTONOMOUS)
         self.assertEqual(self.snap()["indicator_state"], rp.INDICATOR_OFF)
 
     def test_mode_is_echoed_back(self):
         # Without the echo a dropped or misread mode change is invisible.
-        for mode in (rp.MODE_MANUAL, rp.MODE_AUTONOMOUS, rp.MODE_DISABLED):
+        for mode in (rp.MODE_TELEOP, rp.MODE_AUTONOMOUS, rp.MODE_SAFE):
             self.drive(0.4, mode=mode)
             self.assertEqual(self.snap()["mode"], mode)
 
@@ -247,7 +247,7 @@ class TestLinkSeparation(RoverFixture):
         self.assertNotEqual(self.snap()["current_a"], 0.0,
                             "an autonomous rover was stopped by C2 loss alone")
 
-        self.drive(0.6, drive_cmd=800, mode=rp.MODE_MANUAL, c2_lost=True)
+        self.drive(0.6, drive_cmd=800, mode=rp.MODE_TELEOP, c2_lost=True)
         self.assertEqual(self.snap()["current_a"], 0.0,
                          "a teleoperated rover kept driving with C2 lost")
 
@@ -268,7 +268,7 @@ class TestLinkSeparation(RoverFixture):
             for c2 in (rp.LINK_OK, rp.LINK_DEGRADED, rp.LINK_LOST,
                        rp.LINK_NOT_REPORTED):
                 frame = rp.encode_telemetry_state(
-                    rp.MODE_MANUAL, jl, c2, rp.CTRL_HEALTH_OK,
+                    rp.MODE_TELEOP, jl, c2, rp.CTRL_HEALTH_OK,
                     rp.INDICATOR_TELEOP, seq=1)
                 _, d = rp.decode_telemetry_state(frame)
                 self.assertEqual(d["jetson_link"], jl)
@@ -280,7 +280,7 @@ class TestBusHygiene(RoverFixture):
         self.drive(0.4)
         end = time.monotonic() + 0.7
         while time.monotonic() < end:
-            self.link.send(0x321, rp.encode_control(1000, 0, rp.MODE_MANUAL, False))
+            self.link.send(0x321, rp.encode_control(1000, 0, rp.MODE_TELEOP, False))
             self.jl.poll()
             time.sleep(0.02)
         self.jl.poll()
@@ -292,7 +292,7 @@ class TestBusHygiene(RoverFixture):
         # Corrupted AFTER the CRC is computed -- exactly the software-path
         # failure CAN's own CRC cannot see.
         self.drive(0.4)
-        good = rp.encode_control(900, 0, rp.MODE_MANUAL, False, seq=50)
+        good = rp.encode_control(900, 0, rp.MODE_TELEOP, False, seq=50)
         bad = bytearray(good)
         bad[0] ^= 0xFF
         self.send_raw(bytes(bad), 0.7)
@@ -314,7 +314,7 @@ class TestBusHygiene(RoverFixture):
         self.drive(0.4)
         for seq in (10, 60):          # a 50-frame jump
             self.link.send(rp.CAN_ID_CONTROL,
-                           rp.encode_control(400, 0, rp.MODE_MANUAL, False, seq=seq))
+                           rp.encode_control(400, 0, rp.MODE_TELEOP, False, seq=seq))
             time.sleep(0.08)
             self.jl.poll()
         self.assertIn("SEQ_GAP", self.faults())

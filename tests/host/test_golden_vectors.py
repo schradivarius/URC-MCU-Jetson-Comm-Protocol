@@ -79,14 +79,14 @@ class TestPredicateAgreement(GoldenBase):
         self.assertEqual(len(rows), 256)
         for _, value, flags in rows:
             mode = int(value)
-            self.assertEqual(p.is_known_mode(mode), flags[0] == "1",
-                             "is_known_mode disagrees for mode=%d" % mode)
+            self.assertEqual(p.is_commandable_mode(mode), flags[0] == "1",
+                             "is_commandable_mode disagrees for mode=%d" % mode)
             self.assertEqual(p.mode_permits_motion(mode), flags[1] == "1",
                              "mode_permits_motion disagrees for mode=%d" % mode)
 
     def test_only_manual_and_autonomous_ever_permit_motion(self):
         for mode in range(256):
-            if mode not in (p.MODE_MANUAL, p.MODE_AUTONOMOUS):
+            if mode not in (p.MODE_TELEOP, p.MODE_AUTONOMOUS):
                 self.assertFalse(p.mode_permits_motion(mode),
                                  "mode=%d permits motion but must not" % mode)
 
@@ -110,11 +110,11 @@ class TestPredicateAgreement(GoldenBase):
     def test_out_of_range_commands_are_rejected_by_the_python_decoder(self):
         for v in (p.CMD_MIN - 1, p.CMD_MAX + 1, -32768, 32767):
             for drive, steer in ((v, 0), (0, v)):
-                frame = p.encode_control(drive, steer, p.MODE_MANUAL, False)
+                frame = p.encode_control(drive, steer, p.MODE_TELEOP, False)
                 self.assertEqual(p.decode_control(frame)[0], p.DECODE_BAD_RANGE,
                                  "Python accepted %d,%d" % (drive, steer))
         for v in (p.CMD_MIN, 0, p.CMD_MAX):
-            frame = p.encode_control(v, v, p.MODE_MANUAL, False)
+            frame = p.encode_control(v, v, p.MODE_TELEOP, False)
             self.assertEqual(p.decode_control(frame)[0], p.DECODE_OK)
 
     def test_sequence_arithmetic_agrees_across_the_wrap(self):
@@ -192,15 +192,16 @@ class TestFrameAgreement(GoldenBase):
 class TestPythonValidation(unittest.TestCase):
     """Python must reject what C++ rejects, for the same reasons."""
 
-    def test_undefined_mode_is_rejected(self):
-        for mode in (3, 4, 42, 128, 255):
+    def test_non_commandable_mode_is_rejected(self):
+        # MODE_FAULT (3) is defined, but only the controller enters it.
+        for mode in (p.MODE_FAULT, 4, 42, 128, 255):
             frame = p.encode_control(1000, 500, mode, False)
             result, decoded = p.decode_control(frame)
             self.assertEqual(result, p.DECODE_BAD_MODE)
             self.assertIsNone(decoded)
 
     def test_a_corrupted_byte_is_rejected(self):
-        good = p.encode_control(500, -200, p.MODE_MANUAL, False, seq=3)
+        good = p.encode_control(500, -200, p.MODE_TELEOP, False, seq=3)
         for byte in range(p.FRAME_CRC_OFFSET):
             bad = bytearray(good)
             bad[byte] ^= 0xFF
@@ -209,20 +210,20 @@ class TestPythonValidation(unittest.TestCase):
                                 "byte %d corrupted but accepted" % byte)
 
     def test_a_frame_on_the_wrong_id_is_rejected(self):
-        frame = p.encode_control(500, 0, p.MODE_MANUAL, False, seq=1)
+        frame = p.encode_control(500, 0, p.MODE_TELEOP, False, seq=1)
         self.assertEqual(p.decode_control(frame)[0], p.DECODE_OK)
         self.assertEqual(p.decode_control(frame, can_id=p.CAN_ID_TELEM_POWER)[0],
                          p.DECODE_BAD_CRC)
 
     def test_wrong_length_is_rejected(self):
-        frame = p.encode_control(0, 0, p.MODE_MANUAL, False)
+        frame = p.encode_control(0, 0, p.MODE_TELEOP, False)
         for n in range(0, 8):
             self.assertEqual(p.decode_control(frame[:n])[0], p.DECODE_BAD_DLC)
 
     def test_reserved_flag_bits_are_rejected(self):
         # Only bit 7 is reserved now: bit 6 carries c2_lost.
         flags = p.pack_control_flags(False, stop=True) | 0x80
-        frame = p.encode_control(0, 0, p.MODE_MANUAL, False, raw_flags=flags)
+        frame = p.encode_control(0, 0, p.MODE_TELEOP, False, raw_flags=flags)
         self.assertEqual(p.decode_control(frame)[0], p.DECODE_BAD_FLAGS)
 
     def test_the_c2_flag_bit_is_not_reserved(self):
@@ -231,13 +232,13 @@ class TestPythonValidation(unittest.TestCase):
         flags = p.pack_control_flags(True, stop=True)
         self.assertEqual(flags & p.CTRL_FLAG_C2_LOST, p.CTRL_FLAG_C2_LOST)
         result, decoded = p.decode_control(
-            p.encode_control(0, 0, p.MODE_MANUAL, False, raw_flags=flags))
+            p.encode_control(0, 0, p.MODE_TELEOP, False, raw_flags=flags))
         self.assertEqual(result, p.DECODE_OK)
         self.assertTrue(decoded["c2_lost"])
 
     def test_undefined_indicator_request_is_rejected(self):
         for ind in (5, 6, 7):
-            frame = p.encode_control(0, 0, p.MODE_MANUAL, False, indicator_request=ind)
+            frame = p.encode_control(0, 0, p.MODE_TELEOP, False, indicator_request=ind)
             self.assertEqual(p.decode_control(frame)[0], p.DECODE_BAD_INDICATOR)
 
     def test_the_c2_fault_bit_is_named(self):
@@ -246,7 +247,7 @@ class TestPythonValidation(unittest.TestCase):
         self.assertEqual(p.fault_names(0x0080), ["C2_LINK_LOST"])
 
     def test_c2_lost_survives_a_round_trip_in_every_mode(self):
-        for mode in (p.MODE_DISABLED, p.MODE_MANUAL, p.MODE_AUTONOMOUS):
+        for mode in (p.MODE_SAFE, p.MODE_TELEOP, p.MODE_AUTONOMOUS):
             for c2 in (False, True):
                 frame = p.encode_control(100, 0, mode, c2)
                 result, decoded = p.decode_control(frame)

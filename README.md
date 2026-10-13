@@ -111,7 +111,7 @@ implementation, rather than merely assumed to work:
   autonomous, so an undervoltage warning must not take the light away from
   what the rover is actually doing
 - `undefined_mode_does_not_permit_motion` — fails against the pre-fix
-  `mode == MODE_DISABLED` check, which permitted full throttle on any
+  `mode == MODE_SAFE` check (now `MODE_SAFE`), which permitted full throttle on any
   undefined mode ([issue #4](https://github.com/schradivarius/URC-task3/issues/4))
 
 CI additionally builds with **clang** as a second toolchain and runs the suite

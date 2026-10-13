@@ -173,7 +173,7 @@ def run(link, duration_s, c2=None, verbose=True):
             steer = int(200 * ((elapsed % 2) - 1))
             c2_lost = (True if c2 is None
                        else c2_link.poll_c2_lost(c2, c2_monitor, now))
-            jl.send_control(drive, steer, rp.MODE_MANUAL, c2_lost,
+            jl.send_control(drive, steer, rp.MODE_TELEOP, c2_lost,
                             indicator_request=rp.INDICATOR_TELEOP)
             t_next += period
             if now - t_next > period:

@@ -72,18 +72,18 @@ def main():
     t0 = time.monotonic()
     try:
         phase(jl, t0, 1.0, "A: normal operation, CONTROL at 20Hz",
-              drive_cmd=500, steer_cmd=0, mode=rp.MODE_MANUAL, c2_lost=False,
+              drive_cmd=500, steer_cmd=0, mode=rp.MODE_TELEOP, c2_lost=False,
               indicator_request=rp.INDICATOR_TELEOP)
 
         phase(jl, t0, 0.8, "B: link cut -- Jetson stops sending (800ms > 300ms watchdog)",
               send=False)
 
         phase(jl, t0, 0.8, "B: link restored",
-              drive_cmd=300, steer_cmd=100, mode=rp.MODE_MANUAL, c2_lost=False,
+              drive_cmd=300, steer_cmd=100, mode=rp.MODE_TELEOP, c2_lost=False,
               indicator_request=rp.INDICATOR_TELEOP)
 
         phase(jl, t0, 0.5, "C: explicit stop asserted at full throttle",
-              drive_cmd=1000, steer_cmd=500, mode=rp.MODE_MANUAL, c2_lost=False,
+              drive_cmd=1000, steer_cmd=500, mode=rp.MODE_TELEOP, c2_lost=False,
               stop=True)
 
         phase(jl, t0, 0.5, "D: autonomy abort while AUTONOMOUS",
@@ -98,15 +98,15 @@ def main():
               drive_cmd=800, steer_cmd=0, mode=rp.MODE_AUTONOMOUS, c2_lost=True,
               indicator_request=rp.INDICATOR_AUTONOMOUS)
 
-        phase(jl, t0, 0.5, "D3: C2 lost while MANUAL -- stops, nobody can reach it",
-              drive_cmd=800, steer_cmd=0, mode=rp.MODE_MANUAL, c2_lost=True,
+        phase(jl, t0, 0.5, "D3: C2 lost while TELEOP -- stops, nobody can reach it",
+              drive_cmd=800, steer_cmd=0, mode=rp.MODE_TELEOP, c2_lost=True,
               indicator_request=rp.INDICATOR_TELEOP)
 
         # E: corrupt a frame AFTER the CRC is computed. CAN's own CRC would not
         # see this -- it is exactly the software-path corruption the
         # application-layer CRC exists to catch.
         print("-- E: corrupted payload (app-layer CRC must reject it) --")
-        good = rp.encode_control(900, 0, rp.MODE_MANUAL, False, seq=99)
+        good = rp.encode_control(900, 0, rp.MODE_TELEOP, False, seq=99)
         bad = bytearray(good)
         bad[0] ^= 0xFF
         for _ in range(25):
@@ -121,11 +121,11 @@ def main():
         # F: jump the sequence number so frames look lost.
         print("-- F: sequence gap (frames 100 -> 140) --")
         link.send(rp.CAN_ID_CONTROL,
-                  rp.encode_control(400, 0, rp.MODE_MANUAL, False, seq=100))
+                  rp.encode_control(400, 0, rp.MODE_TELEOP, False, seq=100))
         time.sleep(0.06)
         jl.poll()
         link.send(rp.CAN_ID_CONTROL,
-                  rp.encode_control(400, 0, rp.MODE_MANUAL, False, seq=140))
+                  rp.encode_control(400, 0, rp.MODE_TELEOP, False, seq=140))
         time.sleep(0.12)
         jl.poll()
         txt = line(jl, t0)

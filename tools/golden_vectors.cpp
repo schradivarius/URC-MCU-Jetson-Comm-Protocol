@@ -57,7 +57,7 @@ int main() {
     // --- validation predicates, exhaustive over the byte -----------------
     for (int m = 0; m <= 255; ++m) {
         std::printf("MODE|%d|%d%d\n", m,
-                    isKnownMode(static_cast<uint8_t>(m)) ? 1 : 0,
+                    isCommandableMode(static_cast<uint8_t>(m)) ? 1 : 0,
                     modePermitsMotion(static_cast<uint8_t>(m)) ? 1 : 0);
     }
     for (int i = 0; i <= 255; ++i) {
@@ -76,18 +76,18 @@ int main() {
     // --- CONTROL ---------------------------------------------------------
     struct Ctl { int16_t d, s; uint8_t m; bool stop, abort, ret, c2; uint8_t ind, seq; };
     const Ctl ctls[] = {
-        {     0,     0, MODE_DISABLED,   true,  false, false, false, INDICATOR_OFF,        0},
-        {   500,  -200, MODE_MANUAL,     false, false, false, false, INDICATOR_TELEOP,     1},
+        {     0,     0, MODE_SAFE,   true,  false, false, false, INDICATOR_OFF,        0},
+        {   500,  -200, MODE_TELEOP,     false, false, false, false, INDICATOR_TELEOP,     1},
         {  1000, -1000, MODE_AUTONOMOUS, false, false, false, false, INDICATOR_AUTONOMOUS, 42},
-        { -1000,  1000, MODE_MANUAL,     true,  true,  true,  true,  INDICATOR_ARRIVED,  255},
+        { -1000,  1000, MODE_TELEOP,     true,  true,  true,  true,  INDICATOR_ARRIVED,  255},
         // These two were -32768,32767 and -21846,170 before command-range
         // validation. Both are outside CMD_MIN..CMD_MAX, so they no longer
         // decode; the boundary itself is pinned by the RANGE table above and
         // the extreme-int16 ENCODING by the_encoder_still_writes_any_int16.
-        {  -999,   999, MODE_MANUAL,     false, false, true,  false, INDICATOR_FAULT,    128},
+        {  -999,   999, MODE_TELEOP,     false, false, true,  false, INDICATOR_FAULT,    128},
         {  -846,   170, MODE_AUTONOMOUS, false, true,  false, true,  INDICATOR_OFF,        7},
         {   250,   -50, MODE_AUTONOMOUS, false, false, false, true,  INDICATOR_AUTONOMOUS, 64},
-        {     0,     0, MODE_MANUAL,     false, false, false, true,  INDICATOR_TELEOP,    65},
+        {     0,     0, MODE_TELEOP,     false, false, false, true,  INDICATOR_TELEOP,    65},
     };
     for (const Ctl& c : ctls) {
         ControlMsg m;
@@ -143,9 +143,9 @@ int main() {
     // --- TELEM_STATE -----------------------------------------------------
     struct ST { uint8_t mode, jl, c2, h, ind, seq; };
     const ST sts[] = {
-        {MODE_DISABLED, LINK_LOST, LINK_NOT_REPORTED, CTRL_HEALTH_NOT_REPORTED,
+        {MODE_SAFE, LINK_LOST, LINK_NOT_REPORTED, CTRL_HEALTH_NOT_REPORTED,
          INDICATOR_OFF, 0},
-        {MODE_MANUAL, LINK_OK, LINK_OK, CTRL_HEALTH_OK, INDICATOR_TELEOP, 11},
+        {MODE_TELEOP, LINK_OK, LINK_OK, CTRL_HEALTH_OK, INDICATOR_TELEOP, 11},
         {MODE_AUTONOMOUS, LINK_DEGRADED, LINK_LOST, CTRL_HEALTH_DEGRADED,
          INDICATOR_AUTONOMOUS, 12},
         {MODE_AUTONOMOUS, LINK_OK, LINK_NOT_REPORTED, CTRL_HEALTH_FAULT,

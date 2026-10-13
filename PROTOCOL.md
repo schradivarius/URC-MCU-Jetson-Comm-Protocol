@@ -158,22 +158,39 @@ would only add a staleness question nobody needs to ask.
 |---|---|---|---|---|---|
 | 0–1 | `drive_cmd` | int16 | 0.1 % of full drive effort | −1000 … +1000 | Desired drive. Positive is forward. A value outside the range **rejects the whole frame** — see 3.1.4. |
 | 2–3 | `steer_cmd` | int16 | 0.1 % of full steering range | −1000 … +1000 | Desired steering. Positive is right. Range-checked exactly like `drive_cmd`. |
-| 4 | `mode` | uint8 | enum | **0, 1, 2 only** | `0=DISABLED, 1=MANUAL, 2=AUTONOMOUS`. Any other value **rejects the frame** — see 3.1.1. |
+| 4 | `mode` | uint8 | enum | **0, 1, 2 only** | `0=SAFE, 1=TELEOP, 2=AUTONOMOUS`. Any other value, including `3=FAULT`, **rejects the frame** — see 3.1.1. |
 | 5 | `flags` | uint8 | bitfield | see below | Five fields packed; see 3.1.2. |
 | 6 | `seq` | uint8 | frames | 0–255 wraps | See 2.2. |
 | 7 | `crc8` | uint8 | — | 0–255 | See 4. |
 
 #### 3.1.1 `mode` validation
 
-`mode` is a uint8 carrying 256 possible values where three are defined. Two
-separate questions follow, and conflating them was a real bug:
+`mode` is a uint8 carrying 256 possible values where four are defined and
+three may be commanded. Two separate questions follow, and conflating them was
+a real bug:
 
 | Question | Answer |
 |---|---|
-| Is this value *defined*? (`isKnownMode`) | `0`, `1`, `2`. **`DISABLED` is valid** — a legitimate command meaning "do not move". |
-| May the rover *move*? (`modePermitsMotion`) | `MANUAL` or `AUTONOMOUS` only — a **whitelist**. |
+| May the Jetson *send* this value? (`isCommandableMode`) | `0`, `1`, `2`. **`SAFE` is valid** — a legitimate command meaning "do not move". `3=FAULT` is not: only the controller enters it. |
+| May the rover *move*? (`modePermitsMotion`) | `TELEOP` or `AUTONOMOUS` only — a **whitelist**. |
 
-An undefined mode **rejects the whole frame**, exactly like a bad CRC: the
+**Commanded mode vs. active mode.** `SAFE` means stopped *on purpose*;
+`FAULT` means stopped because a link the mode needs is gone. The controller
+works out which mode it is actually executing with
+`RoverController::activeMode()`:
+
+| Situation | Active mode |
+|---|---|
+| No valid `CONTROL` yet, or none for 300 ms (`COMM_TIMEOUT`) | `FAULT` |
+| `TELEOP` commanded, but `c2_lost = 1` | `FAULT` |
+| Anything else | the commanded mode |
+
+`FAULT` is not latched: once the link is back, the active mode is whatever was
+last commanded. `effectiveStop()` and `indicatorState()` are both derived from
+it, so the stop decision, the mode and the rear light cannot disagree.
+`TELEM_STATE.mode` still echoes the *commanded* mode.
+
+A non-commandable mode **rejects the whole frame**, exactly like a bad CRC: the
 sender disagrees with us about the protocol. Deliberately **not**
 forward-compatible — a newer peer sending a mode this firmware does not
 implement must stop this rover. Adding a fourth mode means updating every
@@ -184,7 +201,7 @@ controller on the bus *before* a host may send it.
 | Bits | Field | Type | Range | Meaning |
 |---|---|---|---|---|
 | 0 | `stop` | bool | 0/1 | Stop now, regardless of `mode`. Takes effect on the cycle it arrives — no coast frame. Separate from `mode` so an e-stop can be asserted **and released** without a mode round trip. |
-| 1 | `autonomy_abort` | bool | 0/1 | Abandon the current autonomous task. **Forces a stop while `mode == AUTONOMOUS`**; in `MANUAL` the operator is already driving, so it has no autonomous task to abort and does not stop. ⚠️ *This behaviour is a judgement call, not spelled out by the requirement — flagged for review.* |
+| 1 | `autonomy_abort` | bool | 0/1 | Abandon the current autonomous task. **Forces a stop while `mode == AUTONOMOUS`**; in `TELEOP` the operator is already driving, so it has no autonomous task to abort and does not stop. ⚠️ *This behaviour is a judgement call, not spelled out by the requirement — flagged for review.* |
 | 2 | `return_request` | bool | 0/1 | Begin the return-to-base behaviour. Carried and reported; the controller takes no low-level action on it. |
 | 3–5 | `indicator_request` | uint8 | **0–4** | Requested status-indicator state. `0=OFF, 1=TELEOP, 2=AUTONOMOUS, 3=ARRIVED, 4=FAULT`. 5–7 are reachable on the wire and **reject the frame**. The controller honours this only where it agrees with its own mode — see §3.5. |
 | 6 | `c2_lost` | bool | 0/1 | `1` = the Jetson has lost the base-station (C2) link. The Jetson's report on a link the controller cannot see — see below. |
@@ -207,9 +224,9 @@ base station drops while onboard autonomy keeps running.
 
 | Mode | `c2_lost = 1` → | Why |
 |---|---|---|
-| `MANUAL` | **stop** | The operator's commands can no longer arrive, so nobody is driving |
+| `TELEOP` | **stop** | The operator's commands can no longer arrive, so nobody is driving |
 | `AUTONOMOUS` | **keep driving** | The Jetson is driving, and is provably alive or the command watchdog would already have stopped the rover |
-| `DISABLED` | stopped anyway | — |
+| `SAFE` | stopped anyway | — |
 
 `FAULT_C2_LINK_LOST` is raised in **every** mode: during an autonomous run it
 is the only sign that the rover is out of contact, which an operator needs
@@ -220,7 +237,7 @@ Two implementation details that exist to stop this field lying:
 
 - **`encode_control()` has no default for `c2_lost`.** A caller that forgot it
   would silently report the link as healthy, which is the one direction of
-  error that lets a rover keep driving in `MANUAL` with nobody able to reach
+  error that lets a rover keep driving in `TELEOP` with nobody able to reach
   it. A missing argument is a loud failure instead.
 - **The controller boots with `c2_lost = 1`** and holds it until a valid frame
   says otherwise, matching every other boot default (assume the worst). It is
@@ -293,7 +310,7 @@ left. Bits `0x0001`–`0x0040` keep their v0.3 values.
 | `0x0010` | `UNDERVOLTAGE` | Supply voltage below threshold |
 | `0x0020` | `FIRMWARE_FAULT` | This boot followed a watchdog reset (5.2) |
 | `0x0040` | `PROTOCOL_ERROR` | A frame on our id was uninterpretable: wrong DLC, undefined mode, bad flags, bad indicator, or `drive_cmd`/`steer_cmd` out of range |
-| `0x0080` | `C2_LINK_LOST` | The last `CONTROL` frame reported the base-station link lost (`c2_lost = 1`). Raised in every mode; stops the rover only in `MANUAL` (§3.1.3). Cleared, not latched, once the value goes stale — see §3.5 |
+| `0x0080` | `C2_LINK_LOST` | The last `CONTROL` frame reported the base-station link lost (`c2_lost = 1`). Raised in every mode; stops the rover only in `TELEOP` (§3.1.3). Cleared, not latched, once the value goes stale — see §3.5 |
 | `0x0100` | `SEQ_GAP` | CONTROL frames were lost, duplicated or reordered |
 | `0x0200` | `CRC_ERROR` | Application-layer CRC mismatch on our id |
 | `0x0400`–`0x8000` | *reserved* | |
@@ -408,7 +425,7 @@ field:
    decision rests on a bit the Jetson has *already smoothed* — `C2Monitor`
    waits a full `C2_timeout_s` (1.0 s) before declaring loss. A raw local
    measurement polled at 20 Hz has no such smoothing, so marginal RF would stop
-   and release a `MANUAL` rover over and over. Whatever feeds `c2LinkState()`
+   and release a `TELEOP` rover over and over. Whatever feeds `c2LinkState()`
    locally needs its own hold-off; `LINK_DEGRADED_HOLD_MS` is the existing
    precedent in this file and 1.0 s is the number the Jetson already uses.
 
@@ -481,10 +498,10 @@ controller overrides it. Checked top to bottom, first match wins
 
 | # | Condition | Shown | Request |
 |---|---|---|---|
-| 1 | Command watchdog tripped | `FAULT` | ignored |
-| 2 | `MANUAL` with `c2_lost = 1` | `FAULT` | ignored |
-| 3 | Mode `DISABLED` | `OFF` | ignored |
-| 4 | Mode `MANUAL` | `TELEOP` | ignored — a human-driven rover never shows red or green |
+| 1 | Command watchdog tripped (active mode `FAULT`) | `FAULT` | ignored |
+| 2 | `TELEOP` with `c2_lost = 1` (active mode `FAULT`) | `FAULT` | ignored |
+| 3 | Mode `SAFE` | `OFF` | ignored |
+| 4 | Mode `TELEOP` | `TELEOP` | ignored — a human-driven rover never shows red or green |
 | 5 | Mode `AUTONOMOUS` | `ARRIVED` if `ARRIVED` was requested, else `AUTONOMOUS` | only `ARRIVED` matters |
 
 Rules 1 and 2 are the two ways nothing can be driving the rover, and they show
@@ -581,7 +598,7 @@ resulting stop is diagnosable rather than silent.
 
 Five triggers — **comm timeout**, **explicit `stop`**, **any mode that does not
 positively permit motion**, **`autonomy_abort` while `AUTONOMOUS`**, and
-**`c2_lost` while `MANUAL`** — all force a stop through a single function,
+**`c2_lost` while `TELEOP`** — all force a stop through a single function,
 `RoverController::effectiveStop()`. There is exactly one place in the codebase
 where "should this rover be moving?" is answered. `commandedOutputs()` then
 zeroes drive and steer *before* they reach the motor layer, so a future edit to
@@ -589,11 +606,11 @@ zeroes drive and steer *before* they reach the motor layer, so a future edit to
 
 The first and fifth are deliberately different. A silent Jetson stops the rover
 in **every** mode, because nothing is driving it. C2 loss stops it only in
-`MANUAL`, because an autonomous Jetson drives perfectly well without the base
+`TELEOP`, because an autonomous Jetson drives perfectly well without the base
 station — and the autonomy course is laid out so that it has to (§3.1.3).
 
 The mode test is a **whitelist**. An earlier version asked `mode ==
-MODE_DISABLED` and stopped only then, so every undefined mode value read as
+MODE_SAFE` and stopped only then, so every undefined mode value read as
 "not disabled" and permitted full throttle — a safety predicate that failed
 *open*.
 
@@ -664,7 +681,7 @@ are derived from measured actuator response yet. Two of the relationships
 between them are load-bearing rather than incidental, and are therefore
 asserted in `test_config_sync.py`: the watchdog must tolerate a missed frame,
 and `C2_TIMEOUT_S` must stay longer than the command watchdog — if those two
-converged, a single radio hiccup would start stopping the rover in `MANUAL`.
+converged, a single radio hiccup would start stopping the rover in `TELEOP`.
 
 ### 6.2 Everything else
 
@@ -694,17 +711,17 @@ to one line per phase:
 ```
 -- D2: C2 lost while AUTONOMOUS -- keeps driving, fault raised --
   t= 3.99s  seq= 80  enc=  +54580   +12.00A  23.80V  mode=AUTONOMOUS jet=OK   c2=LOST         ind=AUTONOMOUS age=20ms  faults=C2_LINK_LOST
--- D3: C2 lost while MANUAL -- stops, nobody can reach it --
-  t= 4.50s  seq= 91  enc=  +63380    +0.00A  24.00V  mode=MANUAL     jet=OK   c2=LOST         ind=FAULT      age=20ms  faults=C2_LINK_LOST
+-- D3: C2 lost while TELEOP -- stops, nobody can reach it --
+  t= 4.50s  seq= 91  enc=  +63380    +0.00A  24.00V  mode=TELEOP     jet=OK   c2=LOST         ind=FAULT      age=20ms  faults=C2_LINK_LOST
 -- E: corrupted payload (app-layer CRC must reject it) --
-  t= 5.19s  seq=104  enc=  +63380    +0.00A  24.00V  mode=MANUAL     jet=LOST c2=NOT_REPORTED ind=FAULT      age=487ms faults=COMM_TIMEOUT,CRC_ERROR
+  t= 5.19s  seq=104  enc=  +63380    +0.00A  24.00V  mode=TELEOP     jet=LOST c2=NOT_REPORTED ind=FAULT      age=487ms faults=COMM_TIMEOUT,CRC_ERROR
 -- F: sequence gap (frames 100 -> 140) --
-  t= 5.38s  seq=108  enc=  +66420    +6.00A  23.90V  mode=MANUAL     jet=DEGRADED c2=OK       ind=TELEOP     age=98ms  faults=SEQ_GAP
+  t= 5.38s  seq=108  enc=  +66420    +6.00A  23.90V  mode=TELEOP     jet=DEGRADED c2=OK       ind=TELEOP     age=98ms  faults=SEQ_GAP
 ```
 
 Three things in that capture are the whole point of §3.1.3 and §3.5. In **D2**
 an autonomous rover keeps drawing current with C2 lost, and the fault is
-reported anyway. In **D3** the same loss in `MANUAL` zeroes the current. In
+reported anyway. In **D3** the same loss in `TELEOP` zeroes the current. In
 **E** the Jetson has gone silent, so `c2=NOT_REPORTED` and `C2_LINK_LOST` is
 *absent* rather than latched: the controller stops asserting a C2 verdict it
 can no longer vouch for.
@@ -731,7 +748,7 @@ runs it, and asserts Python produces identical output for:
 - every encoded frame, byte for byte
 - the CRC check value and the id-seeded frame CRC
 - `seqDelta` across the wrap
-- `isKnownMode` and `modePermitsMotion` for **all 256** values
+- `isCommandableMode` and `modePermitsMotion` for **all 256** values
 - `isKnownIndicator` for **all 256** values
 - `c2_lost` round-tripping in every mode, and bit 6 decoding as a field rather
   than as a reserved bit — the guard against a typo'd reserved mask quietly
@@ -816,7 +833,7 @@ Verified to fail on an injected endianness change.
   high-priority e-stop frame in the reserved `0x000`–`0x0FF` block.
 - **Mode names are being revised in parallel.**
   [PR #18](https://github.com/schradivarius/URC-task3/pull/18) renames
-  `MODE_DISABLED`/`MODE_MANUAL` to `MODE_SAFE`/`MODE_TELEOP`, adds a
+  `MODE_SAFE`/`MODE_TELEOP` to `MODE_SAFE`/`MODE_TELEOP`, adds a
   non-commandable `MODE_FAULT = 3` and introduces `activeMode()`. No wire
   values change. Whichever lands second applies a mechanical rename; and
   `TELEM_STATE.mode` (§3.5) should then echo `activeMode()` rather than the

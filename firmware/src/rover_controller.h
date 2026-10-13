@@ -48,20 +48,28 @@ public:
     uint16_t cmdAgeMs() const;
     bool watchdogTripped() const;
 
-    // THE fail-safe decision. A comm timeout, an explicit stop flag, any mode
-    // that does not positively permit motion, an autonomy abort while in
-    // AUTONOMOUS, and a lost C2 link while in MANUAL all force a stop through
-    // this one function, so there is exactly one place where "should the rover
-    // be moving?" is answered.
+    // The mode the rover is actually EXECUTING, which is not always the one it
+    // was commanded: MODE_FAULT when a link that mode needs is gone -- the
+    // Jetson (comm timeout, any mode, including before the first frame) or the
+    // operator (C2 lost while in TELEOP). Otherwise the commanded mode.
+    // Recomputed on every call, not latched: once the link is back, the rover
+    // is in whatever mode was last commanded.
+    uint8_t activeMode() const;
+
+    // THE fail-safe decision. An explicit stop flag, an active mode that does
+    // not positively permit motion (which covers SAFE, a comm timeout and a
+    // lost C2 link in TELEOP, via MODE_FAULT) and an autonomy abort while in
+    // AUTONOMOUS all force a stop through this one function, so there is
+    // exactly one place where "should the rover be moving?" is answered.
     //
     // The comm timeout and the C2 rule are deliberately different. A silent
     // Jetson stops the rover in EVERY mode, because nothing is driving it. C2
-    // loss stops it only in MANUAL, because an autonomous Jetson keeps driving
+    // loss stops it only in TELEOP, because an autonomous Jetson keeps driving
     // perfectly well without the base station -- and the autonomy course is
     // laid out so that it has to.
     //
-    // The mode test is a whitelist (modePermitsMotion), not "== DISABLED":
-    // asking only about DISABLED let every undefined mode read as drivable.
+    // The mode test is a whitelist (modePermitsMotion), not "== SAFE":
+    // asking only about SAFE let every undefined mode read as drivable.
     bool effectiveStop() const;
 
     // The drive/steer actually permitted right now: zeroed under stop, so a
@@ -114,7 +122,7 @@ public:
     // three open questions are policy, not format, and the debounce one is
     // the one that bites. A raw local reading has none of the smoothing
     // C2Monitor applies on the Jetson today, so marginal RF would stop and
-    // release a MANUAL rover repeatedly.
+    // release a TELEOP rover repeatedly.
     //
     // It goes LINK_NOT_REPORTED in two cases, both of them honest "we do not
     // know" rather than a misleading LINK_OK:
