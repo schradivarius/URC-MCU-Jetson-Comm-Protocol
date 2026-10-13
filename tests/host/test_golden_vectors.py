@@ -140,7 +140,8 @@ class TestFrameAgreement(GoldenBase):
         if kind == "POWER":
             return p.encode_telemetry_power(n[0], n[1], n[2], seq=n[3])
         if kind == "STATE":
-            return p.encode_telemetry_state(n[0], n[1], n[2], n[3], n[4], seq=n[5])
+            return p.encode_telemetry_state(n[0], n[1], n[2], n[3], n[4],
+                                            seq=n[5], command_ack=n[6])
         self.fail("unknown vector kind %r" % kind)
 
     FRAME_KINDS = ("CONTROL", "DRIVE_L", "DRIVE_R", "POWER", "STATE")

@@ -21,8 +21,10 @@ namespace rover {
 // --- Protocol version ------------------------------------------------------
 // Bump whenever a message's layout or meaning changes. Not carried on the
 // wire yet; DLC and the application-layer CRC are the only runtime mismatch
-// signals. v0.5 is the first revision with the CRC and sequence number.
-static const uint8_t PROTOCOL_VERSION = 5;
+// signals. v0.5 is the first revision with the CRC and sequence number; v0.6
+// gives TELEM_STATE's reserved byte a meaning (command_ack), which changes
+// what a byte means without changing any frame's layout or size.
+static const uint8_t PROTOCOL_VERSION = 6;
 
 // --- Link ------------------------------------------------------------------
 static const uint32_t CAN_BITRATE_HZ = 500000;   // 500 kbps; every node must match

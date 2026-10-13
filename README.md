@@ -27,7 +27,7 @@ than mocking them, so there is no dependency to manage.
 git clone https://github.com/schradivarius/URC-task3.git
 cd URC-task3
 
-make test     # 74 C++ tests + 57 host tests
+make test     # 79 C++ tests + 67 host tests
 make demo     # no-hardware message-exchange demonstration
 ```
 
@@ -79,11 +79,12 @@ make test-host   # host side only — compiles the C++ core
 
 | Suite | Tests | Answers |
 |---|---:|---|
-| `tests/cpp/test_protocol.cpp` | 34 | Wire format, CRC-8, and every validation predicate |
-| `tests/cpp/test_controller.cpp` | 40 | **Does the rover stop when it should?** |
+| `tests/cpp/test_protocol.cpp` | 35 | Wire format, CRC-8, and every validation predicate |
+| `tests/cpp/test_controller.cpp` | 44 | **Does the rover stop when it should?** |
 | `tests/host/test_config_sync.py` | 12 | Do the C++ and Python configs hold the same constants? |
 | `tests/host/test_golden_vectors.py` | 23 | Do C++ and Python agree byte-for-byte? |
 | `tests/host/test_integration.py` | 22 | Do both ends actually talk to each other? |
+| `tests/host/test_minimum_cases.py` | 10 | **The brief's eight minimum test cases**, one test per case |
 
 Every test is named for the failure it prevents, so the reason it exists
 outlives anyone's memory of writing it. **Start a safety review at

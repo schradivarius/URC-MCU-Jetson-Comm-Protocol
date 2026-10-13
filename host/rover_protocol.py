@@ -55,6 +55,21 @@ CTRL_INDICATOR_SHIFT     = 3
 CTRL_FLAG_C2_LOST        = 0x40   # bit 6: the Jetson reports the C2 link down
 CTRL_FLAG_RESERVED_MASK  = 0x80   # bit 7, must be zero
 
+# Command acknowledgment bits (TELEM_STATE byte 5). Same bit positions as the
+# CONTROL flags above, so the Jetson compares what it sent against what came
+# back with one mask. See rover_protocol.h.
+ACK_STOP           = 0x01
+ACK_AUTONOMY_ABORT = 0x02
+ACK_RETURN_REQUEST = 0x04
+ACK_MASK           = 0x07
+ACK_NAMES = ((ACK_STOP, "STOP"), (ACK_AUTONOMY_ABORT, "ABORT"),
+             (ACK_RETURN_REQUEST, "RETURN"))
+
+
+def ack_names(command_ack):
+    """Which action commands the controller says it is holding."""
+    return [name for bit, name in ACK_NAMES if command_ack & bit]
+
 # --- status indicator ---
 INDICATOR_OFF        = 0
 INDICATOR_TELEOP     = 1
@@ -126,7 +141,7 @@ CONTROL_FMT = "<hhBB"   # drive_cmd, steer_cmd, mode, flags
 DRIVE_L_FMT = "<ih"     # enc_left, steer_fb
 DRIVE_R_FMT = "<iH"     # enc_right, cmd_age_ms
 POWER_FMT   = "<hhH"    # current_ca, voltage_cv, fault_status
-STATE_FMT   = "<6B"     # mode, jetson_link, c2_link, ctrl_health, indicator, rsvd
+STATE_FMT   = "<6B"     # mode, jetson_link, c2_link, ctrl_health, indicator, ack
 
 INT32_MIN = -(2 ** 31)
 INT32_MAX = 2 ** 31 - 1
@@ -325,10 +340,11 @@ def encode_telemetry_power(current_ca, voltage_cv, fault_status, seq=0):
 
 
 def encode_telemetry_state(mode, jetson_link, c2_link, controller_health,
-                           indicator_state, seq=0, reserved=0):
+                           indicator_state, seq=0, command_ack=0):
     return _seal(CAN_ID_TELEM_STATE,
                  struct.pack(STATE_FMT, mode, jetson_link, c2_link,
-                             controller_health, indicator_state, reserved), seq)
+                             controller_health, indicator_state,
+                             command_ack & ACK_MASK), seq)
 
 
 def decode_telemetry_drive_l(frame, can_id=CAN_ID_TELEM_DRIVE_L):
@@ -363,11 +379,11 @@ def decode_telemetry_state(frame, can_id=CAN_ID_TELEM_STATE):
     result, payload, seq = _open(can_id, frame)
     if result != DECODE_OK:
         return result, None
-    mode, jlink, c2link, health, indicator, reserved = struct.unpack(STATE_FMT, payload)
+    mode, jlink, c2link, health, indicator, ack = struct.unpack(STATE_FMT, payload)
     return DECODE_OK, {
         "mode": mode, "jetson_link": jlink, "c2_link": c2link,
         "controller_health": health, "indicator_state": indicator,
-        "reserved": reserved, "seq": seq,
+        "command_ack": ack, "seq": seq,
     }
 
 

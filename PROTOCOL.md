@@ -1,4 +1,4 @@
-# Rover Onboard Computer ↔ Embedded Controller Protocol (v0.5)
+# Rover Onboard Computer ↔ Embedded Controller Protocol (v0.6)
 
 **Scope:** Onboard computer (Jetson Orin Nano, candidate) ↔ embedded controller
 (**Teensy 4.1**, NXP i.MX RT1062, C++ / Teensyduino), over **CAN**.
@@ -9,6 +9,15 @@
 > per-link health and low-level controller health. `fault_status` widened to
 > `uint16`. Telemetry became **four frames** carrying one shared sequence
 > number.
+>
+> **v0.6 — command acknowledgment.** `TELEM_STATE`'s reserved byte 5 becomes
+> `command_ack`, echoing which of `stop`, `autonomy_abort` and `return_request`
+> the controller is currently holding. The brief asks that the MCU "receives
+> and acknowledges the correct command type", and `return_request` had no
+> acknowledgment at all: by design it changes no behaviour on the MCU, so the
+> only evidence it arrived was that nothing observable happened — which is
+> indistinguishable from the frame never arriving. No frame changed size or
+> layout; one byte that was transmitted as zero now carries meaning (§3.5.3).
 >
 > **v0.5 — C2 and the status indicator, reconciled.** v0.4 was written against
 > a `main` that predated two merged changes (PRs #13 and #15), so it left the
@@ -145,6 +154,7 @@ a shared cycle (§2.2, §3.2–3.5):
 | C2-link state (as forwarded) | `TELEM_STATE` byte 2 | uint8 enum |
 | low-level controller health | `TELEM_STATE` byte 3 | uint8 enum |
 | status-indicator state | `TELEM_STATE` byte 4 | uint8 enum |
+| command acknowledgment | `TELEM_STATE` byte 5 | uint8 bitfield |
 | checksum / CRC | byte 7 of all four frames | uint8 CRC-8 |
 
 **Every field in both directions updates at 20 Hz**, the rate of its frame. The
@@ -331,7 +341,7 @@ the button.
 | 2 | `c2_link` | uint8 | enum | 0–3 | Health of the **base-station C2** link, as *forwarded by the Jetson* (§3.1.3). Never derived from `jetson_link`. |
 | 3 | `controller_health` | uint8 | enum | 0–3 | Aggregate low-level motor-driver / ESC health. |
 | 4 | `indicator_state` | uint8 | enum | 0–4 | What the status indicator is **actually displaying**. |
-| 5 | *reserved* | uint8 | — | transmit as 0 | |
+| 5 | `command_ack` | uint8 | bitfield | 0–7 | Which action commands the controller is **currently holding** from the last valid `CONTROL` frame — see §3.5.3. |
 
 **Link health enum** (`jetson_link`, `c2_link`):
 
@@ -428,6 +438,38 @@ different code, so the question is worth settling before anyone writes any.
 **Controller health enum** (`controller_health`): `0=OK, 1=DEGRADED,
 2=FAULT, 3=NOT_REPORTED`. Currently always `NOT_REPORTED` — no motor-driver
 telemetry is wired up yet.
+
+#### 3.5.3 `command_ack` — proving the command type arrived
+
+| Bit | Name | Echoes |
+|---|---|---|
+| 0 | `ACK_STOP` | `flags` bit 0, `stop` |
+| 1 | `ACK_AUTONOMY_ABORT` | `flags` bit 1, `autonomy_abort` |
+| 2 | `ACK_RETURN_REQUEST` | `flags` bit 2, `return_request` |
+| 3–7 | — | transmit as 0 |
+
+**The bit positions deliberately match the `CONTROL` flags they echo**, so the
+Jetson compares what it sent against what came back with one mask and no
+translation table. `ACK_MASK` (`0x07`) is applied on encode, so the unused bits
+cannot leak a stale value.
+
+**Why this exists.** The brief requires that the MCU "receives and acknowledges
+the correct command type". Two of the three action commands acknowledge
+themselves through behaviour: a `stop` or an `autonomy_abort` visibly halts the
+rover. `return_request` does not and must not — route planning belongs to the
+Jetson, so the controller carries the request and changes nothing. That left
+the only evidence of receipt being *that nothing happened*, which is exactly
+what a frame that never arrived looks like.
+
+**It is a live state, not a latch.** The bits clear as soon as the Jetson stops
+asserting them, so the byte answers "what are you acting on now?" rather than
+"what did you ever see?". A latched abort would keep reading as aborting long
+after release, and an operator checking whether a release took effect would be
+misled at the worst moment.
+
+**It describes the last *valid* command**, like every other field derived from
+it: a rejected frame cannot retract an acknowledgment, because a rejected frame
+updates nothing (§5).
 
 #### 3.5.1 The status indicator, and why request and state are two fields
 
@@ -682,32 +724,69 @@ converged, a single radio hiccup would start stopping the rover in `MANUAL`.
 ## 7. Demonstration and tests — no hardware required
 
 ```
-make test     # 74 C++ tests + 57 host tests
+make test     # 79 C++ tests + 67 host tests
 make demo     # the message-exchange demonstration
 ```
 
 `make demo` runs a live exchange against `tools/rover_sim`, then exercises a
-link cut, the stop flag, an autonomy abort, **C2 loss in each of the two modes
-that differ**, a corrupted frame and a sequence gap. Captured output, trimmed
-to one line per phase:
+link cut, the stop flag, an autonomy abort, a return request, **C2 loss in each
+of the two modes that differ**, a corrupted frame and a sequence gap. Captured
+output, trimmed to one line per phase:
 
 ```
+-- D: autonomy abort while AUTONOMOUS --
+  t= 3.32s  seq= 67  enc=  +43540    +0.00A  24.00V  mode=AUTONOMOUS jet=OK   c2=OK           ind=AUTONOMOUS age=19ms  ack=ABORT  faults=none
+-- D1: return request while AUTONOMOUS -- acknowledged, keeps driving --
+  t= 3.83s  seq= 77  enc=  +47500    +9.00A  23.85V  mode=AUTONOMOUS jet=OK   c2=OK           ind=AUTONOMOUS age=11ms  ack=RETURN faults=none
 -- D2: C2 lost while AUTONOMOUS -- keeps driving, fault raised --
-  t= 3.99s  seq= 80  enc=  +54580   +12.00A  23.80V  mode=AUTONOMOUS jet=OK   c2=LOST         ind=AUTONOMOUS age=20ms  faults=C2_LINK_LOST
+  t= 4.34s  seq= 87  enc=  +63280   +12.00A  23.80V  mode=AUTONOMOUS jet=OK   c2=LOST         ind=AUTONOMOUS age=0ms   ack=-      faults=C2_LINK_LOST
 -- D3: C2 lost while MANUAL -- stops, nobody can reach it --
-  t= 4.50s  seq= 91  enc=  +63380    +0.00A  24.00V  mode=MANUAL     jet=OK   c2=LOST         ind=FAULT      age=20ms  faults=C2_LINK_LOST
+  t= 4.85s  seq= 98  enc=  +78320    +0.00A  24.00V  mode=MANUAL     jet=OK   c2=LOST         ind=FAULT      age=20ms  ack=-      faults=C2_LINK_LOST
 -- E: corrupted payload (app-layer CRC must reject it) --
-  t= 5.19s  seq=104  enc=  +63380    +0.00A  24.00V  mode=MANUAL     jet=LOST c2=NOT_REPORTED ind=FAULT      age=487ms faults=COMM_TIMEOUT,CRC_ERROR
+  t= 5.19s  seq=104  enc=  +78320    +0.00A  24.00V  mode=MANUAL     jet=LOST c2=NOT_REPORTED ind=FAULT      age=486ms ack=-      faults=COMM_TIMEOUT,CRC_ERROR
 -- F: sequence gap (frames 100 -> 140) --
-  t= 5.38s  seq=108  enc=  +66420    +6.00A  23.90V  mode=MANUAL     jet=DEGRADED c2=OK       ind=TELEOP     age=98ms  faults=SEQ_GAP
+  t= 5.90s  seq=118  enc=  +80620    +6.00A  23.90V  mode=MANUAL     jet=DEGRADED c2=OK       ind=TELEOP     age=77ms  ack=-      faults=SEQ_GAP
 ```
 
-Three things in that capture are the whole point of §3.1.3 and §3.5. In **D2**
-an autonomous rover keeps drawing current with C2 lost, and the fault is
+Four things in that capture are the whole point of §3.1.3, §3.5 and §3.5.3.
+**D** and **D1** are the same mode carrying two different action commands: the
+abort zeroes the current, the return request does not, and `ack` is what tells
+them apart on the wire — without it the return request would be invisible. In
+**D2** an autonomous rover keeps drawing current with C2 lost, and the fault is
 reported anyway. In **D3** the same loss in `MANUAL` zeroes the current. In
 **E** the Jetson has gone silent, so `c2=NOT_REPORTED` and `C2_LINK_LOST` is
 *absent* rather than latched: the controller stops asserting a C2 verdict it
 can no longer vouch for.
+
+### 7.1 The brief's eight minimum test cases
+
+The brief names eight scenarios that have to be run and documented.
+`tests/host/test_minimum_cases.py` is those eight, one test per case, in the
+brief's own order and vocabulary, each running end to end against the real
+compiled controller. The file exists separately from `test_integration.py`
+because the two are indexed differently on purpose: `test_integration.py` is
+organised by mechanism, which is the right shape for catching a regression and
+the wrong shape for answering "did we run case 6?".
+
+```
+python3 -m unittest tests.host.test_minimum_cases -v
+```
+
+| # | Case | Test | What it proves beyond "it ran" |
+|---|---|---|---|
+| 1 | Normal teleop packet | `test_case_1_normal_teleop_packet` | CRC passed, command acted on, telemetry returned at rate, mode echo agrees |
+| 2 | Normal autonomous packet, red requested | `test_case_2_normal_autonomous_packet` | The rover *moves* under the autonomous command and shows red, not merely accepts the mode |
+| 3 | Target reached | `test_case_3_target_reached` | Arrival is signalled **while stopped at the target**, and the signal persists — the state URC actually scores |
+| 4 | Corrupted packet | `test_case_4_corrupted_packet` | Measured against a valid-command yardstick, so "it kept coasting on the last good command" is not mistaken for "it obeyed the bad frame" |
+| 5 | Stale command | `test_case_5_stale_command` | `cmd_age_ms` itself climbs past the timeout and keeps climbing — the case is about age, not just about silence |
+| 6 | Jetson heartbeat lost | `test_case_6_jetson_heartbeat_lost` | Reported three ways, telemetry keeps flowing during the loss, recovers unaided |
+| 7 | C2 lost, Jetson alive | `test_case_7_c2_lost_but_jetson_still_alive` | Both link fields disagree *at the same instant*, and autonomy keeps driving while teleop stops |
+| 8 | Abort / return request | `test_case_8_*` (3 tests) | Each type is acknowledged **distinguishably** in `command_ack`, together and separately, and clears on release |
+
+Cases 3, 5 and 8 were each verified to **fail** against a deliberately broken
+controller — the arrival request ignored, the command age saturated at the
+watchdog, and `command_ack` hard-wired to zero — so they are regression tests
+rather than decoration.
 
 Against real hardware the same host script runs unchanged:
 
@@ -836,7 +915,7 @@ Verified to fail on an injected endianness change.
 | `host/demo.py` | Jetson | The demonstration in section 7 |
 | `tools/rover_sim.cpp` | dev machine | Simulator: real controller, fake plant |
 | `tools/golden_vectors.cpp` | dev machine | Emits vectors for cross-language pinning |
-| `tests/cpp/`, `tests/host/` | dev machine | 131 tests total |
+| `tests/cpp/`, `tests/host/` | dev machine | 146 tests total |
 
 ### 10.1 Flashing the Teensy 4.1
 

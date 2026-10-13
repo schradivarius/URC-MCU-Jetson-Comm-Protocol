@@ -257,7 +257,7 @@ static void telemetry_state_round_trips() {
     TelemetryState in;
     in.mode = MODE_AUTONOMOUS; in.jetson_link = LINK_DEGRADED;
     in.c2_link = LINK_LOST; in.controller_health = CTRL_HEALTH_FAULT;
-    in.indicator_state = INDICATOR_ARRIVED; in.reserved = 0;
+    in.indicator_state = INDICATOR_ARRIVED; in.command_ack = ACK_RETURN_REQUEST;
     uint8_t buf[8] = {0};
     encodeTelemetryState(in, 42, buf);
     TelemetryState out; uint8_t seq = 0;
@@ -268,7 +268,18 @@ static void telemetry_state_round_trips() {
     CHECK_EQ(out.c2_link, LINK_LOST);
     CHECK_EQ(out.controller_health, CTRL_HEALTH_FAULT);
     CHECK_EQ(out.indicator_state, INDICATOR_ARRIVED);
+    CHECK_EQ(out.command_ack, ACK_RETURN_REQUEST);
     CHECK_EQ(seq, 42);
+}
+
+static void ack_bits_match_the_control_flag_bits() {
+    // The whole point of the acknowledgment byte is that the Jetson can mask
+    // it with the same constants it used to build the command. If these ever
+    // drift apart, every ack check on the host silently reads the wrong bit.
+    CHECK_EQ((int)ACK_STOP,           (int)CTRL_FLAG_STOP);
+    CHECK_EQ((int)ACK_AUTONOMY_ABORT, (int)CTRL_FLAG_AUTONOMY_ABORT);
+    CHECK_EQ((int)ACK_RETURN_REQUEST, (int)CTRL_FLAG_RETURN_REQUEST);
+    CHECK_EQ((int)ACK_MASK, ACK_STOP | ACK_AUTONOMY_ABORT | ACK_RETURN_REQUEST);
 }
 
 // --- validation -------------------------------------------------------------
@@ -492,6 +503,7 @@ int main() {
     RUN_TEST(telemetry_drive_r_round_trips);
     RUN_TEST(telemetry_power_round_trips_signed_and_wide_faults);
     RUN_TEST(telemetry_state_round_trips);
+    RUN_TEST(ack_bits_match_the_control_flag_bits);
     RUN_TEST(wrong_dlc_is_rejected);
     RUN_TEST(a_corrupted_byte_is_caught_by_the_app_layer_crc);
     RUN_TEST(a_frame_on_the_wrong_can_id_fails);

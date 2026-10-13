@@ -310,7 +310,7 @@ uint8_t encodeTelemetryState(const TelemetryState& msg, uint8_t seq, uint8_t* bu
     buf[2] = msg.c2_link;
     buf[3] = msg.controller_health;
     buf[4] = msg.indicator_state;
-    buf[5] = msg.reserved;
+    buf[5] = static_cast<uint8_t>(msg.command_ack & ACK_MASK);
     return sealFrame(CAN_ID_TELEM_STATE, seq, buf);
 }
 
@@ -323,7 +323,7 @@ DecodeResult decodeTelemetryState(uint32_t can_id, const uint8_t* buf, uint8_t l
     out.c2_link           = buf[2];
     out.controller_health = buf[3];
     out.indicator_state   = buf[4];
-    out.reserved          = buf[5];
+    out.command_ack       = buf[5];
     return DECODE_OK;
 }
 

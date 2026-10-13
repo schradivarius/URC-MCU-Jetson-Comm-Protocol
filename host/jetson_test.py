@@ -141,7 +141,8 @@ class JetsonLink:
                    else "%dms" % age)
         return ("[t=%5.1fs] link=%-4s seq=%3d sent=%4d snap=%4d torn=%2d "
                 "enc=(%+9d,%+9d) steer=%+5d %+7.2fA %6.2fV mode=%-10s "
-                "jet=%-12s c2=%-12s ctrl=%-12s ind=%-10s age=%-8s faults=%s"
+                "jet=%-12s c2=%-12s ctrl=%-12s ind=%-10s age=%-8s ack=%-12s "
+                "faults=%s"
                 % (elapsed, "UP" if self.link_up else "DOWN", s["seq"],
                    self.frames_sent, self.tele.complete_count,
                    self.tele.torn_count, s["enc_left"], s["enc_right"],
@@ -151,7 +152,8 @@ class JetsonLink:
                    rp.LINK_NAMES.get(s["c2_link"], "?"),
                    rp.CTRL_HEALTH_NAMES.get(s["controller_health"], "?"),
                    rp.INDICATOR_NAMES.get(s["indicator_state"], "?"),
-                   age_txt, faults))
+                   age_txt, ",".join(rp.ack_names(s["command_ack"])) or "-",
+                   faults))
 
 
 def run(link, duration_s, c2=None, verbose=True):

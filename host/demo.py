@@ -10,6 +10,7 @@ A: normal 20 Hz operation, four telemetry frames reassembled per cycle.
 B: a deliberate 800 ms silence (well past the 300 ms command watchdog).
 C: the explicit stop flag at full throttle.
 D: autonomy abort while in AUTONOMOUS.
+D1: return request -- acknowledged in telemetry without stopping the rover.
 E: a corrupted frame -- the application-layer CRC rejects it and the rover
    reports CRC_ERROR rather than acting on it.
 F: a sequence gap -- detected and reported as SEQ_GAP.
@@ -34,13 +35,14 @@ def line(jl, t0):
     age = s["cmd_age_ms"]
     age_txt = "never" if age == rp.CMD_AGE_UNKNOWN else "%dms" % age
     return ("  t=%5.2fs  seq=%3d  enc=%+8d  %+7.2fA %6.2fV  mode=%-10s "
-            "jet=%-8s c2=%-12s ind=%-10s age=%-7s faults=%s"
+            "jet=%-8s c2=%-12s ind=%-10s age=%-7s ack=%-8s faults=%s"
             % (time.monotonic() - t0, s["seq"], s["enc_left"], s["current_a"],
                s["voltage_v"], rp.MODE_NAMES.get(s["mode"], "?"),
                rp.LINK_NAMES.get(s["jetson_link"], "?"),
                rp.LINK_NAMES.get(s["c2_link"], "?"),
                rp.INDICATOR_NAMES.get(s["indicator_state"], "?"),
-               age_txt, faults))
+               age_txt, ",".join(rp.ack_names(s["command_ack"])) or "-",
+               faults))
 
 
 def phase(jl, t0, seconds, label, send=True, **kw):
@@ -90,6 +92,15 @@ def main():
               drive_cmd=800, steer_cmd=0, mode=rp.MODE_AUTONOMOUS, c2_lost=False,
               autonomy_abort=True, indicator_request=rp.INDICATOR_AUTONOMOUS)
 
+        # D1: a return request is the opposite case to D. It must be
+        # acknowledged while changing nothing: the MCU carries the request and
+        # the Jetson plans the route, so the rover keeps driving and `ack`
+        # is the only evidence the command arrived at all.
+        phase(jl, t0, 0.5, "D1: return request while AUTONOMOUS -- acknowledged, keeps driving",
+              drive_cmd=600, steer_cmd=0, mode=rp.MODE_AUTONOMOUS, c2_lost=False,
+              return_request=True, indicator_request=rp.INDICATOR_AUTONOMOUS)
+        after_return = jl.snapshot
+
         # The two link failures are NOT equivalent, and these two phases are
         # the demonstration of it. C2 loss with a healthy Jetson is expected on
         # the autonomy course, where line of sight to the base station drops
@@ -135,11 +146,19 @@ def main():
         assert jl.snapshot is not None, "never received a complete snapshot"
         assert jl.tele.complete_count > 10, "too few complete snapshots"
         assert jl.unknown_frames == 0, "unexpected CAN id seen"
+        # D1: the return request has to be visible to the Jetson, and visibly
+        # distinct from an abort -- that distinction is the whole requirement.
+        assert after_return is not None, "no snapshot during the return request"
+        assert after_return["command_ack"] & rp.ACK_RETURN_REQUEST, \
+            "the return request was never acknowledged"
+        assert not after_return["command_ack"] & rp.ACK_AUTONOMY_ABORT, \
+            "a return request was acknowledged as an abort"
         print()
         print("PASS: snapshots reassembled from four frames throughout; the")
         print("watchdog, stop flag and autonomy abort each forced a stop; C2")
         print("loss stopped a teleoperated rover but not an autonomous one; the")
-        print("application-layer CRC rejected a corrupted frame; and a")
+        print("application-layer CRC rejected a corrupted frame; a return")
+        print("request was acknowledged without stopping the rover; and a")
         print("sequence gap was detected and reported.")
     finally:
         link.close()

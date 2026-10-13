@@ -135,6 +135,11 @@ public:
     const ControlMsg& lastControl() const { return last_control_; }
     bool autonomyAbort() const { return last_control_.autonomy_abort; }
     bool returnRequest() const { return last_control_.return_request; }
+
+    // ACK_* bitmask of the action commands currently held, as reported in
+    // TELEM_STATE. A live state, not a latch: it clears when the Jetson stops
+    // asserting the flag.
+    uint8_t commandAck() const;
     bool c2Lost() const { return last_control_.c2_lost; }
 
     uint32_t controlFramesAccepted() const { return control_frames_accepted_; }

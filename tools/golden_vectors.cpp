@@ -141,22 +141,27 @@ int main() {
     }
 
     // --- TELEM_STATE -----------------------------------------------------
-    struct ST { uint8_t mode, jl, c2, h, ind, seq; };
+    struct ST { uint8_t mode, jl, c2, h, ind, seq, ack; };
     const ST sts[] = {
         {MODE_DISABLED, LINK_LOST, LINK_NOT_REPORTED, CTRL_HEALTH_NOT_REPORTED,
-         INDICATOR_OFF, 0},
-        {MODE_MANUAL, LINK_OK, LINK_OK, CTRL_HEALTH_OK, INDICATOR_TELEOP, 11},
+         INDICATOR_OFF, 0, 0},
+        {MODE_MANUAL, LINK_OK, LINK_OK, CTRL_HEALTH_OK, INDICATOR_TELEOP, 11, 0},
         {MODE_AUTONOMOUS, LINK_DEGRADED, LINK_LOST, CTRL_HEALTH_DEGRADED,
-         INDICATOR_AUTONOMOUS, 12},
+         INDICATOR_AUTONOMOUS, 12, ACK_AUTONOMY_ABORT},
         {MODE_AUTONOMOUS, LINK_OK, LINK_NOT_REPORTED, CTRL_HEALTH_FAULT,
-         INDICATOR_FAULT, 13},
+         INDICATOR_FAULT, 13, ACK_RETURN_REQUEST},
+        // Every acknowledgment bit at once, so a Python-side mask error on any
+        // one of the three shows up as a byte mismatch rather than passing.
+        {MODE_AUTONOMOUS, LINK_OK, LINK_OK, CTRL_HEALTH_OK,
+         INDICATOR_ARRIVED, 14, ACK_MASK},
     };
     for (const ST& s : sts) {
         TelemetryState m; m.mode = s.mode; m.jetson_link = s.jl; m.c2_link = s.c2;
-        m.controller_health = s.h; m.indicator_state = s.ind; m.reserved = 0;
+        m.controller_health = s.h; m.indicator_state = s.ind;
+        m.command_ack = s.ack;
         uint8_t n = encodeTelemetryState(m, s.seq, buf);
-        std::snprintf(args, sizeof(args), "%u,%u,%u,%u,%u,%u",
-                      s.mode, s.jl, s.c2, s.h, s.ind, s.seq);
+        std::snprintf(args, sizeof(args), "%u,%u,%u,%u,%u,%u,%u",
+                      s.mode, s.jl, s.c2, s.h, s.ind, s.seq, s.ack);
         emitHex("STATE", args, buf, n);
     }
     return 0;
