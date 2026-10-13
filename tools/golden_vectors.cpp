@@ -17,6 +17,8 @@
 //   MODE|<value>|<known><motion>         two 0/1 digits
 //   INDICATOR|<value>|<known>
 //   RANGE|<value>|<valid>
+//   AUTHORITY|<from_autonomy>,<mode>|<owns>
+//   CMDSTATUS|<status>,<decode>,<return>|<packed hex>
 //   <NAME>|<args>|<frame hex>            encoded frames
 
 #include <cstdio>
@@ -42,7 +44,8 @@ int main() {
     const uint8_t sample[6] = {1, 2, 3, 4, 5, 6};
     const uint32_t ids[] = {CAN_ID_CONTROL, CAN_ID_TELEM_DRIVE_L,
                             CAN_ID_TELEM_DRIVE_R, CAN_ID_TELEM_POWER,
-                            CAN_ID_TELEM_STATE, 0x7FF, 0x000};
+                            CAN_ID_TELEM_STATE, CAN_ID_TELEM_CMD_ECHO,
+                            0x7FF, 0x000};
     for (uint32_t id : ids) {
         std::printf("FRAMECRC|%u|010203040506|%02x\n",
                     static_cast<unsigned>(id), frameCrc8(id, sample, 6));
@@ -73,31 +76,65 @@ int main() {
         std::printf("RANGE|%d|%d\n", v, isValidCommand(v) ? 1 : 0);
     }
 
+    // Command authority, exhaustive over the mode byte for both sources. The
+    // failure this pins is an undefined mode reading as owned by whoever
+    // asked -- a whitelist that quietly became a blacklist on one side only.
+    for (int src = 0; src <= 1; ++src) {
+        for (int m = 0; m <= 255; ++m) {
+            std::printf("AUTHORITY|%d,%d|%d\n", src, m,
+                        sourceOwnsMode(src != 0, static_cast<uint8_t>(m)) ? 1 : 0);
+        }
+    }
+
+    // The command-status byte. Two 3-bit fields and a flag sharing one byte is
+    // exactly the kind of packing that goes wrong on one side only.
+    const uint8_t statuses[] = {CMD_STATUS_APPLIED, CMD_STATUS_STOPPED,
+                                CMD_STATUS_WRONG_SOURCE, CMD_STATUS_NO_COMMAND};
+    const DecodeResult decodes[] = {DECODE_OK, DECODE_BAD_DLC, DECODE_BAD_CRC,
+                                    DECODE_BAD_MODE, DECODE_BAD_FLAGS,
+                                    DECODE_BAD_INDICATOR, DECODE_BAD_RANGE};
+    for (uint8_t st : statuses) {
+        for (DecodeResult dr : decodes) {
+            for (int ret = 0; ret <= 1; ++ret) {
+                std::printf("CMDSTATUS|%u,%u,%d|%02x\n", st,
+                            static_cast<unsigned>(dr), ret,
+                            packCmdStatus(st, dr, ret != 0));
+            }
+        }
+    }
+
     // --- CONTROL ---------------------------------------------------------
-    struct Ctl { int16_t d, s; uint8_t m; bool stop, abort, ret, c2; uint8_t ind, seq; };
+    struct Ctl { int16_t d, s; uint8_t m; bool stop, abort, ret, c2, aut; uint8_t ind, seq; };
     const Ctl ctls[] = {
-        {     0,     0, MODE_DISABLED,   true,  false, false, false, INDICATOR_OFF,        0},
-        {   500,  -200, MODE_MANUAL,     false, false, false, false, INDICATOR_TELEOP,     1},
-        {  1000, -1000, MODE_AUTONOMOUS, false, false, false, false, INDICATOR_AUTONOMOUS, 42},
-        { -1000,  1000, MODE_MANUAL,     true,  true,  true,  true,  INDICATOR_ARRIVED,  255},
+        {     0,     0, MODE_DISABLED,   true,  false, false, false, false, INDICATOR_OFF,        0},
+        {   500,  -200, MODE_MANUAL,     false, false, false, false, false, INDICATOR_TELEOP,     1},
+        {  1000, -1000, MODE_AUTONOMOUS, false, false, false, false, true,  INDICATOR_AUTONOMOUS, 42},
+        { -1000,  1000, MODE_MANUAL,     true,  true,  true,  true,  false, INDICATOR_ARRIVED,  255},
         // These two were -32768,32767 and -21846,170 before command-range
         // validation. Both are outside CMD_MIN..CMD_MAX, so they no longer
         // decode; the boundary itself is pinned by the RANGE table above and
         // the extreme-int16 ENCODING by the_encoder_still_writes_any_int16.
-        {  -999,   999, MODE_MANUAL,     false, false, true,  false, INDICATOR_FAULT,    128},
-        {  -846,   170, MODE_AUTONOMOUS, false, true,  false, true,  INDICATOR_OFF,        7},
-        {   250,   -50, MODE_AUTONOMOUS, false, false, false, true,  INDICATOR_AUTONOMOUS, 64},
-        {     0,     0, MODE_MANUAL,     false, false, false, true,  INDICATOR_TELEOP,    65},
+        {  -999,   999, MODE_MANUAL,     false, false, true,  false, false, INDICATOR_FAULT,    128},
+        {  -846,   170, MODE_AUTONOMOUS, false, true,  false, true,  true,  INDICATOR_OFF,        7},
+        {   250,   -50, MODE_AUTONOMOUS, false, false, false, true,  true,  INDICATOR_AUTONOMOUS, 64},
+        {     0,     0, MODE_MANUAL,     false, false, false, true,  false, INDICATOR_TELEOP,    65},
+        // Both mismatched combinations, which are legal on the wire and
+        // refused by the controller rather than by the codec. If either side
+        // ever started rejecting them at decode, these two rows would be the
+        // first thing to fail.
+        {   700,   100, MODE_MANUAL,     false, false, false, false, true,  INDICATOR_TELEOP,    66},
+        {   700,   100, MODE_AUTONOMOUS, false, false, false, false, false, INDICATOR_ARRIVED,   67},
     };
     for (const Ctl& c : ctls) {
         ControlMsg m;
         m.drive_cmd = c.d; m.steer_cmd = c.s; m.mode = c.m;
         m.stop = c.stop; m.autonomy_abort = c.abort; m.return_request = c.ret;
-        m.c2_lost = c.c2; m.indicator_request = c.ind; m.seq = c.seq;
+        m.c2_lost = c.c2; m.from_autonomy = c.aut;
+        m.indicator_request = c.ind; m.seq = c.seq;
         uint8_t n = encodeControl(m, buf);
-        std::snprintf(args, sizeof(args), "%d,%d,%u,%d,%d,%d,%d,%u,%u",
+        std::snprintf(args, sizeof(args), "%d,%d,%u,%d,%d,%d,%d,%d,%u,%u",
                       c.d, c.s, c.m, c.stop ? 1 : 0, c.abort ? 1 : 0,
-                      c.ret ? 1 : 0, c.c2 ? 1 : 0, c.ind, c.seq);
+                      c.ret ? 1 : 0, c.c2 ? 1 : 0, c.aut ? 1 : 0, c.ind, c.seq);
         emitHex("CONTROL", args, buf, n);
     }
 
@@ -158,6 +195,27 @@ int main() {
         std::snprintf(args, sizeof(args), "%u,%u,%u,%u,%u,%u",
                       s.mode, s.jl, s.c2, s.h, s.ind, s.seq);
         emitHex("STATE", args, buf, n);
+    }
+
+    // --- TELEM_CMD_ECHO --------------------------------------------------
+    struct EC { int16_t d, s; uint8_t ack, st; DecodeResult dr; bool ret; uint8_t seq; };
+    const EC ecs[] = {
+        {    0,     0,   0, CMD_STATUS_NO_COMMAND,   DECODE_OK,        false,   0},
+        {  500,  -200,   7, CMD_STATUS_APPLIED,      DECODE_OK,        false,  21},
+        {    0,     0,  99, CMD_STATUS_WRONG_SOURCE, DECODE_OK,        false,  22},
+        {    0,     0, 255, CMD_STATUS_STOPPED,      DECODE_BAD_CRC,   false,  23},
+        { 1000, -1000, 128, CMD_STATUS_APPLIED,      DECODE_BAD_RANGE, true,   24},
+        {-1000,  1000,   1, CMD_STATUS_APPLIED,      DECODE_OK,        true,  255},
+    };
+    for (const EC& e : ecs) {
+        TelemetryCmdEcho m;
+        m.drive_applied = e.d; m.steer_applied = e.s; m.ack_seq = e.ack;
+        m.status = packCmdStatus(e.st, e.dr, e.ret);
+        uint8_t n = encodeTelemetryCmdEcho(m, e.seq, buf);
+        std::snprintf(args, sizeof(args), "%d,%d,%u,%u,%u,%d,%u",
+                      e.d, e.s, e.ack, e.st, static_cast<unsigned>(e.dr),
+                      e.ret ? 1 : 0, e.seq);
+        emitHex("CMD_ECHO", args, buf, n);
     }
     return 0;
 }

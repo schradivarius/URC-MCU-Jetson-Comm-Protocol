@@ -67,10 +67,10 @@ class TestCrcAgreement(GoldenBase):
                              "frame_crc8 disagrees for id %s" % can_id)
 
     def test_the_id_seed_actually_changes_the_crc(self):
-        payload = bytes(range(6))
-        crcs = {p.frame_crc8(cid, payload)
-                for cid in (p.CAN_ID_CONTROL,) + p.TELEM_IDS}
-        self.assertEqual(len(crcs), 5, "the CAN id is not affecting the CRC")
+        ids = (p.CAN_ID_CONTROL,) + p.TELEM_IDS
+        crcs = {p.frame_crc8(cid, bytes(range(6))) for cid in ids}
+        self.assertEqual(len(crcs), len(ids),
+                         "the CAN id is not affecting the CRC")
 
 
 class TestPredicateAgreement(GoldenBase):
@@ -124,15 +124,57 @@ class TestPredicateAgreement(GoldenBase):
                              "seq_delta(%d,%d) disagrees" % (prev, cur))
 
 
+class TestAuthorityAgreement(GoldenBase):
+    """The mux rule exists on both sides, so it is pinned like the codec."""
+
+    def test_authority_agrees_for_every_mode_and_both_sources(self):
+        rows = self.rowsOf("AUTHORITY")
+        self.assertEqual(len(rows), 512, "expected both sources x 256 modes")
+        for _, args, owns in rows:
+            src, mode = (int(a) for a in args.split(","))
+            self.assertEqual(p.source_owns_mode(bool(src), mode), owns == "1",
+                             "source_owns_mode disagrees for src=%d mode=%d"
+                             % (src, mode))
+
+    def test_no_undefined_mode_is_ever_owned_by_a_motion_command(self):
+        # Independent of the C++ output, so a matching pair of wrong
+        # implementations still fails. The only modes where the question has a
+        # real answer are the two that permit motion.
+        for mode in range(256):
+            if mode == p.MODE_AUTONOMOUS:
+                self.assertTrue(p.source_owns_mode(True, mode))
+                self.assertFalse(p.source_owns_mode(False, mode))
+            elif mode == p.MODE_MANUAL:
+                self.assertTrue(p.source_owns_mode(False, mode))
+                self.assertFalse(p.source_owns_mode(True, mode))
+            else:
+                # Nothing may move, so neither source is wrong -- and nothing
+                # is authorised to move either, which modePermitsMotion says.
+                self.assertFalse(p.mode_permits_motion(mode))
+
+    def test_the_command_status_byte_packs_identically(self):
+        rows = self.rowsOf("CMDSTATUS")
+        for _, args, packed_hex in rows:
+            status, decode, ret = (int(a) for a in args.split(","))
+            got = p.pack_cmd_status(status, decode, bool(ret))
+            self.assertEqual("%02x" % got, packed_hex,
+                             "pack_cmd_status disagrees for %s" % args)
+            self.assertEqual(p.cmd_status_of(got), status)
+            self.assertEqual(p.decode_result_of(got), decode)
+            self.assertEqual(p.return_active_of(got), bool(ret))
+            self.assertEqual(got & p.CMD_ECHO_RESERVED_MASK, 0)
+
+
 class TestFrameAgreement(GoldenBase):
     def encode(self, kind, args):
         n = [int(a) for a in args.split(",")]
         if kind == "CONTROL":
             return p.encode_control(n[0], n[1], n[2], bool(n[6]),
-                                    stop=bool(n[3]), seq=n[8],
+                                    stop=bool(n[3]), seq=n[9],
                                     autonomy_abort=bool(n[4]),
                                     return_request=bool(n[5]),
-                                    indicator_request=n[7])
+                                    from_autonomy=bool(n[7]),
+                                    indicator_request=n[8])
         if kind == "DRIVE_L":
             return p.encode_telemetry_drive_l(n[0], n[1], seq=n[2])
         if kind == "DRIVE_R":
@@ -141,9 +183,13 @@ class TestFrameAgreement(GoldenBase):
             return p.encode_telemetry_power(n[0], n[1], n[2], seq=n[3])
         if kind == "STATE":
             return p.encode_telemetry_state(n[0], n[1], n[2], n[3], n[4], seq=n[5])
+        if kind == "CMD_ECHO":
+            return p.encode_telemetry_cmd_echo(
+                n[0], n[1], n[2],
+                p.pack_cmd_status(n[3], n[4], bool(n[5])), seq=n[6])
         self.fail("unknown vector kind %r" % kind)
 
-    FRAME_KINDS = ("CONTROL", "DRIVE_L", "DRIVE_R", "POWER", "STATE")
+    FRAME_KINDS = ("CONTROL", "DRIVE_L", "DRIVE_R", "POWER", "STATE", "CMD_ECHO")
 
     def test_every_frame_encodes_identically(self):
         checked = 0
@@ -165,6 +211,7 @@ class TestFrameAgreement(GoldenBase):
             "DRIVE_R": lambda f: p.decode_telemetry_drive_r(f),
             "POWER":   lambda f: p.decode_telemetry_power(f),
             "STATE":   lambda f: p.decode_telemetry_state(f),
+            "CMD_ECHO": lambda f: p.decode_telemetry_cmd_echo(f),
         }
         for kind in self.FRAME_KINDS:
             for _, args, frame_hex in self.rowsOf(kind):
@@ -176,9 +223,31 @@ class TestFrameAgreement(GoldenBase):
 
     def test_sequence_number_survives_the_round_trip(self):
         for _, args, frame_hex in self.rowsOf("CONTROL"):
-            expected_seq = int(args.split(",")[8])
+            expected_seq = int(args.split(",")[9])
             _, decoded = p.decode_control(bytes.fromhex(frame_hex))
             self.assertEqual(decoded["seq"], expected_seq)
+
+    def test_the_command_source_survives_the_round_trip(self):
+        seen = set()
+        for _, args, frame_hex in self.rowsOf("CONTROL"):
+            expected = bool(int(args.split(",")[7]))
+            _, decoded = p.decode_control(bytes.fromhex(frame_hex))
+            self.assertEqual(decoded["from_autonomy"], expected,
+                             "the source bit disagrees for CONTROL(%s)" % args)
+            seen.add(expected)
+        self.assertEqual(seen, {False, True},
+                         "the vectors never exercise both command sources")
+
+    def test_the_echo_status_byte_unpacks_to_what_cpp_packed(self):
+        for _, args, frame_hex in self.rowsOf("CMD_ECHO"):
+            n = [int(a) for a in args.split(",")]
+            _, decoded = p.decode_telemetry_cmd_echo(bytes.fromhex(frame_hex))
+            self.assertEqual(decoded["drive_applied"], n[0])
+            self.assertEqual(decoded["steer_applied"], n[1])
+            self.assertEqual(decoded["ack_seq"], n[2])
+            self.assertEqual(decoded["cmd_status"], n[3])
+            self.assertEqual(decoded["last_decode"], n[4])
+            self.assertEqual(decoded["return_active"], bool(n[5]))
 
     def test_every_frame_is_exactly_eight_bytes(self):
         # 8 bytes is Classic CAN's limit. Exceeding it would force CAN FD
@@ -219,26 +288,53 @@ class TestPythonValidation(unittest.TestCase):
         for n in range(0, 8):
             self.assertEqual(p.decode_control(frame[:n])[0], p.DECODE_BAD_DLC)
 
-    def test_reserved_flag_bits_are_rejected(self):
-        # Only bit 7 is reserved now: bit 6 carries c2_lost.
-        flags = p.pack_control_flags(False, stop=True) | 0x80
-        frame = p.encode_control(0, 0, p.MODE_MANUAL, False, raw_flags=flags)
-        self.assertEqual(p.decode_control(frame)[0], p.DECODE_BAD_FLAGS)
+    def test_no_flags_byte_value_is_rejected_any_more(self):
+        """v0.5 rejected bit 7 as reserved; v0.6 gave it to from_autonomy, so
+        the only part of the flags byte that can still be out of range is the
+        indicator field inside it. The guard that the check was really
+        removed, rather than left checking a mask someone resets later."""
+        for raw in range(256):
+            frame = p.encode_control(0, 0, p.MODE_MANUAL, False, raw_flags=raw)
+            ind = (raw & p.CTRL_INDICATOR_MASK) >> p.CTRL_INDICATOR_SHIFT
+            expected = (p.DECODE_OK if p.is_known_indicator(ind)
+                        else p.DECODE_BAD_INDICATOR)
+            self.assertEqual(p.decode_control(frame)[0], expected,
+                             "flags=0x%02x decoded unexpectedly" % raw)
 
-    def test_the_c2_flag_bit_is_not_reserved(self):
-        """Bit 6 is a real field, so setting it must NOT reject the frame --
-        the guard against a typo'd mask writing into a live field."""
-        flags = p.pack_control_flags(True, stop=True)
+    def test_the_c2_and_source_bits_are_fields_not_reserved_bits(self):
+        """Bits 6 and 7 are real fields, so setting them must NOT reject the
+        frame -- the guard against a stray mask writing into a live field."""
+        flags = p.pack_control_flags(True, stop=True, from_autonomy=True)
         self.assertEqual(flags & p.CTRL_FLAG_C2_LOST, p.CTRL_FLAG_C2_LOST)
+        self.assertEqual(flags & p.CTRL_FLAG_FROM_AUTONOMY,
+                         p.CTRL_FLAG_FROM_AUTONOMY)
         result, decoded = p.decode_control(
-            p.encode_control(0, 0, p.MODE_MANUAL, False, raw_flags=flags))
+            p.encode_control(0, 0, p.MODE_AUTONOMOUS, False, raw_flags=flags))
         self.assertEqual(result, p.DECODE_OK)
         self.assertTrue(decoded["c2_lost"])
+        self.assertTrue(decoded["from_autonomy"])
+
+    def test_a_mismatched_source_is_not_a_codec_error(self):
+        """Authority is the controller's decision, not the codec's. If decode
+        ever started rejecting these, a Jetson-side mux bug would stop the
+        rover instead of being reported."""
+        for mode, src in ((p.MODE_MANUAL, True), (p.MODE_AUTONOMOUS, False)):
+            frame = p.encode_control(700, 100, mode, False, from_autonomy=src)
+            result, decoded = p.decode_control(frame)
+            self.assertEqual(result, p.DECODE_OK)
+            self.assertFalse(p.source_owns_mode(decoded["from_autonomy"],
+                                                decoded["mode"]))
 
     def test_undefined_indicator_request_is_rejected(self):
         for ind in (5, 6, 7):
             frame = p.encode_control(0, 0, p.MODE_MANUAL, False, indicator_request=ind)
             self.assertEqual(p.decode_control(frame)[0], p.DECODE_BAD_INDICATOR)
+
+    def test_the_command_source_fault_bit_is_named(self):
+        """0x0400 was the first of the bits PROTOCOL.md 3.5.2 held in reserve
+        until someone was actually building the thing that needed one."""
+        self.assertEqual(p.FAULT_CMD_SOURCE, 0x0400)
+        self.assertEqual(p.fault_names(0x0400), ["CMD_SOURCE"])
 
     def test_the_c2_fault_bit_is_named(self):
         """0x0080 is FAULT_C2_LINK_LOST, which v0.4 had left reserved."""

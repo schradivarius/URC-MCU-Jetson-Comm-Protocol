@@ -43,6 +43,10 @@ class RoverFixture(unittest.TestCase):
         kw.setdefault("steer_cmd", 100)
         kw.setdefault("mode", rp.MODE_MANUAL)
         kw.setdefault("c2_lost", False)
+        # Default to the producer that OWNS the mode being commanded, so a
+        # test that is not about authority does not have to think about it --
+        # and the ones that are say so explicitly.
+        kw.setdefault("from_autonomy", kw["mode"] == rp.MODE_AUTONOMOUS)
         end = time.monotonic() + seconds
         while time.monotonic() < end:
             if send:
@@ -71,9 +75,9 @@ class RoverFixture(unittest.TestCase):
 
 
 class TestSnapshotAssembly(RoverFixture):
-    """The four telemetry frames must reassemble into coherent snapshots."""
+    """The five telemetry frames must reassemble into coherent snapshots."""
 
-    def test_all_four_frames_arrive_and_assemble(self):
+    def test_all_five_frames_arrive_and_assemble(self):
         self.drive(0.6)
         self.assertGreater(self.jl.tele.complete_count, 5)
         for can_id in rp.TELEM_IDS:
@@ -83,7 +87,7 @@ class TestSnapshotAssembly(RoverFixture):
         self.assertEqual(self.jl.unknown_frames, 0)
 
     def test_snapshots_are_not_torn(self):
-        # All four frames of a cycle share one sequence number. Over a clean
+        # All five frames of a cycle share one sequence number. Over a clean
         # link every snapshot should be coherent.
         self.drive(1.0)
         self.assertEqual(self.jl.tele.torn_count, 0,
@@ -103,7 +107,12 @@ class TestSnapshotAssembly(RoverFixture):
         for field in ("seq", "enc_left", "enc_right", "steer_fb", "current_ca",
                       "voltage_cv", "mode", "fault_status", "cmd_age_ms",
                       "jetson_link", "c2_link", "controller_health",
-                      "indicator_state"):
+                      "indicator_state",
+                      # Task 4's feedback loop adds these three. The accepted
+                      # commands are what let the Jetson tell "my command got
+                      # through" from "the rover happens to be moving".
+                      "drive_applied", "steer_applied", "ack_seq",
+                      "cmd_status", "last_decode", "return_active"):
             self.assertIn(field, s, "telemetry is missing %r" % field)
 
 
@@ -320,6 +329,188 @@ class TestBusHygiene(RoverFixture):
         self.assertIn("SEQ_GAP", self.faults())
         self.assertEqual(self.snap()["jetson_link"], rp.LINK_DEGRADED,
                          "a sequence gap did not degrade the reported link")
+
+
+class TestCommandAuthority(RoverFixture):
+    """Task 4's core claim: manual and autonomous commands do not get mixed up.
+
+    These run against the real compiled controller over a real pipe, so what
+    they check is the behaviour a rover would show, not a predicate.
+    """
+
+    def test_an_autonomy_command_is_not_acted_on_while_teleoperated(self):
+        self.drive(0.6, drive_cmd=600, steer_cmd=0, mode=rp.MODE_MANUAL,
+                   from_autonomy=True)
+        s = self.snap()
+        self.assertEqual(s["enc_left"], 0, "an unauthorised command drove the rover")
+        self.assertEqual(s["drive_applied"], 0)
+        self.assertEqual(s["cmd_status"], rp.CMD_STATUS_WRONG_SOURCE)
+        self.assertIn("CMD_SOURCE", self.faults())
+        # Refused, not disconnected: the frame was valid and the link is fine.
+        self.assertNotIn("COMM_TIMEOUT", self.faults())
+        self.assertEqual(s["jetson_link"], rp.LINK_OK)
+
+    def test_the_same_command_drives_once_the_mode_matches(self):
+        # The demonstration the task asks for, end to end: identical command,
+        # only the mode differs.
+        self.drive(0.6, drive_cmd=600, steer_cmd=0, mode=rp.MODE_MANUAL,
+                   from_autonomy=True)
+        refused = self.snap()["enc_left"]
+        self.assertEqual(refused, 0)
+
+        self.drive(0.6, drive_cmd=600, steer_cmd=0, mode=rp.MODE_AUTONOMOUS,
+                   from_autonomy=True)
+        s = self.snap()
+        self.assertGreater(s["enc_left"], 0, "the authorised command did not drive")
+        self.assertEqual(s["drive_applied"], 600)
+        self.assertEqual(s["cmd_status"], rp.CMD_STATUS_APPLIED)
+        self.assertNotIn("CMD_SOURCE", self.faults())
+
+    def test_a_teleop_command_is_not_acted_on_while_autonomous(self):
+        self.drive(0.6, drive_cmd=600, steer_cmd=0, mode=rp.MODE_AUTONOMOUS,
+                   from_autonomy=False)
+        self.assertEqual(self.snap()["enc_left"], 0)
+        self.assertEqual(self.snap()["cmd_status"], rp.CMD_STATUS_WRONG_SOURCE)
+
+    def test_stop_still_overrides_an_authorised_autonomy_command(self):
+        self.drive(0.5, drive_cmd=800, mode=rp.MODE_AUTONOMOUS)
+        moving = self.snap()["enc_left"]
+        self.assertGreater(moving, 0)
+        self.drive(0.5, drive_cmd=800, mode=rp.MODE_AUTONOMOUS, stop=True)
+        halted = self.snap()["enc_left"]
+        self.drive(0.4, drive_cmd=800, mode=rp.MODE_AUTONOMOUS, stop=True)
+        self.assertEqual(self.snap()["enc_left"], halted)
+        self.assertEqual(self.snap()["cmd_status"], rp.CMD_STATUS_STOPPED)
+
+    def test_a_stop_from_the_unauthorised_source_still_stops_the_rover(self):
+        # Safety flags are never gated by authority: an operator who can see
+        # the rover must be able to stop it even while autonomy owns the mode.
+        self.drive(0.5, drive_cmd=800, mode=rp.MODE_AUTONOMOUS)
+        self.assertGreater(self.snap()["enc_left"], 0)
+        self.drive(0.5, drive_cmd=800, mode=rp.MODE_AUTONOMOUS,
+                   from_autonomy=False, stop=True)
+        halted = self.snap()["enc_left"]
+        self.drive(0.4, drive_cmd=800, mode=rp.MODE_AUTONOMOUS,
+                   from_autonomy=False, stop=True)
+        self.assertEqual(self.snap()["enc_left"], halted)
+        self.assertEqual(self.snap()["cmd_status"], rp.CMD_STATUS_STOPPED)
+
+    def test_the_refusal_does_not_latch(self):
+        # A safety gate that cannot be left is a rover that has to be
+        # power-cycled at a competition.
+        self.drive(0.5, drive_cmd=600, mode=rp.MODE_MANUAL, from_autonomy=True)
+        self.assertIn("CMD_SOURCE", self.faults())
+        self.drive(0.5, drive_cmd=600, mode=rp.MODE_MANUAL, from_autonomy=False)
+        self.assertNotIn("CMD_SOURCE", self.faults())
+        self.assertEqual(self.snap()["cmd_status"], rp.CMD_STATUS_APPLIED)
+        self.assertGreater(self.snap()["enc_left"], 0)
+
+    def test_an_unauthorised_arrival_claim_does_not_light_the_indicator(self):
+        # Flashing green is worth 25 points under rule 1.e.xvii.
+        self.drive(0.5, drive_cmd=0, mode=rp.MODE_AUTONOMOUS,
+                   from_autonomy=False, indicator_request=rp.INDICATOR_ARRIVED)
+        self.assertEqual(self.snap()["indicator_state"], rp.INDICATOR_AUTONOMOUS)
+        self.drive(0.5, drive_cmd=0, mode=rp.MODE_AUTONOMOUS,
+                   from_autonomy=True, indicator_request=rp.INDICATOR_ARRIVED)
+        self.assertEqual(self.snap()["indicator_state"], rp.INDICATOR_ARRIVED)
+
+    def test_a_stale_source_mismatch_is_not_reported(self):
+        # Once the watchdog trips, the controller cannot vouch for who sent
+        # the last frame any more than for what it said.
+        self.drive(0.5, drive_cmd=600, mode=rp.MODE_MANUAL, from_autonomy=True)
+        self.assertIn("CMD_SOURCE", self.faults())
+        self.drive(0.7, send=False)
+        self.assertIn("COMM_TIMEOUT", self.faults())
+        self.assertNotIn("CMD_SOURCE", self.faults())
+
+
+class TestAcknowledgement(RoverFixture):
+    """TELEM_CMD_ECHO: the Jetson has to be able to prove a command landed."""
+
+    def test_the_controller_acknowledges_the_sequence_it_acted_on(self):
+        self.drive(0.6, drive_cmd=400)
+        s = self.snap()
+        # The ack has to name a frame we actually sent, and a recent one --
+        # 20 Hz commands and 20 Hz telemetry should never be far apart.
+        self.assertLessEqual(rp.seq_delta(s["ack_seq"], self.jl.tx_seq), 10,
+                             "the acknowledged sequence number is far behind")
+        self.assertEqual(s["cmd_status"], rp.CMD_STATUS_APPLIED)
+        self.assertEqual(s["last_decode"], rp.DECODE_OK)
+
+    def test_the_echo_reports_why_the_last_frame_was_rejected(self):
+        # A rejected frame and an applied command can coexist: the reason the
+        # last frame bounced is its own field, not a verdict on the command.
+        self.drive(0.4, drive_cmd=400)
+        good = rp.encode_control(400, 0, rp.MODE_MANUAL, False, seq=90)
+        bad = bytearray(good)
+        bad[0] ^= 0xFF
+        self.send_raw(bytes(bad), 0.2)
+        self.assertEqual(self.snap()["last_decode"], rp.DECODE_BAD_CRC)
+
+    def test_the_echo_tracks_what_the_drive_stage_was_handed(self):
+        for drive_cmd, steer_cmd in ((0, 0), (250, -100), (1000, 0), (-700, 400)):
+            self.drive(0.4, drive_cmd=drive_cmd, steer_cmd=steer_cmd)
+            s = self.snap()
+            self.assertEqual(s["drive_applied"], drive_cmd)
+            self.assertEqual(s["steer_applied"], steer_cmd)
+
+    def test_a_return_request_is_acknowledged_without_stopping_the_rover(self):
+        # Reported, not obeyed: driving back is route planning, and
+        # PROTOCOL.md section 9 leaves the semantics as a team decision.
+        self.drive(0.5, drive_cmd=500, mode=rp.MODE_AUTONOMOUS,
+                   return_request=True)
+        s = self.snap()
+        self.assertTrue(s["return_active"])
+        self.assertEqual(s["cmd_status"], rp.CMD_STATUS_APPLIED)
+        self.assertEqual(s["drive_applied"], 500)
+        self.assertGreater(s["enc_left"], 0, "the return request stopped the rover")
+        self.assertEqual(s["indicator_state"], rp.INDICATOR_AUTONOMOUS)
+
+    def test_controller_health_is_no_longer_a_constant(self):
+        # The drive module reports its own state, so this field finally
+        # carries something. OK while driving normally.
+        self.drive(0.6, drive_cmd=400, steer_cmd=0)
+        self.assertEqual(self.snap()["controller_health"], rp.CTRL_HEALTH_OK)
+
+    def test_a_saturating_mix_is_reported_as_degraded(self):
+        # drive 800 + steer 400 asks for 1200 on one side. The module scales
+        # the pair down to keep the turn, and says it could not deliver both.
+        self.drive(0.6, drive_cmd=800, steer_cmd=400, mode=rp.MODE_AUTONOMOUS)
+        self.assertEqual(self.snap()["controller_health"],
+                         rp.CTRL_HEALTH_DEGRADED)
+        # Still driving -- DEGRADED is information, not a fault.
+        self.assertGreater(self.snap()["enc_left"], 0)
+        self.assertEqual(self.faults(), [])
+
+
+class TestDriveStage(RoverFixture):
+    """The mixing actually reaches the plant, rather than stopping at a struct."""
+
+    def test_steering_splits_the_two_encoders(self):
+        # Straight ahead: both sides equal. Turning: they diverge, and in the
+        # commanded direction.
+        self.drive(0.6, drive_cmd=400, steer_cmd=0)
+        s = self.snap()
+        self.assertEqual(s["enc_left"], s["enc_right"],
+                         "the sides differ with no steering commanded")
+
+        self.drive(0.6, drive_cmd=400, steer_cmd=300)
+        s = self.snap()
+        self.assertGreater(s["enc_left"], s["enc_right"],
+                           "a right turn did not out-run the left side")
+
+    def test_the_steering_actuator_follows_the_command(self):
+        self.drive(0.8, drive_cmd=0, steer_cmd=500)
+        self.assertAlmostEqual(self.snap()["steer_fb"], 500, delta=25)
+        self.drive(0.8, drive_cmd=0, steer_cmd=-500)
+        self.assertAlmostEqual(self.snap()["steer_fb"], -500, delta=25)
+
+    def test_nothing_is_energized_under_a_stop(self):
+        self.drive(0.5, drive_cmd=1000, steer_cmd=1000, stop=True)
+        s = self.snap()
+        self.assertEqual(s["drive_applied"], 0)
+        self.assertEqual(s["steer_applied"], 0)
+        self.assertEqual(s["current_ca"], 0)
 
 
 if __name__ == "__main__":

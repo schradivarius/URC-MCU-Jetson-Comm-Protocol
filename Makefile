@@ -1,9 +1,10 @@
 # Top-level entry point. `make test` runs everything.
 #
 #   make test        C++ unit tests + host tests (golden vectors, integration)
-#   make test-cpp    just the firmware core (28 tests, no Python needed)
-#   make test-host   just the host side (11 tests, compiles the C++ core)
+#   make test-cpp    just the firmware core (no Python needed)
+#   make test-host   just the host side (compiles the C++ core)
 #   make demo        the no-hardware message-exchange demonstration
+#   make autonomy    the Task 4 mock-autonomy mission against the simulator
 #   make clean
 #
 # Needs a C++17 compiler and Python 3.9+. Nothing to install: the host tests
@@ -11,7 +12,7 @@
 
 PYTHON ?= python3
 
-.PHONY: test test-cpp test-host demo clean
+.PHONY: test test-cpp test-host demo autonomy clean
 
 test: test-cpp test-host
 	@echo
@@ -30,6 +31,9 @@ test-host:
 
 demo:
 	@$(PYTHON) host/demo.py
+
+autonomy:
+	@$(PYTHON) host/autonomy_sim.py --mock
 
 clean:
 	@$(MAKE) --no-print-directory -C tests/cpp clean

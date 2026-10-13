@@ -19,17 +19,28 @@ static RoverController freshController(uint32_t start_ms = 0) {
     return RoverController(fakeMillis, 300, 50);
 }
 
+// Which producer a frame claims to come from. SRC_OWNER is "whichever one
+// owns the mode being commanded", i.e. an ordinary authorised frame -- so a
+// test that is not ABOUT authority does not have to think about it, and the
+// ones that are say so loudly.
+enum Source { SRC_OWNER = -1, SRC_TELEOP = 0, SRC_AUTONOMY = 1 };
+
+static bool sourceBit(Source src, uint8_t mode) {
+    if (src == SRC_OWNER) return mode == MODE_AUTONOMOUS;
+    return src == SRC_AUTONOMY;
+}
+
 // Send a well-formed CONTROL frame. seq increments so the healthy path never
 // trips the gap detector by accident.
 static uint8_t g_seq = 0;
 static bool sendControl(RoverController& ctl, int16_t drive, int16_t steer,
                         uint8_t mode, bool stop, bool abort = false,
                         bool ret = false, uint8_t ind = INDICATOR_OFF,
-                        bool c2_lost = false) {
+                        bool c2_lost = false, Source src = SRC_OWNER) {
     ControlMsg m;
     m.drive_cmd = drive; m.steer_cmd = steer; m.mode = mode;
     m.stop = stop; m.autonomy_abort = abort; m.return_request = ret;
-    m.c2_lost = c2_lost;
+    m.c2_lost = c2_lost; m.from_autonomy = sourceBit(src, mode);
     m.indicator_request = ind; m.seq = ++g_seq;
     uint8_t buf[8] = {0};
     return ctl.ingestFrame(CAN_ID_CONTROL, buf, encodeControl(m, buf));
@@ -39,7 +50,7 @@ static bool sendWithSeq(RoverController& ctl, uint8_t seq, int16_t drive = 400) 
     ControlMsg m;
     m.drive_cmd = drive; m.steer_cmd = 0; m.mode = MODE_MANUAL;
     m.stop = false; m.autonomy_abort = false; m.return_request = false;
-    m.c2_lost = false;
+    m.c2_lost = false; m.from_autonomy = false;
     m.indicator_request = INDICATOR_OFF; m.seq = seq;
     uint8_t buf[8] = {0};
     return ctl.ingestFrame(CAN_ID_CONTROL, buf, encodeControl(m, buf));
@@ -571,6 +582,345 @@ static void telemetry_pacing_is_correct_across_wraparound() {
     CHECK(ctl.telemetryDue());
 }
 
+
+// --- command authority: the Task 4 mux --------------------------------------
+//
+// The rule under test: a producer may command MOTION only in the mode it
+// owns. The autonomy stack owns AUTONOMOUS, the operator owns MANUAL. A frame
+// from the other one is still a VALID frame -- it keeps the link alive and
+// its mode echo and safety flags are honoured -- it just may not drive.
+
+static void an_autonomy_command_is_refused_while_teleoperated() {
+    RoverController ctl = freshController();
+    CHECK(sendControl(ctl, 600, 200, MODE_MANUAL, false, false, false,
+                      INDICATOR_OFF, false, SRC_AUTONOMY));
+    // Accepted as a frame...
+    CHECK_EQ(ctl.lastDecodeResult(), DECODE_OK);
+    CHECK_EQ(ctl.controlFramesAccepted(), 1u);
+    CHECK(!ctl.watchdogTripped());
+    // ...but not acted on, and NOT by pretending the rover is stopped.
+    CHECK(!ctl.commandAuthorized());
+    CHECK(!ctl.effectiveStop());
+    int16_t d, s; ctl.commandedOutputs(d, s);
+    CHECK_EQ(d, 0); CHECK_EQ(s, 0);
+    CHECK_EQ(ctl.commandStatus(), CMD_STATUS_WRONG_SOURCE);
+    CHECK(ctl.faultWord() & FAULT_CMD_SOURCE);
+}
+
+static void a_teleop_command_is_refused_while_autonomous() {
+    RoverController ctl = freshController();
+    CHECK(sendControl(ctl, 600, 200, MODE_AUTONOMOUS, false, false, false,
+                      INDICATOR_OFF, false, SRC_TELEOP));
+    CHECK(!ctl.commandAuthorized());
+    int16_t d, s; ctl.commandedOutputs(d, s);
+    CHECK_EQ(d, 0); CHECK_EQ(s, 0);
+    CHECK_EQ(ctl.commandStatus(), CMD_STATUS_WRONG_SOURCE);
+    CHECK(ctl.faultWord() & FAULT_CMD_SOURCE);
+}
+
+static void the_same_command_is_accepted_once_the_mode_matches() {
+    // The whole Task 4 demonstration in one test: identical command, refused
+    // in one mode and applied in the other, with nothing else changed.
+    RoverController ctl = freshController();
+    CHECK(sendControl(ctl, 600, 200, MODE_MANUAL, false, false, false,
+                      INDICATOR_OFF, false, SRC_AUTONOMY));
+    int16_t d, s; ctl.commandedOutputs(d, s);
+    CHECK_EQ(d, 0); CHECK_EQ(s, 0);
+
+    CHECK(sendControl(ctl, 600, 200, MODE_AUTONOMOUS, false, false, false,
+                      INDICATOR_OFF, false, SRC_AUTONOMY));
+    CHECK(ctl.commandAuthorized());
+    ctl.commandedOutputs(d, s);
+    CHECK_EQ(d, 600); CHECK_EQ(s, 200);
+    CHECK_EQ(ctl.commandStatus(), CMD_STATUS_APPLIED);
+    CHECK(!(ctl.faultWord() & FAULT_CMD_SOURCE));
+}
+
+static void stop_overrides_an_authorised_autonomy_command() {
+    RoverController ctl = freshController();
+    CHECK(sendControl(ctl, 900, 0, MODE_AUTONOMOUS, true, false, false,
+                      INDICATOR_OFF, false, SRC_AUTONOMY));
+    CHECK(ctl.commandAuthorized());        // authority is fine...
+    CHECK(ctl.effectiveStop());            // ...and irrelevant under a stop
+    int16_t d, s; ctl.commandedOutputs(d, s);
+    CHECK_EQ(d, 0); CHECK_EQ(s, 0);
+    CHECK_EQ(ctl.commandStatus(), CMD_STATUS_STOPPED);
+}
+
+static void a_stop_from_the_wrong_source_still_stops_the_rover() {
+    // Safety flags are never gated by authority. An operator who can see the
+    // rover must be able to stop it even while autonomy owns the mode.
+    RoverController ctl = freshController();
+    CHECK(sendControl(ctl, 900, 0, MODE_AUTONOMOUS, true, false, false,
+                      INDICATOR_OFF, false, SRC_TELEOP));
+    CHECK(!ctl.commandAuthorized());
+    CHECK(ctl.effectiveStop());
+    CHECK_EQ(ctl.commandStatus(), CMD_STATUS_STOPPED);   // stop outranks source
+}
+
+static void an_abort_from_the_wrong_source_still_stops_the_rover() {
+    RoverController ctl = freshController();
+    CHECK(sendControl(ctl, 900, 0, MODE_AUTONOMOUS, false, /*abort=*/true,
+                      false, INDICATOR_OFF, false, SRC_TELEOP));
+    CHECK(ctl.effectiveStop());
+    int16_t d, s; ctl.commandedOutputs(d, s);
+    CHECK_EQ(d, 0); CHECK_EQ(s, 0);
+}
+
+static void disabled_mode_has_no_owner_so_neither_source_mismatches() {
+    for (int src = 0; src <= 1; ++src) {
+        RoverController ctl = freshController();
+        CHECK(sendControl(ctl, 0, 0, MODE_DISABLED, false, false, false,
+                          INDICATOR_OFF, false,
+                          src ? SRC_AUTONOMY : SRC_TELEOP));
+        CHECK(ctl.commandAuthorized());
+        CHECK(!ctl.sourceMismatch());
+        CHECK(!(ctl.faultWord() & FAULT_CMD_SOURCE));
+        // Nothing moves regardless -- that is the mode, not the authority.
+        CHECK_EQ(ctl.commandStatus(), CMD_STATUS_STOPPED);
+    }
+}
+
+static void a_stale_source_mismatch_is_not_reported() {
+    // Same rule as the stale C2 bit: once the watchdog has tripped, the
+    // controller cannot vouch for anything the last frame said, including who
+    // sent it. Reporting a mismatch on top of a comm timeout would send an
+    // operator chasing the wrong bug.
+    RoverController ctl = freshController();
+    CHECK(sendControl(ctl, 600, 0, MODE_AUTONOMOUS, false, false, false,
+                      INDICATOR_OFF, false, SRC_TELEOP));
+    CHECK(ctl.sourceMismatch());
+    CHECK(ctl.faultWord() & FAULT_CMD_SOURCE);
+
+    advance(400);                               // past the 300 ms watchdog
+    CHECK(ctl.watchdogTripped());
+    CHECK(!ctl.sourceMismatch());
+    CHECK(!(ctl.faultWord() & FAULT_CMD_SOURCE));
+    CHECK(ctl.faultWord() & FAULT_COMM_TIMEOUT);
+    CHECK_EQ(ctl.commandStatus(), CMD_STATUS_STOPPED);
+}
+
+static void an_unauthorised_frame_still_feeds_the_watchdog() {
+    // It is a valid frame from a live Jetson. Treating it as silence would
+    // turn a mux bug into a comm timeout and hide the real cause.
+    RoverController ctl = freshController();
+    CHECK(sendControl(ctl, 600, 0, MODE_AUTONOMOUS, false, false, false,
+                      INDICATOR_OFF, false, SRC_TELEOP));
+    advance(200);
+    CHECK(sendControl(ctl, 600, 0, MODE_AUTONOMOUS, false, false, false,
+                      INDICATOR_OFF, false, SRC_TELEOP));
+    advance(200);
+    CHECK(!ctl.watchdogTripped());
+    CHECK_EQ(ctl.jetsonLinkState(), LINK_OK);
+}
+
+static void an_arrival_claim_from_the_wrong_source_is_ignored() {
+    // Flashing green is worth 25 points under rule 1.e.xvii. A teleop-path
+    // frame asserting it while the rover is autonomous is the one mix-up that
+    // could light it on a rover that has arrived nowhere.
+    RoverController ctl = freshController();
+    CHECK(sendControl(ctl, 0, 0, MODE_AUTONOMOUS, false, false, false,
+                      INDICATOR_ARRIVED, false, SRC_TELEOP));
+    CHECK_EQ(ctl.indicatorState(), INDICATOR_AUTONOMOUS);
+
+    CHECK(sendControl(ctl, 0, 0, MODE_AUTONOMOUS, false, false, false,
+                      INDICATOR_ARRIVED, false, SRC_AUTONOMY));
+    CHECK_EQ(ctl.indicatorState(), INDICATOR_ARRIVED);
+}
+
+// --- return request ---------------------------------------------------------
+
+static void a_return_request_is_reported_but_changes_no_behaviour() {
+    RoverController ctl = freshController();
+    CHECK(sendControl(ctl, 500, 0, MODE_AUTONOMOUS, false, false, /*ret=*/true,
+                      INDICATOR_OFF, false, SRC_AUTONOMY));
+    CHECK(ctl.returnRequestActive());
+    CHECK(ctl.returnRequest());
+    // Deliberately NOT a stop: driving back is the autonomy stack's job, and
+    // PROTOCOL.md section 9 leaves the semantics as a team decision.
+    CHECK(!ctl.effectiveStop());
+    int16_t d, s; ctl.commandedOutputs(d, s);
+    CHECK_EQ(d, 500);
+    CHECK_EQ(ctl.indicatorState(), INDICATOR_AUTONOMOUS);   // still red
+}
+
+static void a_return_request_outside_autonomous_is_not_active() {
+    RoverController ctl = freshController();
+    CHECK(sendControl(ctl, 500, 0, MODE_MANUAL, false, false, /*ret=*/true));
+    CHECK(ctl.returnRequest());            // the bit arrived...
+    CHECK(!ctl.returnRequestActive());     // ...but an autonomous return means
+                                           // nothing while a human is driving
+}
+
+static void a_return_request_from_the_operator_is_honoured() {
+    // Rule 1.e.xi makes signalling the return the OPERATOR's action, so it
+    // must survive arriving from the teleop path during an autonomous run.
+    RoverController ctl = freshController();
+    CHECK(sendControl(ctl, 0, 0, MODE_AUTONOMOUS, false, false, /*ret=*/true,
+                      INDICATOR_OFF, false, SRC_TELEOP));
+    CHECK(!ctl.commandAuthorized());
+    CHECK(ctl.returnRequestActive());
+}
+
+static void a_stale_return_request_is_not_reported() {
+    RoverController ctl = freshController();
+    CHECK(sendControl(ctl, 0, 0, MODE_AUTONOMOUS, false, false, /*ret=*/true,
+                      INDICATOR_OFF, false, SRC_AUTONOMY));
+    CHECK(ctl.returnRequestActive());
+    advance(400);
+    CHECK(!ctl.returnRequestActive());
+}
+
+// --- the acknowledgement frame ---------------------------------------------
+
+static void the_echo_acknowledges_the_sequence_number_it_acted_on() {
+    RoverController ctl = freshController();
+    CHECK(sendWithSeq(ctl, 77, 400));
+    TelemetryCmdEcho e = ctl.buildCmdEcho(400, 0);
+    CHECK_EQ(e.ack_seq, 77);
+    CHECK_EQ(e.drive_applied, 400);
+    CHECK_EQ(cmdStatusOf(e.status), CMD_STATUS_APPLIED);
+    CHECK_EQ(decodeResultOf(e.status), DECODE_OK);
+    CHECK(!returnActiveOf(e.status));
+}
+
+static void the_echo_reports_no_command_before_the_first_frame() {
+    RoverController ctl = freshController();
+    TelemetryCmdEcho e = ctl.buildCmdEcho(0, 0);
+    CHECK_EQ(cmdStatusOf(e.status), CMD_STATUS_NO_COMMAND);
+}
+
+static void the_echo_carries_the_reason_the_last_frame_was_rejected() {
+    // A frame can be rejected while an older accepted command is still being
+    // applied, so the decode reason is its own field rather than a verdict.
+    RoverController ctl = freshController();
+    CHECK(sendControl(ctl, 400, 0, MODE_MANUAL, false));
+    uint8_t buf[8] = {0};
+    ControlMsg m;
+    m.drive_cmd = 400; m.steer_cmd = 0; m.mode = MODE_MANUAL;
+    m.stop = false; m.autonomy_abort = false; m.return_request = false;
+    m.c2_lost = false; m.from_autonomy = false;
+    m.indicator_request = INDICATOR_OFF; m.seq = ++g_seq;
+    encodeControl(m, buf);
+    buf[0] ^= 0xFF;                               // corrupt after the CRC
+    CHECK(!ctl.ingestFrame(CAN_ID_CONTROL, buf, FRAME_DLC));
+
+    TelemetryCmdEcho e = ctl.buildCmdEcho(400, 0);
+    CHECK_EQ(decodeResultOf(e.status), DECODE_BAD_CRC);
+    CHECK_EQ(cmdStatusOf(e.status), CMD_STATUS_APPLIED);   // the old one stands
+    CHECK_EQ(e.drive_applied, 400);
+}
+
+static void the_echo_reports_a_refused_command_as_zero() {
+    RoverController ctl = freshController();
+    CHECK(sendControl(ctl, 800, 300, MODE_MANUAL, false, false, false,
+                      INDICATOR_OFF, false, SRC_AUTONOMY));
+    int16_t d, s; ctl.commandedOutputs(d, s);
+    TelemetryCmdEcho e = ctl.buildCmdEcho(d, s);
+    CHECK_EQ(e.drive_applied, 0);
+    CHECK_EQ(e.steer_applied, 0);
+    CHECK_EQ(cmdStatusOf(e.status), CMD_STATUS_WRONG_SOURCE);
+}
+
+static void the_echo_reports_an_active_return_request() {
+    RoverController ctl = freshController();
+    CHECK(sendControl(ctl, 300, 0, MODE_AUTONOMOUS, false, false, /*ret=*/true,
+                      INDICATOR_OFF, false, SRC_AUTONOMY));
+    TelemetryCmdEcho e = ctl.buildCmdEcho(300, 0);
+    CHECK(returnActiveOf(e.status));
+}
+
+// --- the invariant, swept exhaustively --------------------------------------
+
+static void outputs_are_nonzero_only_when_permitted_and_authorised() {
+    // Every reachable combination of the fields that can gate motion, times
+    // "has the watchdog tripped". The invariant is the whole safety claim in
+    // one line: a non-zero output requires BOTH that the rover may move and
+    // that this command is its to obey.
+    //
+    // Written as a sweep rather than as cases because the gating conditions
+    // now interact -- mode, source, stop, abort, C2 and the watchdog -- and a
+    // future edit that gets one pairing wrong would otherwise need somebody to
+    // have thought of that exact pairing in advance.
+    int moved = 0, refused = 0, stopped_count = 0;
+    for (int mode = 0; mode <= 3; ++mode) {
+        for (int src = 0; src <= 1; ++src) {
+            for (int stop = 0; stop <= 1; ++stop) {
+                for (int abort = 0; abort <= 1; ++abort) {
+                    for (int c2 = 0; c2 <= 1; ++c2) {
+                        for (int stale = 0; stale <= 1; ++stale) {
+                            RoverController ctl = freshController();
+                            const bool accepted = sendControl(
+                                ctl, 700, 300, static_cast<uint8_t>(mode),
+                                stop != 0, abort != 0, false, INDICATOR_OFF,
+                                c2 != 0, src ? SRC_AUTONOMY : SRC_TELEOP);
+                            // mode 3 is undefined, so the frame is rejected
+                            // and the rover is left in its boot state.
+                            CHECK_EQ(accepted, mode <= 2);
+                            if (stale) advance(400);
+
+                            int16_t d, s;
+                            ctl.commandedOutputs(d, s);
+                            const bool permitted = !ctl.effectiveStop();
+                            const bool authorised = ctl.commandAuthorized();
+
+                            if (d != 0 || s != 0) {
+                                CHECK(permitted);
+                                CHECK(authorised);
+                                CHECK_EQ(ctl.commandStatus(), CMD_STATUS_APPLIED);
+                                CHECK_EQ(d, 700); CHECK_EQ(s, 300);
+                                moved++;
+                            } else if (!permitted) {
+                                // NO_COMMAND rather than STOPPED when the
+                                // frame was never accepted at all -- an
+                                // undefined mode leaves the controller in its
+                                // boot state, and "nobody has spoken to me" is
+                                // the more useful of the two things to say.
+                                CHECK_EQ(ctl.commandStatus(),
+                                         accepted ? CMD_STATUS_STOPPED
+                                                  : CMD_STATUS_NO_COMMAND);
+                                stopped_count++;
+                            } else {
+                                CHECK(!authorised);
+                                CHECK_EQ(ctl.commandStatus(), CMD_STATUS_WRONG_SOURCE);
+                                refused++;
+                            }
+
+                            // The fault bit must agree with the verdict, and
+                            // must never be raised on a stale frame.
+                            const bool bit = (ctl.faultWord() & FAULT_CMD_SOURCE) != 0;
+                            CHECK_EQ(bit, ctl.sourceMismatch());
+                            if (stale) CHECK(!bit);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // All three outcomes have to be reachable, or the sweep proved nothing by
+    // never leaving one branch.
+    CHECK(moved > 0);
+    CHECK(refused > 0);
+    CHECK(stopped_count > 0);
+}
+
+static void a_refused_command_is_not_a_stop() {
+    // The distinction the whole design rests on: WRONG_SOURCE leaves the rover
+    // able to move, so the drive stage stays energized at neutral and an
+    // authorised command takes effect on the very next frame rather than after
+    // a recovery. Reporting it as a stop would lose that.
+    RoverController ctl = freshController();
+    CHECK(sendControl(ctl, 700, 300, MODE_AUTONOMOUS, false, false, false,
+                      INDICATOR_OFF, false, SRC_TELEOP));
+    CHECK(!ctl.effectiveStop());
+    CHECK_EQ(ctl.commandStatus(), CMD_STATUS_WRONG_SOURCE);
+
+    CHECK(sendControl(ctl, 700, 300, MODE_AUTONOMOUS, false, false, false,
+                      INDICATOR_OFF, false, SRC_AUTONOMY));
+    int16_t d, s; ctl.commandedOutputs(d, s);
+    CHECK_EQ(d, 700); CHECK_EQ(s, 300);
+}
+
 int main() {
     std::printf("test_controller\n");
     RUN_TEST(boots_stopped_and_disabled);
@@ -613,5 +963,26 @@ int main() {
     RUN_TEST(the_telemetry_sequence_advances_once_per_cycle);
     RUN_TEST(telemetry_does_not_burst_after_a_stall);
     RUN_TEST(telemetry_pacing_is_correct_across_wraparound);
+    RUN_TEST(an_autonomy_command_is_refused_while_teleoperated);
+    RUN_TEST(a_teleop_command_is_refused_while_autonomous);
+    RUN_TEST(the_same_command_is_accepted_once_the_mode_matches);
+    RUN_TEST(stop_overrides_an_authorised_autonomy_command);
+    RUN_TEST(a_stop_from_the_wrong_source_still_stops_the_rover);
+    RUN_TEST(an_abort_from_the_wrong_source_still_stops_the_rover);
+    RUN_TEST(disabled_mode_has_no_owner_so_neither_source_mismatches);
+    RUN_TEST(a_stale_source_mismatch_is_not_reported);
+    RUN_TEST(an_unauthorised_frame_still_feeds_the_watchdog);
+    RUN_TEST(an_arrival_claim_from_the_wrong_source_is_ignored);
+    RUN_TEST(a_return_request_is_reported_but_changes_no_behaviour);
+    RUN_TEST(a_return_request_outside_autonomous_is_not_active);
+    RUN_TEST(a_return_request_from_the_operator_is_honoured);
+    RUN_TEST(a_stale_return_request_is_not_reported);
+    RUN_TEST(the_echo_acknowledges_the_sequence_number_it_acted_on);
+    RUN_TEST(the_echo_reports_no_command_before_the_first_frame);
+    RUN_TEST(the_echo_carries_the_reason_the_last_frame_was_rejected);
+    RUN_TEST(the_echo_reports_a_refused_command_as_zero);
+    RUN_TEST(the_echo_reports_an_active_return_request);
+    RUN_TEST(outputs_are_nonzero_only_when_permitted_and_authorised);
+    RUN_TEST(a_refused_command_is_not_a_stop);
     return testing::summary("test_controller");
 }

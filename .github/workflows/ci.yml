@@ -46,5 +46,7 @@ jobs:
         run: make test-host
       - name: Message-exchange demonstration
         run: make demo
+      - name: Mock-autonomy mission (Task 4)
+        run: make autonomy
       - name: Byte-compile every module
         run: python -m compileall -q host tools tests

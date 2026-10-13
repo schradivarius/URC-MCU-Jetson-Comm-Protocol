@@ -28,12 +28,14 @@ SIM_SOURCES = [
     os.path.join(REPO, "tools", "rover_sim.cpp"),
     os.path.join(REPO, "firmware", "src", "rover_controller.cpp"),
     os.path.join(REPO, "firmware", "src", "rover_protocol.cpp"),
+    os.path.join(REPO, "firmware", "src", "rover_drive.cpp"),
 ]
 # Headers count too: a constant changed only in rover_config.h must still
 # rebuild the simulator, or the tests run against stale message sizes.
 SIM_HEADERS = [
     os.path.join(REPO, "firmware", "src", name)
-    for name in ("rover_config.h", "rover_protocol.h", "rover_controller.h")
+    for name in ("rover_config.h", "rover_protocol.h", "rover_controller.h",
+                 "rover_drive.h")
 ]
 SIM_BINARY = os.path.join(REPO, "tests", "cpp", "build", "rover_sim")
 

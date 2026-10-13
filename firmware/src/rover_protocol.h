@@ -6,6 +6,29 @@
 // board attached. Only rover_firmware.ino touches hardware.
 //
 // ---------------------------------------------------------------------------
+// v0.6: a command SOURCE, and an acknowledgement of what was acted on
+// ---------------------------------------------------------------------------
+// Task 3 proved a Jetson command can reach the controller intact. Task 4 is
+// about a command reaching the DRIVE STAGE and the Jetson being able to prove
+// it did -- which needs two things this protocol did not have:
+//
+//   1. A way to tell an autonomy-generated command from a teleoperated one.
+//      Both leave the Jetson on the same id, so without a tag the controller
+//      cannot tell them apart and a command meant for one mode can act in the
+//      other. Bit 7 of the flags byte is that tag. The controller refuses
+//      motion from a source that does not own the current mode -- a MUX, and
+//      deliberately on the MCU rather than the Jetson, so a Jetson-side bug
+//      cannot drive an autonomous rover with a stale teleop command.
+//
+//   2. A way for the Jetson to see WHAT WAS ACCEPTED, as opposed to what the
+//      plant happened to do. TELEM_CMD_ECHO carries the accepted drive and
+//      steer, the sequence number they came from, and a verdict byte saying
+//      whether they are being applied, overridden by a stop, or refused for
+//      lacking authority. Encoders and steering feedback answer "did the
+//      rover move"; this answers "did my command get through", which is a
+//      different question and the one an autonomy stack has to ask.
+//
+// ---------------------------------------------------------------------------
 // v0.4: structured command and telemetry packets
 // ---------------------------------------------------------------------------
 // Adds, to both directions: a sequence number, an application-layer CRC-8, and
@@ -80,7 +103,23 @@ namespace rover {
 //   bit  2     return_request  1 = begin the return-to-base behaviour
 //   bits 3-5   indicator_request  requested status-indicator state (0-7)
 //   bit  6     c2_lost         1 = the Jetson has lost the base-station link
-//   bit  7     reserved, MUST be transmitted as 0
+//   bit  7     from_autonomy   1 = the onboard autonomy stack produced the
+//                              drive/steer in this frame; 0 = the human
+//                              operator did (v0.6; reserved before that)
+//
+// THE FLAGS BYTE IS NOW FULL. The next field to be added goes in the mode
+// byte, whose top five bits are unused -- MODE_MAX is 2 -- and which already
+// rejects anything it does not define through isKnownMode(). That is why
+// DECODE_BAD_FLAGS is kept in the DecodeResult enum below but no longer
+// produced: a receiver still has to understand it, from an older sender or a
+// future revision that reserves a bit again.
+//
+// WHY A BIT AND NOT A SECOND CAN ID. A separate id per producer would bind
+// the source to the frame through the CRC seed, which is stronger. It would
+// also put mode, stop, c2_lost and indicator_request in two frames at once
+// and need a precedence table for every one of them. One frame means one
+// answer at a time, and the producers are both inside one trusted node, so
+// the weaker binding costs nothing real.
 //
 // c2_lost is the Jetson's REPORT on a link the controller cannot see. The
 // controller detects a silent Jetson itself (the command watchdog), but it has
@@ -98,8 +137,32 @@ enum : uint8_t {
     CTRL_INDICATOR_MASK      = 0x38,  // bits 3-5
     CTRL_INDICATOR_SHIFT     = 3,
     CTRL_FLAG_C2_LOST        = 0x40,  // bit 6
-    CTRL_FLAG_RESERVED_MASK  = 0x80,  // bit 7, must be zero
+    CTRL_FLAG_FROM_AUTONOMY  = 0x80,  // bit 7, v0.6 (reserved before that)
 };
+
+// ---------------------------------------------------------------------------
+// Command authority: which producer owns which mode.
+//
+//   MODE_MANUAL      the human operator  (from_autonomy == false)
+//   MODE_AUTONOMOUS  the autonomy stack  (from_autonomy == true)
+//   MODE_DISABLED    neither -- nothing may move, so there is nothing to own
+//
+// A frame whose source does not own the current mode is NOT malformed and is
+// NOT rejected at decode. It is a well-formed statement that this command has
+// no authority right now, which is exactly the mix-up worth seeing rather
+// than hiding: a Jetson-side mux bug, or a teleop command queued before a
+// mode change and delivered after it. The controller accepts the frame --
+// keeping the link alive and the mode echo honest -- and refuses only its
+// MOTION. See RoverController::commandAuthorized().
+//
+// SAFETY FLAGS ARE NEVER GATED BY THIS. stop, autonomy_abort, return_request
+// and c2_lost are honoured from either source, because anyone who can see the
+// rover is in trouble must be able to stop it. Only drive/steer and the
+// indicator request -- the two things that assert what the rover is DOING --
+// need the source to own the mode.
+// ---------------------------------------------------------------------------
+
+bool sourceOwnsMode(bool from_autonomy, uint8_t mode);
 
 // Status-indicator states. The same enum is used for the Jetson's REQUEST
 // (CONTROL) and the controller's REPORT of what is actually displayed
@@ -135,6 +198,12 @@ enum : uint16_t {
     FAULT_C2_LINK_LOST   = 0x0080,  // the last CONTROL frame reported C2 lost
     FAULT_SEQ_GAP        = 0x0100,  // CONTROL frames were lost or reordered
     FAULT_CRC_ERROR      = 0x0200,  // app-layer CRC mismatch on our id
+    // The last valid CONTROL frame came from a producer that does not own the
+    // current mode, so its motion was refused. In the fault word and not only
+    // in TELEM_CMD_ECHO, because an operator watching faults is the person
+    // who needs to know the rover is being commanded by the wrong half of the
+    // stack. Self-clearing: the next authorised frame drops it.
+    FAULT_CMD_SOURCE     = 0x0400,
 };
 
 // Link health, reported for each link independently.
@@ -156,6 +225,34 @@ enum : uint8_t {
     CTRL_HEALTH_DEGRADED     = 1,  // at least one channel reporting a problem
     CTRL_HEALTH_FAULT        = 2,  // at least one channel unusable
     CTRL_HEALTH_NOT_REPORTED = 3,  // no driver telemetry wired up yet
+};
+
+// ---------------------------------------------------------------------------
+// What the controller is doing with the last command it accepted
+// (TelemetryCmdEcho::status, bits 0-2).
+//
+// Checked in this order, first match wins, so the value is always the single
+// most important reason the drive stage is seeing what it is seeing:
+//
+//   NO_COMMAND    no valid CONTROL frame has ever arrived. ack_seq and the
+//                 echoed commands mean nothing yet.
+//   STOPPED       a stop condition zeroed the outputs: the command watchdog,
+//                 the stop flag, a mode that does not permit motion, an
+//                 autonomy abort, or C2 loss in MANUAL. Which one it is, is
+//                 in fault_status and the mode echo -- this byte says only
+//                 that safety, not authority, is why nothing is moving.
+//   WRONG_SOURCE  the frame was valid and the rover is not stopped, but the
+//                 producer does not own the current mode, so its motion was
+//                 refused. The Task 4 discriminator.
+//   APPLIED       the echoed drive and steer are what the drive stage was
+//                 handed this cycle.
+// ---------------------------------------------------------------------------
+enum : uint8_t {
+    CMD_STATUS_APPLIED      = 0,
+    CMD_STATUS_STOPPED      = 1,
+    CMD_STATUS_WRONG_SOURCE = 2,
+    CMD_STATUS_NO_COMMAND   = 3,
+    CMD_STATUS_MAX          = 7,   // 3 bits on the wire
 };
 
 // Command age. Two distinct reserved values, because "you have never spoken to
@@ -254,10 +351,12 @@ struct ControlMsg {
     bool    return_request;    // begin the return-to-base behaviour
     uint8_t indicator_request; // INDICATOR_*, 0..7
     bool    c2_lost;           // the Jetson reports the base-station link down
+    bool    from_autonomy;     // the autonomy stack produced drive/steer, not
+                               // the operator -- see sourceOwnsMode()
     uint8_t seq;               // increments once per frame, wraps 255->0
 };
 
-// Controller -> Jetson, four frames, all 20 Hz, all sharing one cycle's seq.
+// Controller -> Jetson, five frames, all 20 Hz, all sharing one cycle's seq.
 
 struct TelemetryDriveL {
     int32_t enc_left;      // cumulative ticks, WRAPS -- treat as relative
@@ -288,6 +387,20 @@ struct TelemetryState {
     uint8_t reserved;          // transmit as 0
 };
 
+// The acknowledgement. Everything here is about the COMMAND, not the plant:
+// what the controller accepted, which frame it came from, and why it is or is
+// not being acted on. Encoders and steering feedback say what the rover did;
+// this says what it was told to do and whether that instruction survived.
+struct TelemetryCmdEcho {
+    int16_t drive_applied;  // drive handed to the drive stage, 0 when refused
+    int16_t steer_applied;  // steer handed to the drive stage, 0 when refused
+    uint8_t ack_seq;        // seq of the CONTROL frame these came from.
+                            // MEANINGLESS while status reads NO_COMMAND -- at
+                            // boot there is no frame to acknowledge and 0 is a
+                            // perfectly ordinary sequence number.
+    uint8_t status;         // packed: see packCmdStatus()
+};
+
 // ---------------------------------------------------------------------------
 // Encode / decode.
 //
@@ -306,12 +419,46 @@ enum DecodeResult : uint8_t {
     DECODE_BAD_DLC,        // wrong frame length
     DECODE_BAD_CRC,        // app-layer CRC mismatch
     DECODE_BAD_MODE,       // mode value this firmware does not define
-    DECODE_BAD_FLAGS,      // reserved flag bits were set
+    DECODE_BAD_FLAGS,      // reserved flag bits were set. NOT PRODUCED SINCE
+                           // v0.6, which took the last reserved bit for
+                           // from_autonomy -- kept because a receiver still
+                           // meets it from a v0.5 sender, and because the next
+                           // revision to reserve a bit revives it. Renumbering
+                           // a wire enum to close a gap is how two ends come
+                           // to disagree about what 5 means.
     DECODE_BAD_INDICATOR,  // indicator request out of range
     DECODE_BAD_RANGE,      // drive_cmd or steer_cmd outside CMD_MIN..CMD_MAX
 };
 
 const char* decodeResultName(DecodeResult r);
+
+// ---------------------------------------------------------------------------
+// TelemetryCmdEcho::status packing.
+//
+//   bits 0-2  CMD_STATUS_*     what is being done with the last command
+//   bits 3-5  DecodeResult     why the LAST FRAME ON OUR ID was rejected, or
+//                              DECODE_OK. Distinct from bits 0-2: a frame can
+//                              be rejected (bad CRC) while an older accepted
+//                              command is still being applied, and an
+//                              operator debugging a link at a competition
+//                              needs the reason, not just a fault bit.
+//   bit  6    return_active    the controller is holding a return request
+//   bit  7    reserved, transmit as 0
+// ---------------------------------------------------------------------------
+enum : uint8_t {
+    CMD_ECHO_STATUS_MASK   = 0x07,
+    CMD_ECHO_DECODE_MASK   = 0x38,  // bits 3-5
+    CMD_ECHO_DECODE_SHIFT  = 3,
+    CMD_ECHO_RETURN_ACTIVE = 0x40,  // bit 6
+    CMD_ECHO_RESERVED_MASK = 0x80,  // bit 7, must be zero
+};
+
+uint8_t      packCmdStatus(uint8_t status, DecodeResult decode, bool return_active);
+uint8_t      cmdStatusOf(uint8_t packed);
+DecodeResult decodeResultOf(uint8_t packed);
+bool         returnActiveOf(uint8_t packed);
+const char*  cmdStatusName(uint8_t status);
+
 
 uint8_t      encodeControl(const ControlMsg& msg, uint8_t* buf);
 DecodeResult decodeControl(uint32_t can_id, const uint8_t* buf, uint8_t len,
@@ -332,6 +479,10 @@ DecodeResult decodeTelemetryPower(uint32_t can_id, const uint8_t* buf, uint8_t l
 uint8_t      encodeTelemetryState(const TelemetryState& msg, uint8_t seq, uint8_t* buf);
 DecodeResult decodeTelemetryState(uint32_t can_id, const uint8_t* buf, uint8_t len,
                                   TelemetryState& out, uint8_t& seq_out);
+
+uint8_t      encodeTelemetryCmdEcho(const TelemetryCmdEcho& msg, uint8_t seq, uint8_t* buf);
+DecodeResult decodeTelemetryCmdEcho(uint32_t can_id, const uint8_t* buf, uint8_t len,
+                                    TelemetryCmdEcho& out, uint8_t& seq_out);
 
 }  // namespace rover
 

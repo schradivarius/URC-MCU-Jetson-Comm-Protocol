@@ -38,9 +38,9 @@ from rover_config import (  # noqa: E402
 
 
 class TelemetryAssembler:
-    """Collects the four telemetry frames of one cycle into one snapshot.
+    """Collects the five telemetry frames of one cycle into one snapshot.
 
-    All four frames of a cycle carry the SAME sequence number, which is how a
+    All five frames of a cycle carry the SAME sequence number, which is how a
     coherent snapshot is told from one torn across two cycles. A torn snapshot
     is counted rather than silently published, because mixing a fresh encoder
     reading with a stale fault word is exactly the kind of quiet wrongness
@@ -56,6 +56,16 @@ class TelemetryAssembler:
         self.torn_count = 0
         self.frames_by_id = {cid: 0 for cid in rp.TELEM_IDS}
         self.decode_errors = {}    # DecodeResult -> count
+
+    def missing_ids(self):
+        """Telemetry ids nothing has ever arrived on.
+
+        Worth naming rather than just waiting: a controller running an older
+        protocol sends a SUBSET of these frames, so the snapshot never
+        completes and the only symptom is silence. There is no version field
+        on the wire (PROTOCOL.md 6), so which ids showed up is the diagnostic.
+        """
+        return tuple(cid for cid, n in self.frames_by_id.items() if n == 0)
 
     def feed(self, can_id, frame):
         decoder = rp.DECODERS.get(can_id)
@@ -98,8 +108,11 @@ class JetsonLink:
 
     def send_control(self, drive_cmd, steer_cmd, mode, c2_lost, stop=False,
                      autonomy_abort=False, return_request=False,
-                     indicator_request=rp.INDICATOR_OFF):
+                     indicator_request=rp.INDICATOR_OFF, from_autonomy=False):
         # c2_lost is required, not defaulted: see encode_control's docstring.
+        # from_autonomy defaults to the operator, which is the fail-safe
+        # direction -- a forgotten argument gets refused in AUTONOMOUS rather
+        # than driving an autonomous rover.
         self._tx_seq = (self._tx_seq + 1) & 0xFF
         self.link.send(rp.CAN_ID_CONTROL,
                        rp.encode_control(drive_cmd, steer_cmd, mode, c2_lost,
@@ -107,8 +120,16 @@ class JetsonLink:
                                          seq=self._tx_seq,
                                          autonomy_abort=autonomy_abort,
                                          return_request=return_request,
-                                         indicator_request=indicator_request))
+                                         indicator_request=indicator_request,
+                                         from_autonomy=from_autonomy))
         self.frames_sent += 1
+        return self._tx_seq
+
+    @property
+    def tx_seq(self):
+        """The sequence number of the last CONTROL frame sent, for matching
+        against the ack_seq the controller echoes back."""
+        return self._tx_seq
 
     def poll(self):
         for can_id, frame in self.link.recv():
@@ -133,6 +154,12 @@ class JetsonLink:
     def format_status(self, elapsed):
         s = self.snapshot
         if s is None:
+            missing = self.tele.missing_ids()
+            if missing and any(self.tele.frames_by_id.values()):
+                # Some ids are arriving and others never have, which is what a
+                # protocol-version mismatch looks like from this end.
+                return ("[t=%5.1fs] no complete snapshot: nothing on %s"
+                        % (elapsed, ", ".join("0x%03x" % c for c in missing)))
             return "[t=%5.1fs] waiting for a complete telemetry snapshot..." % elapsed
         faults = ",".join(rp.fault_names(s["fault_status"])) or "none"
         age = s["cmd_age_ms"]
@@ -141,7 +168,8 @@ class JetsonLink:
                    else "%dms" % age)
         return ("[t=%5.1fs] link=%-4s seq=%3d sent=%4d snap=%4d torn=%2d "
                 "enc=(%+9d,%+9d) steer=%+5d %+7.2fA %6.2fV mode=%-10s "
-                "jet=%-12s c2=%-12s ctrl=%-12s ind=%-10s age=%-8s faults=%s"
+                "jet=%-12s c2=%-12s ctrl=%-12s ind=%-10s age=%-8s "
+                "cmd=%-12s ack=%3d applied=(%+5d,%+5d) faults=%s"
                 % (elapsed, "UP" if self.link_up else "DOWN", s["seq"],
                    self.frames_sent, self.tele.complete_count,
                    self.tele.torn_count, s["enc_left"], s["enc_right"],
@@ -151,7 +179,9 @@ class JetsonLink:
                    rp.LINK_NAMES.get(s["c2_link"], "?"),
                    rp.CTRL_HEALTH_NAMES.get(s["controller_health"], "?"),
                    rp.INDICATOR_NAMES.get(s["indicator_state"], "?"),
-                   age_txt, faults))
+                   age_txt,
+                   rp.CMD_STATUS_NAMES.get(s["cmd_status"], "?"), s["ack_seq"],
+                   s["drive_applied"], s["steer_applied"], faults))
 
 
 def run(link, duration_s, c2=None, verbose=True):

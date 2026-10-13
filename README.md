@@ -1,18 +1,24 @@
-# URC Rover — Jetson ↔ Teensy CAN Link (Task 3)
+# URC Rover — Jetson ↔ Teensy Link (Tasks 3 & 4)
 
 Communication link between the rover's **onboard computer** (Jetson Orin Nano,
 candidate) and its **embedded controller** (**Teensy 4.1**, C++ / Teensyduino),
-over **CAN**.
+over **CAN** — and the autonomy-to-embedded interface built on top of it.
 
 Framed, prioritised CAN messages with watchdog-based fail-safes. Full
 specification: **[PROTOCOL.md](PROTOCOL.md)**.
+
+**Task 3** proved a Jetson command reaches the controller intact. **Task 4**
+proves a high-level autonomy decision travels that interface, reaches the
+drive stage, and that the Jetson can read back that it did — including that
+autonomy and teleop commands are refused in each other's modes.
 
 ## Status
 
 | | |
 |---|---|
-| Protocol, safety logic, firmware | Implemented, **111 tests** passing |
+| Protocol, safety logic, firmware | Implemented, **209 tests** passing |
 | Cross-language codec | Pinned byte-for-byte, plus every validation predicate |
+| Autonomy → drive-stage loop (Task 4) | Closed and verified end to end (`make autonomy`) |
 | **Validated on real hardware** | **Not yet — see [Known gaps](#known-gaps)** |
 
 ---
@@ -27,11 +33,12 @@ than mocking them, so there is no dependency to manage.
 git clone https://github.com/schradivarius/URC-task3.git
 cd URC-task3
 
-make test     # 74 C++ tests + 57 host tests
-make demo     # no-hardware message-exchange demonstration
+make test      # 116 C++ tests + 93 host tests
+make demo      # no-hardware message-exchange demonstration (Task 3)
+make autonomy  # mock autonomy stack driving the firmware (Task 4)
 ```
 
-If both succeed, your environment is good.
+If all three succeed, your environment is good.
 
 ---
 
@@ -44,7 +51,8 @@ firmware/                    C++ — runs on the Teensy 4.1
   rover_firmware.ino           hardware wiring ONLY (CAN, watchdog, pins)
   src/rover_config.h           every protocol + timing constant ─┐
   src/rover_protocol.*         message definitions + codec      ─┤ pure C++,
-  src/rover_controller.*       command/safety state machine     ─┘ no Arduino
+  src/rover_controller.*       command/safety state machine      │ no Arduino
+  src/rover_drive.*            drive/steering output stage      ─┘
 
 host/                        Python — runs on the Jetson
   rover_config.py              constants (pinned to rover_config.h)
@@ -52,20 +60,22 @@ host/                        Python — runs on the Jetson
   can_link.py                  sim + python-can backends
   c2_link.py                   C2 (base-station) link-loss detection
   jetson_test.py               live harness
-  demo.py                      the demonstration
+  demo.py                      the Task 3 demonstration
+  autonomy_sim.py              mock autonomy stack — the Task 4 mission
 
 tools/
-  rover_sim.cpp                simulator: REAL controller, fake plant
+  rover_sim.cpp                simulator: REAL controller + drive stage, fake plant
   golden_vectors.cpp           emits vectors for cross-language pinning
 
-tests/cpp/                   74 tests — firmware core
-tests/host/                  57 tests — config sync, golden vectors, integration
+tests/cpp/                   116 tests — firmware core
+tests/host/                  93 tests — config sync, golden vectors, integration,
+                                        the autonomy mission
 ```
 
-The two files under `firmware/src/` have **no Arduino dependency and no
-hardware calls**, which is what lets the safety-critical logic be unit-tested
-natively with a fake clock. `rover_firmware.ino` is only the wiring around
-them. **If you are reviewing safety behaviour, read `rover_controller.h`.**
+The files under `firmware/src/` have **no Arduino dependency and no hardware
+calls**, which is what lets the safety-critical logic be unit-tested natively
+with a fake clock. `rover_firmware.ino` is only the wiring around them. **If
+you are reviewing safety behaviour, read `rover_controller.h`.**
 
 ---
 
@@ -79,11 +89,13 @@ make test-host   # host side only — compiles the C++ core
 
 | Suite | Tests | Answers |
 |---|---:|---|
-| `tests/cpp/test_protocol.cpp` | 34 | Wire format, CRC-8, and every validation predicate |
-| `tests/cpp/test_controller.cpp` | 40 | **Does the rover stop when it should?** |
-| `tests/host/test_config_sync.py` | 12 | Do the C++ and Python configs hold the same constants? |
-| `tests/host/test_golden_vectors.py` | 23 | Do C++ and Python agree byte-for-byte? |
-| `tests/host/test_integration.py` | 22 | Do both ends actually talk to each other? |
+| `tests/cpp/test_protocol.cpp` | 38 | Wire format, CRC-8, and every validation predicate |
+| `tests/cpp/test_controller.cpp` | 61 | **Does the rover stop when it should?** And: does it refuse a command from the wrong half of the stack? |
+| `tests/cpp/test_drive.cpp` | 17 | Does a command become the right motor output — and never one it was told not to? |
+| `tests/host/test_config_sync.py` | 14 | Do the C++ and Python configs hold the same constants? |
+| `tests/host/test_golden_vectors.py` | 30 | Do C++ and Python agree byte-for-byte? |
+| `tests/host/test_integration.py` | 39 | Do both ends actually talk to each other? |
+| `tests/host/test_autonomy_mission.py` | 10 | Does an autonomy decision reach the drive stage — and would we notice if it stopped? |
 
 Every test is named for the failure it prevents, so the reason it exists
 outlives anyone's memory of writing it. **Start a safety review at
@@ -113,6 +125,14 @@ implementation, rather than merely assumed to work:
 - `undefined_mode_does_not_permit_motion` — fails against the pre-fix
   `mode == MODE_DISABLED` check, which permitted full throttle on any
   undefined mode ([issue #4](https://github.com/schradivarius/URC-task3/issues/4))
+- `the_same_command_is_accepted_once_the_mode_matches` — one command, refused
+  in `MANUAL` and applied in `AUTONOMOUS`, with nothing else changed: the Task
+  4 claim that manual and autonomous commands do not get mixed up
+- `test_an_impossible_expectation_fails_the_run` and
+  `test_every_step_passed_on_telemetry_it_caused` — the negative controls for
+  the autonomy mission. A harness that cannot fail is not evidence, and a step
+  that passes on the *previous* step's telemetry is the classic way an
+  integration test goes green while proving nothing
 
 CI additionally builds with **clang** as a second toolchain and runs the suite
 under **UBSan + ASan**, because signed overflow in the encoder accumulators
@@ -168,8 +188,15 @@ Stated plainly, so nobody builds on an unchecked assumption:
 - **`SRC_SRSR` watchdog bit mask is unverified.** It fails safe — an
   unrecognised reset cause reports nothing — but confirm it by deliberately
   hanging the loop once on the bench.
-- **Motor and sensor I/O is stubbed** behind `readSensors()` and
-  `setMotorOutputs()`.
+- **Sensor I/O is stubbed** behind `readSensors()`. The drive stage is real and
+  unit-tested (`rover_drive.*`), but its output pins are placeholders and the
+  PWM mode is unverified: `analogWrite()` suits a brushed H-bridge or a
+  PWM-input ESC, while a hobby servo or a PPM-input ESC wants a 1–2 ms pulse in
+  a 20 ms frame. **Establish which the hardware expects before connecting
+  anything that moves.**
+- **`return_request` is acknowledged, not acted on.** The controller reports
+  that it arrived; whether it should *do* anything is an open team decision in
+  `PROTOCOL.md` §9, because it changes `effectiveStop()`.
 - **Two encoders, one aggregate current reading.** Both need to grow, and both
   change the payload when they do.
 - **CAN FD, the second and third CAN buses, and a dedicated e-stop frame** are
