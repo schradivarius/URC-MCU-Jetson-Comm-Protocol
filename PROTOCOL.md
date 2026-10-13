@@ -97,6 +97,7 @@ This table is a priority ordering, not just a set of names.
 | **`0x201`** | `TELEM_DRIVE_R` | controller → Jetson | 8 | 20 Hz |
 | **`0x202`** | `TELEM_POWER` | controller → Jetson | 8 | 20 Hz |
 | **`0x203`** | `TELEM_STATE` | controller → Jetson | 8 | 20 Hz |
+| **`0x204`** | `TELEM_CMD_ECHO` | controller → Jetson | 8 | 20 Hz |
 
 Commands outrank telemetry because a late command can hurt the rover and late
 telemetry only annoys an operator.
@@ -190,7 +191,7 @@ be moving". `TELEM_CMD_ECHO` answers the second question.
 
 **Every field in both directions updates at 20 Hz**, the rate of its frame. The
 rate is per frame, not per field: there is no slow-changing field sent less
-often, because at 8 bytes a frame the bus is 2% utilised (§2) and a second rate
+often, because at 8 bytes a frame the bus is ~3% utilised (§2) and a second rate
 would only add a staleness question nobody needs to ask.
 
 ### 3.1 `CONTROL` — `0x100`, DLC 8, 20 Hz, Jetson → controller
@@ -431,7 +432,8 @@ left. Bits `0x0001`–`0x0040` keep their v0.3 values.
 | `0x0080` | `C2_LINK_LOST` | The last `CONTROL` frame reported the base-station link lost (`c2_lost = 1`). Raised in every mode; stops the rover only in `MANUAL` (§3.1.3). Cleared, not latched, once the value goes stale — see §3.5 |
 | `0x0100` | `SEQ_GAP` | CONTROL frames were lost, duplicated or reordered |
 | `0x0200` | `CRC_ERROR` | Application-layer CRC mismatch on our id |
-| `0x0400`–`0x8000` | *reserved* | |
+| `0x0400` | `CMD_SOURCE` | A command arrived from the producer that does not own the current mode: an autonomy frame in `MANUAL`, or an operator frame in `AUTONOMOUS`. Drive and steering are refused; see §3.1.5 |
+| `0x0800`–`0x8000` | *reserved* | |
 
 `PROTOCOL_ERROR`, `CRC_ERROR` and `SEQ_GAP` all self-clear when a valid,
 contiguous frame arrives, so fixing the sender clears the fault rather than
@@ -536,7 +538,7 @@ field:
    alone. If the controller hears the base station and the Jetson does not, the
    *Jetson's* radio or software is broken, not the link. If the Jetson hears it
    and the controller does not, the controller's receiver is. Either is worth a
-   fault bit from the reserved `0x0400`–`0x8000` range. **Do not pick the
+   fault bit from the reserved `0x0800`–`0x8000` range. **Do not pick the
    number until someone is building it** — v0.4 reserved `0x0080` for work that
    had not started, and reconciling that reservation is most of what v0.5 was.
 3. **What is the debounce?** This is the one that will bite. Today the stop
@@ -945,7 +947,7 @@ converged, a single radio hiccup would start stopping the rover in `MANUAL`.
 ## 7. Demonstration and tests — no hardware required
 
 ```
-make test      # 116 C++ tests + 97 host tests
+make test      # 116 C++ tests + 98 host tests
 make demo      # the Task 3 message-exchange demonstration
 make autonomy  # the Task 4 mock-autonomy mission
 ```
@@ -1144,7 +1146,7 @@ Verified to fail on an injected endianness change.
   up. Nothing inside a single trusted sender can close the window entirely;
   this narrows it.
 - **Mode names are being revised in parallel.**
-  [PR #18](https://github.com/schradivarius/URC-task3/pull/18) renames
+  [PR #18](https://github.com/schradivarius/URC-MCU-Jetson-Comm-Protocol/pull/18) renames
   `MODE_DISABLED`/`MODE_MANUAL` to `MODE_SAFE`/`MODE_TELEOP`, adds a
   non-commandable `MODE_FAULT = 3` and introduces `activeMode()`. No wire
   values change. Whichever lands second applies a mechanical rename; and
@@ -1165,6 +1167,7 @@ Verified to fail on an injected endianness change.
 | `firmware/src/rover_controller.*` | **Both** | Command/safety state machine |
 | `firmware/src/rover_drive.*` | **Both** | Drive/steering output stage (§5.4) |
 | `host/rover_protocol.py` | Jetson | Python codec (pinned to the C++ one) |
+| `host/protocol_root.py` | Jetson | Resolves which checkout `firmware/src` and `tools/` come from — the one place that decides |
 | `host/can_link.py` | Jetson | Sim and python-can backends |
 | `host/c2_link.py` | Jetson | C2 (base-station) link-loss detection, and a fake link for testing |
 | `host/jetson_test.py` | Jetson | Live harness, snapshot reassembly |
@@ -1172,7 +1175,7 @@ Verified to fail on an injected endianness change.
 | `host/autonomy_sim.py` | Jetson | Mock autonomy stack: the Task 4 mission (§7) |
 | `tools/rover_sim.cpp` | dev machine | Simulator: real controller, fake plant |
 | `tools/golden_vectors.cpp` | dev machine | Emits vectors for cross-language pinning |
-| `tests/cpp/`, `tests/host/` | dev machine | 213 tests total |
+| `tests/cpp/`, `tests/host/` | dev machine | 214 tests total |
 
 ### 10.1 Flashing the Teensy 4.1
 
@@ -1193,13 +1196,23 @@ Verified to fail on an injected endianness change.
 ### 10.2 Running the autonomy program from a separate repository
 
 The autonomy program is a *consumer* of this protocol, not part of it, so it
-can live in a repository of its own. Two files move and nothing else:
+**can** live in a repository of its own. It currently does not, and this section
+describes an option rather than a plan: two files move and nothing else.
 
 | Moves to the autonomy repository | Stays here |
 |---|---|
 | `host/autonomy_sim.py` | `host/rover_protocol.py`, `host/rover_config.py` |
-| `tests/host/test_autonomy_mission.py` | `host/can_link.py`, `host/jetson_test.py` |
+| `tests/host/test_autonomy_mission.py` | `host/protocol_root.py`, `host/can_link.py`, `host/jetson_test.py` |
 | | everything under `firmware/` and `tools/` |
+
+Worth saying plainly before the mechanics: the ratio argues against doing this
+yet. Task 4 added 5 files and modified 23 existing ones, because it was a wire
+change (v0.5 → v0.6) as much as a new program. 23 of those 28 files are on the
+protocol side of this seam, the two that move import four modules that stay, and
+`ci.yml`'s autonomy step is the only place a real consumer exercises the
+protocol end to end. The seam below is built and tested so that the move is
+cheap *later* — when the autonomy stack is real perception code in its own
+toolchain, or someone outside the team needs the protocol without it.
 
 What must **not** move, and must not be copied either, is the Python codec. It
 is a hand-written mirror of the C++ headers, and §8 keeps the two honest with
@@ -1214,18 +1227,33 @@ or a CI checkout step) and points `ROVER_PROTOCOL_ROOT` at it:
 ROVER_PROTOCOL_ROOT=../protocol python3 autonomy/autonomy_sim.py --mock
 ```
 
-`can_link.py` and `autonomy_sim.py` both honour that variable and fall back to
-the enclosing repository when it is unset, so a shared checkout needs nothing.
-A root that does not contain `firmware/src` and `tools/rover_sim.cpp` fails by
-name at `build_sim()`, before the staleness check, so a binary left over from
-an earlier run cannot quietly stand in for sources that are not there.
+Everything that reads `firmware/src/` or `tools/` resolves the root through
+`host/protocol_root.py`, which falls back to the enclosing repository when the
+variable is unset, so a shared checkout needs nothing. The two files that have
+to locate `host/` before they can import anything from it — `autonomy_sim.py`
+and `test_autonomy_mission.py` — read the variable by name instead, and are the
+only places that do. A root that does not contain `firmware/src` and
+`tools/rover_sim.cpp` fails by name at `build_sim()`, before the staleness
+check, so a binary left over from an earlier run cannot quietly stand in for
+sources that are not there.
 
 Two consequences worth knowing before relying on it:
 
 - The simulator is compiled **into** the protocol checkout
   (`tests/cpp/build/`), so that checkout has to be writable. A read-only
   submodule cache is the one layout this does not serve.
-- The autonomy repository pins a **commit** of this one. That pin is the
-  version contract: moving it is how an autonomy change opts in to a new
-  protocol version, and `version` in `TELEM_STATE` (§3.5) is what catches a
-  pin nobody moved.
+- The autonomy repository pins a **commit** of this one, and moving that pin is
+  how an autonomy change opts in to a new protocol version. Nothing on the wire
+  reports the version (§6), so a pin nobody moves is caught the same way any
+  other revision mismatch is: by *which ids arrive*. A v0.5 controller sends
+  four telemetry frames, the Jetson's snapshot never completes, and
+  `TelemetryAssembler.missing_ids()` names `0x204` (§2.2). The skew table in
+  §3.1.2 covers the other direction. `PROTOCOL_VERSION` itself is compile-time
+  only, pinned across the two languages by `test_config_sync.py`.
+- That pinning is **only** honest if it reads the checkout being compiled.
+  Every path into `firmware/src/` and `tools/` resolves through
+  `host/protocol_root.py` for that reason: when only `can_link.py` honoured the
+  variable, the integration suite drove the overridden firmware while the
+  pinning suite checked the local pair, and the host suite passed over a
+  `PROTOCOL_VERSION` mismatch.
+  `test_the_pinning_follows_the_firmware_that_is_actually_compiled` pins it.

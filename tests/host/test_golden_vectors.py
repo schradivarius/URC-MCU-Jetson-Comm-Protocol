@@ -19,17 +19,21 @@ import unittest
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(REPO, "host"))
 
+import protocol_root  # noqa: E402
 import rover_protocol as p  # noqa: E402
 
 
 def build_and_run_cpp():
-    out_dir = os.path.join(REPO, "tests", "cpp", "build")
+    # Resolved rather than derived from __file__, for the same reason as
+    # test_config_sync.py: pinning the local Python against a different
+    # checkout's C++ than the one under test proves nothing.
+    out_dir = protocol_root.build_dir()
     os.makedirs(out_dir, exist_ok=True)
     binary = os.path.join(out_dir, "golden_vectors")
     subprocess.run(
         [os.environ.get("CXX", "g++"), "-std=c++17", "-O1",
-         os.path.join(REPO, "tools", "golden_vectors.cpp"),
-         os.path.join(REPO, "firmware", "src", "rover_protocol.cpp"),
+         protocol_root.tools("golden_vectors.cpp"),
+         protocol_root.firmware_src("rover_protocol.cpp"),
          "-o", binary],
         check=True, capture_output=True)
     result = subprocess.run([binary], check=True, capture_output=True, text=True)

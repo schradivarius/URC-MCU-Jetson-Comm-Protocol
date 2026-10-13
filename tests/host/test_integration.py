@@ -13,6 +13,7 @@ is worse than no test.
 """
 
 import os
+import shutil
 import struct
 import subprocess
 import sys
@@ -528,13 +529,13 @@ class TestProtocolRootOverride(unittest.TestCase):
     SNIPPET = ("import sys; sys.path.insert(0, %r);"
                " import can_link; print(can_link.REPO)")
 
-    def _run(self, snippet, env_root=None, cwd=None):
+    def _run(self, snippet, env_root=None, cwd=None, argv=None):
         env = dict(os.environ)
         env.pop("ROVER_PROTOCOL_ROOT", None)
         if env_root is not None:
             env["ROVER_PROTOCOL_ROOT"] = env_root
-        return subprocess.run([sys.executable, "-c", snippet], env=env, cwd=cwd,
-                              capture_output=True, text=True)
+        return subprocess.run(argv or [sys.executable, "-c", snippet],
+                              env=env, cwd=cwd, capture_output=True, text=True)
 
     def test_without_the_variable_the_root_is_the_enclosing_repository(self):
         done = self._run(self.SNIPPET % os.path.join(REPO, "host"), cwd="/")
@@ -576,6 +577,37 @@ class TestProtocolRootOverride(unittest.TestCase):
         self.assertIn("RuntimeError", done.stderr)
         self.assertIn("rover_sim.cpp", done.stderr)
         self.assertIn("ROVER_PROTOCOL_ROOT", done.stderr)
+
+    def test_the_pinning_follows_the_firmware_that_is_actually_compiled(self):
+        # The regression test for a real bug. When only can_link.py honoured the
+        # override, the integration suite drove the FOREIGN firmware while
+        # test_config_sync.py and test_golden_vectors.py read the LOCAL headers.
+        # The whole host suite then reported OK against a firmware declaring a
+        # different PROTOCOL_VERSION than the Python codec talking to it -- the
+        # one failure section 8 of PROTOCOL.md exists to catch, hidden by the
+        # very flag added to keep the two honest across checkouts.
+        with tempfile.TemporaryDirectory() as foreign:
+            for name in ("firmware", "tools"):
+                shutil.copytree(os.path.join(REPO, name),
+                                os.path.join(foreign, name))
+            header = os.path.join(foreign, "firmware", "src", "rover_config.h")
+            with open(header) as fh:
+                text = fh.read()
+            bumped = text.replace("PROTOCOL_VERSION = %d" % rp.PROTOCOL_VERSION,
+                                  "PROTOCOL_VERSION = %d" % (rp.PROTOCOL_VERSION + 90))
+            self.assertNotEqual(bumped, text, "could not find the version to bump")
+            with open(header, "w") as fh:
+                fh.write(bumped)
+
+            done = self._run(None, env_root=foreign, cwd=REPO, argv=[
+                sys.executable, os.path.join(REPO, "tests", "host",
+                                             "test_config_sync.py")])
+
+        self.assertNotEqual(
+            done.returncode, 0,
+            "config sync passed against a firmware declaring a different "
+            "PROTOCOL_VERSION, so the pinning is reading the wrong checkout")
+        self.assertIn("PROTOCOL_VERSION differs", done.stderr)
 
     def test_an_already_built_binary_cannot_mask_a_wrong_root(self):
         # The nastiest version of the mistake: a stale binary left in place

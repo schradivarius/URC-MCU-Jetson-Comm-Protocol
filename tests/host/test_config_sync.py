@@ -19,10 +19,16 @@ REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 sys.path.insert(0, os.path.join(REPO, "host"))
 
 import c2_link  # noqa: E402
+import protocol_root  # noqa: E402
 import rover_config as cfg  # noqa: E402
 import rover_protocol as rp  # noqa: E402
 
-HEADER_PATH = os.path.join(REPO, "firmware", "src", "rover_config.h")
+# Resolved, not derived from __file__: this test's whole job is to pin the
+# Python constants against the C++ ones, and it can only do that if it reads
+# the header belonging to the firmware can_link.py actually compiles. Deriving
+# it locally while can_link compiled an overridden checkout is how this suite
+# once passed over a PROTOCOL_VERSION mismatch.
+HEADER_PATH = protocol_root.firmware_src("rover_config.h")
 
 # Python name -> C++ name, for every constant that exists on both sides.
 SHARED = {

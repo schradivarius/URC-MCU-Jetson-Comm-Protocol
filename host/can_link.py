@@ -21,33 +21,28 @@ import sys
 import threading
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import protocol_root  # noqa: E402
 from rover_config import CAN_BITRATE_HZ  # noqa: E402
 
-# Where the firmware sources live. By default this file's own repository, which
-# is right whenever the Jetson code and the firmware share a checkout.
-#
-# ROVER_PROTOCOL_ROOT overrides it, so a separate autonomy repository can point
-# at a checkout of the protocol repository instead of vendoring a copy of
-# firmware/src. That distinction matters more than it looks: a vendored copy is
-# exactly how the C++ and the Python drift apart, and not drifting is the whole
-# reason the host tests compile the real controller rather than mocking it.
-_DEFAULT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-REPO = os.path.abspath(os.path.expanduser(
-    os.environ.get("ROVER_PROTOCOL_ROOT") or _DEFAULT_ROOT))
+# Resolved through protocol_root so that every reader of firmware/src -- this
+# module, the config-sync test and the golden-vector test -- agrees on which
+# checkout is in play. They did not always, and the suite went green over a
+# version mismatch as a result; see host/protocol_root.py.
+REPO = protocol_root.protocol_root()
 SIM_SOURCES = [
-    os.path.join(REPO, "tools", "rover_sim.cpp"),
-    os.path.join(REPO, "firmware", "src", "rover_controller.cpp"),
-    os.path.join(REPO, "firmware", "src", "rover_protocol.cpp"),
-    os.path.join(REPO, "firmware", "src", "rover_drive.cpp"),
+    protocol_root.tools("rover_sim.cpp"),
+    protocol_root.firmware_src("rover_controller.cpp"),
+    protocol_root.firmware_src("rover_protocol.cpp"),
+    protocol_root.firmware_src("rover_drive.cpp"),
 ]
 # Headers count too: a constant changed only in rover_config.h must still
 # rebuild the simulator, or the tests run against stale message sizes.
 SIM_HEADERS = [
-    os.path.join(REPO, "firmware", "src", name)
+    protocol_root.firmware_src(name)
     for name in ("rover_config.h", "rover_protocol.h", "rover_controller.h",
                  "rover_drive.h")
 ]
-SIM_BINARY = os.path.join(REPO, "tests", "cpp", "build", "rover_sim")
+SIM_BINARY = os.path.join(protocol_root.build_dir(), "rover_sim")
 
 
 def build_sim(force=False):
@@ -58,9 +53,9 @@ def build_sim(force=False):
     # from an earlier run that still looks perfectly good.
     missing = [p for p in SIM_SOURCES + SIM_HEADERS if not os.path.exists(p)]
     if missing:
-        hint = ("" if os.environ.get("ROVER_PROTOCOL_ROOT") is None else
-                "; ROVER_PROTOCOL_ROOT is set, and must point at the root of a "
-                "protocol-repository checkout")
+        hint = ("" if not protocol_root.is_overridden() else
+                "; %s is set, and must point at the root of a "
+                "protocol-repository checkout" % protocol_root.ENV_VAR)
         raise RuntimeError("firmware sources missing under %s: %s%s"
                            % (REPO, ", ".join(os.path.relpath(m, REPO)
                                               for m in missing), hint))

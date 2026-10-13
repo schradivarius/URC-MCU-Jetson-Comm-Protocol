@@ -16,7 +16,7 @@ autonomy and teleop commands are refused in each other's modes.
 
 | | |
 |---|---|
-| Protocol, safety logic, firmware | Implemented, **213 tests** passing |
+| Protocol, safety logic, firmware | Implemented, **214 tests** passing |
 | Cross-language codec | Pinned byte-for-byte, plus every validation predicate |
 | Autonomy → drive-stage loop (Task 4) | Closed and verified end to end (`make autonomy`) |
 | **Validated on real hardware** | **Not yet — see [Known gaps](#known-gaps)** |
@@ -30,10 +30,10 @@ you already have. The host tests compile the *real firmware sources* rather
 than mocking them, so there is no dependency to manage.
 
 ```bash
-git clone https://github.com/schradivarius/URC-task3.git
-cd URC-task3
+git clone https://github.com/schradivarius/URC-MCU-Jetson-Comm-Protocol.git
+cd URC-MCU-Jetson-Comm-Protocol
 
-make test      # 116 C++ tests + 97 host tests
+make test      # 116 C++ tests + 98 host tests
 make demo      # no-hardware message-exchange demonstration (Task 3)
 make autonomy  # mock autonomy stack driving the firmware (Task 4)
 ```
@@ -57,6 +57,7 @@ firmware/                    C++ — runs on the Teensy 4.1
 host/                        Python — runs on the Jetson
   rover_config.py              constants (pinned to rover_config.h)
   rover_protocol.py            codec (pinned to the C++ one)
+  protocol_root.py             which checkout firmware/src comes from
   can_link.py                  sim + python-can backends
   c2_link.py                   C2 (base-station) link-loss detection
   jetson_test.py               live harness
@@ -68,7 +69,7 @@ tools/
   golden_vectors.cpp           emits vectors for cross-language pinning
 
 tests/cpp/                   116 tests — firmware core
-tests/host/                  93 tests — config sync, golden vectors, integration,
+tests/host/                  98 tests — config sync, golden vectors, integration,
                                         the autonomy mission
 ```
 
@@ -100,7 +101,7 @@ make test-host   # host side only — compiles the C++ core
 | `tests/cpp/test_drive.cpp` | 17 | Does a command become the right motor output — and never one it was told not to? |
 | `tests/host/test_config_sync.py` | 14 | Do the C++ and Python configs hold the same constants? |
 | `tests/host/test_golden_vectors.py` | 30 | Do C++ and Python agree byte-for-byte? |
-| `tests/host/test_integration.py` | 43 | Do both ends actually talk to each other? |
+| `tests/host/test_integration.py` | 44 | Do both ends actually talk to each other? |
 | `tests/host/test_autonomy_mission.py` | 10 | Does an autonomy decision reach the drive stage — and would we notice if it stopped? |
 
 Every test is named for the failure it prevents, so the reason it exists
@@ -130,7 +131,7 @@ implementation, rather than merely assumed to work:
   what the rover is actually doing
 - `undefined_mode_does_not_permit_motion` — fails against the pre-fix
   `mode == MODE_DISABLED` check, which permitted full throttle on any
-  undefined mode ([issue #4](https://github.com/schradivarius/URC-task3/issues/4))
+  undefined mode ([issue #4](https://github.com/schradivarius/URC-MCU-Jetson-Comm-Protocol/issues/4))
 - `the_same_command_is_accepted_once_the_mode_matches` — one command, refused
   in `MANUAL` and applied in `AUTONOMOUS`, with nothing else changed: the Task
   4 claim that manual and autonomous commands do not get mixed up

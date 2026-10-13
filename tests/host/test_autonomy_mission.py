@@ -20,6 +20,15 @@ import time
 import unittest
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# In a shared checkout the autonomy program and the protocol modules are both in
+# host/. If the autonomy program moves to a repository of its own, only the
+# protocol modules stay behind, so both directories go on the path and this file
+# travels unchanged. Bootstrapped by hand rather than through protocol_root,
+# which lives in the directory being looked for.
+_OVERRIDE = os.environ.get("ROVER_PROTOCOL_ROOT")
+if _OVERRIDE:
+    sys.path.insert(0, os.path.join(
+        os.path.abspath(os.path.expanduser(_OVERRIDE)), "host"))
 sys.path.insert(0, os.path.join(REPO, "host"))
 
 import autonomy_sim as mission  # noqa: E402
