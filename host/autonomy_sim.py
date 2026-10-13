@@ -43,7 +43,18 @@ import os
 import sys
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# can_link, rover_protocol, jetson_test and rover_config belong to the protocol
+# repository, not to the autonomy program. In a shared checkout they sit right
+# beside this file; when the autonomy program lives in a repository of its own,
+# ROVER_PROTOCOL_ROOT names the protocol checkout they live in. Importing them
+# either way is deliberate: this program must speak the protocol the firmware
+# was compiled from, never a second copy of it.
+_PROTOCOL_ROOT = os.environ.get("ROVER_PROTOCOL_ROOT")
+if _PROTOCOL_ROOT:
+    sys.path.insert(0, os.path.join(
+        os.path.abspath(os.path.expanduser(_PROTOCOL_ROOT)), "host"))
+else:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import can_link  # noqa: E402
 import rover_protocol as rp  # noqa: E402

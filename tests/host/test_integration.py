@@ -14,7 +14,9 @@ is worse than no test.
 
 import os
 import struct
+import subprocess
 import sys
+import tempfile
 import time
 import unittest
 
@@ -511,6 +513,85 @@ class TestDriveStage(RoverFixture):
         self.assertEqual(s["drive_applied"], 0)
         self.assertEqual(s["steer_applied"], 0)
         self.assertEqual(s["current_ca"], 0)
+
+
+class TestProtocolRootOverride(unittest.TestCase):
+    """Where can_link looks for the firmware it compiles.
+
+    The autonomy program is going to live in its own repository, so the Jetson
+    code has to be able to point at a checkout of the protocol repository
+    rather than assume the firmware sits one directory above it. These run in
+    subprocesses because the root is resolved at import time, and a reload
+    would leave the module pointing somewhere else for every test after it.
+    """
+
+    SNIPPET = ("import sys; sys.path.insert(0, %r);"
+               " import can_link; print(can_link.REPO)")
+
+    def _run(self, snippet, env_root=None, cwd=None):
+        env = dict(os.environ)
+        env.pop("ROVER_PROTOCOL_ROOT", None)
+        if env_root is not None:
+            env["ROVER_PROTOCOL_ROOT"] = env_root
+        return subprocess.run([sys.executable, "-c", snippet], env=env, cwd=cwd,
+                              capture_output=True, text=True)
+
+    def test_without_the_variable_the_root_is_the_enclosing_repository(self):
+        done = self._run(self.SNIPPET % os.path.join(REPO, "host"), cwd="/")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout.strip(), os.path.realpath(REPO))
+
+    def test_the_variable_moves_the_root_somewhere_else_entirely(self):
+        # Pointing the variable AT this repository would prove nothing: the
+        # default derivation lands on the same path, so the assertion would
+        # pass either way. So the root here is a foreign directory that merely
+        # has the right shape, which is also what a protocol checkout inside a
+        # separate autonomy repository looks like.
+        snippet = (self.SNIPPET % os.path.join(REPO, "host")) + \
+            "; print(can_link.build_sim())"
+        with tempfile.TemporaryDirectory() as elsewhere:
+            for name in ("firmware", "tools"):
+                os.symlink(os.path.join(REPO, name),
+                           os.path.join(elsewhere, name))
+            done = self._run(snippet, env_root=elsewhere, cwd="/")
+            self.assertEqual(done.returncode, 0, done.stderr)
+            root, binary = done.stdout.split()
+            self.assertEqual(root, elsewhere)
+            self.assertNotEqual(root, REPO)
+            # Compiled from the foreign root, into the foreign root -- so a
+            # read-only protocol checkout is the one layout this cannot serve,
+            # and it fails loudly rather than reusing the wrong binary.
+            self.assertTrue(binary.startswith(elsewhere), binary)
+            self.assertTrue(os.access(binary, os.X_OK))
+
+    def test_a_wrong_root_fails_by_name_and_says_which_variable_is_wrong(self):
+        # The symptom to avoid is a compiler error about a header nobody
+        # pointed at. The message has to name the file AND the variable, or the
+        # next person edits the wrong thing.
+        snippet = (self.SNIPPET % os.path.join(REPO, "host")) + \
+            "; can_link.build_sim()"
+        with tempfile.TemporaryDirectory() as empty:
+            done = self._run(snippet, env_root=empty, cwd="/")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("RuntimeError", done.stderr)
+        self.assertIn("rover_sim.cpp", done.stderr)
+        self.assertIn("ROVER_PROTOCOL_ROOT", done.stderr)
+
+    def test_an_already_built_binary_cannot_mask_a_wrong_root(self):
+        # The nastiest version of the mistake: a stale binary left in place
+        # looks perfectly good, so the sources are checked BEFORE the staleness
+        # comparison rather than after it.
+        snippet = (self.SNIPPET % os.path.join(REPO, "host")) + \
+            "; can_link.build_sim()"
+        with tempfile.TemporaryDirectory() as fake:
+            build = os.path.join(fake, "tests", "cpp", "build")
+            os.makedirs(build)
+            with open(os.path.join(build, "rover_sim"), "w") as fh:
+                fh.write("not a real simulator")
+            done = self._run(snippet, env_root=fake, cwd="/")
+        self.assertNotEqual(done.returncode, 0,
+                            "a leftover binary was accepted without its sources")
+        self.assertIn("firmware sources missing", done.stderr)
 
 
 if __name__ == "__main__":

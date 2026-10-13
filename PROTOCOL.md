@@ -945,7 +945,7 @@ converged, a single radio hiccup would start stopping the rover in `MANUAL`.
 ## 7. Demonstration and tests — no hardware required
 
 ```
-make test      # 116 C++ tests + 93 host tests
+make test      # 116 C++ tests + 97 host tests
 make demo      # the Task 3 message-exchange demonstration
 make autonomy  # the Task 4 mock-autonomy mission
 ```
@@ -1172,7 +1172,7 @@ Verified to fail on an injected endianness change.
 | `host/autonomy_sim.py` | Jetson | Mock autonomy stack: the Task 4 mission (§7) |
 | `tools/rover_sim.cpp` | dev machine | Simulator: real controller, fake plant |
 | `tools/golden_vectors.cpp` | dev machine | Emits vectors for cross-language pinning |
-| `tests/cpp/`, `tests/host/` | dev machine | 209 tests total |
+| `tests/cpp/`, `tests/host/` | dev machine | 213 tests total |
 
 ### 10.1 Flashing the Teensy 4.1
 
@@ -1189,3 +1189,43 @@ Verified to fail on an injected endianness change.
 - Each CAN bus needs a **transceiver**; the MCU cannot drive a differential bus.
 - The bus needs **120 Ω termination at both physical ends.** Exactly one
   resistor, or three, is the most common CAN bring-up failure.
+
+### 10.2 Running the autonomy program from a separate repository
+
+The autonomy program is a *consumer* of this protocol, not part of it, so it
+can live in a repository of its own. Two files move and nothing else:
+
+| Moves to the autonomy repository | Stays here |
+|---|---|
+| `host/autonomy_sim.py` | `host/rover_protocol.py`, `host/rover_config.py` |
+| `tests/host/test_autonomy_mission.py` | `host/can_link.py`, `host/jetson_test.py` |
+| | everything under `firmware/` and `tools/` |
+
+What must **not** move, and must not be copied either, is the Python codec. It
+is a hand-written mirror of the C++ headers, and §8 keeps the two honest with
+golden vectors emitted by the C++ and asserted by the Python **in one CI run**.
+Split them across repositories and that check still passes on both sides while
+the two drift apart — the single failure this whole design is built to prevent.
+
+So the autonomy repository takes a checkout of *this* repository (a submodule,
+or a CI checkout step) and points `ROVER_PROTOCOL_ROOT` at it:
+
+```sh
+ROVER_PROTOCOL_ROOT=../protocol python3 autonomy/autonomy_sim.py --mock
+```
+
+`can_link.py` and `autonomy_sim.py` both honour that variable and fall back to
+the enclosing repository when it is unset, so a shared checkout needs nothing.
+A root that does not contain `firmware/src` and `tools/rover_sim.cpp` fails by
+name at `build_sim()`, before the staleness check, so a binary left over from
+an earlier run cannot quietly stand in for sources that are not there.
+
+Two consequences worth knowing before relying on it:
+
+- The simulator is compiled **into** the protocol checkout
+  (`tests/cpp/build/`), so that checkout has to be writable. A read-only
+  submodule cache is the one layout this does not serve.
+- The autonomy repository pins a **commit** of this one. That pin is the
+  version contract: moving it is how an autonomy change opts in to a new
+  protocol version, and `version` in `TELEM_STATE` (§3.5) is what catches a
+  pin nobody moved.

@@ -23,7 +23,17 @@ import threading
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from rover_config import CAN_BITRATE_HZ  # noqa: E402
 
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Where the firmware sources live. By default this file's own repository, which
+# is right whenever the Jetson code and the firmware share a checkout.
+#
+# ROVER_PROTOCOL_ROOT overrides it, so a separate autonomy repository can point
+# at a checkout of the protocol repository instead of vendoring a copy of
+# firmware/src. That distinction matters more than it looks: a vendored copy is
+# exactly how the C++ and the Python drift apart, and not drifting is the whole
+# reason the host tests compile the real controller rather than mocking it.
+_DEFAULT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO = os.path.abspath(os.path.expanduser(
+    os.environ.get("ROVER_PROTOCOL_ROOT") or _DEFAULT_ROOT))
 SIM_SOURCES = [
     os.path.join(REPO, "tools", "rover_sim.cpp"),
     os.path.join(REPO, "firmware", "src", "rover_controller.cpp"),
@@ -42,6 +52,18 @@ SIM_BINARY = os.path.join(REPO, "tests", "cpp", "build", "rover_sim")
 
 def build_sim(force=False):
     """Compile the simulator if needed. Returns its path."""
+    # Checked by name, and before the staleness comparison below, because the
+    # alternative symptoms are all worse: an OSError from getmtime, a compiler
+    # error naming a header nobody pointed at, or -- worst -- a cached binary
+    # from an earlier run that still looks perfectly good.
+    missing = [p for p in SIM_SOURCES + SIM_HEADERS if not os.path.exists(p)]
+    if missing:
+        hint = ("" if os.environ.get("ROVER_PROTOCOL_ROOT") is None else
+                "; ROVER_PROTOCOL_ROOT is set, and must point at the root of a "
+                "protocol-repository checkout")
+        raise RuntimeError("firmware sources missing under %s: %s%s"
+                           % (REPO, ", ".join(os.path.relpath(m, REPO)
+                                              for m in missing), hint))
     if not force and os.path.exists(SIM_BINARY):
         newest_src = max(os.path.getmtime(s) for s in SIM_SOURCES + SIM_HEADERS)
         if os.path.getmtime(SIM_BINARY) >= newest_src:

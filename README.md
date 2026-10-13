@@ -16,7 +16,7 @@ autonomy and teleop commands are refused in each other's modes.
 
 | | |
 |---|---|
-| Protocol, safety logic, firmware | Implemented, **209 tests** passing |
+| Protocol, safety logic, firmware | Implemented, **213 tests** passing |
 | Cross-language codec | Pinned byte-for-byte, plus every validation predicate |
 | Autonomy → drive-stage loop (Task 4) | Closed and verified end to end (`make autonomy`) |
 | **Validated on real hardware** | **Not yet — see [Known gaps](#known-gaps)** |
@@ -33,7 +33,7 @@ than mocking them, so there is no dependency to manage.
 git clone https://github.com/schradivarius/URC-task3.git
 cd URC-task3
 
-make test      # 116 C++ tests + 93 host tests
+make test      # 116 C++ tests + 97 host tests
 make demo      # no-hardware message-exchange demonstration (Task 3)
 make autonomy  # mock autonomy stack driving the firmware (Task 4)
 ```
@@ -77,6 +77,12 @@ calls**, which is what lets the safety-critical logic be unit-tested natively
 with a fake clock. `rover_firmware.ino` is only the wiring around them. **If
 you are reviewing safety behaviour, read `rover_controller.h`.**
 
+The autonomy program can also live in a repository of its own — it is a
+consumer of this protocol, not part of it. Two files move, the Python codec
+stays, and `ROVER_PROTOCOL_ROOT` points the Jetson code at a checkout of this
+one. [PROTOCOL.md §10.2](PROTOCOL.md) says why copying the codec instead would
+defeat the cross-language pinning.
+
 ---
 
 ## Running the tests
@@ -94,7 +100,7 @@ make test-host   # host side only — compiles the C++ core
 | `tests/cpp/test_drive.cpp` | 17 | Does a command become the right motor output — and never one it was told not to? |
 | `tests/host/test_config_sync.py` | 14 | Do the C++ and Python configs hold the same constants? |
 | `tests/host/test_golden_vectors.py` | 30 | Do C++ and Python agree byte-for-byte? |
-| `tests/host/test_integration.py` | 39 | Do both ends actually talk to each other? |
+| `tests/host/test_integration.py` | 43 | Do both ends actually talk to each other? |
 | `tests/host/test_autonomy_mission.py` | 10 | Does an autonomy decision reach the drive stage — and would we notice if it stopped? |
 
 Every test is named for the failure it prevents, so the reason it exists
