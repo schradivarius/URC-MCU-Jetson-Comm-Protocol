@@ -150,6 +150,35 @@ enum : uint8_t {
                             // were told has gone stale -- see c2LinkState()
 };
 
+// ---------------------------------------------------------------------------
+// Command acknowledgment (TelemetryState::command_ack, wire byte 5).
+//
+// The controller echoes back WHICH action commands it is currently holding
+// from the last valid CONTROL frame. The brief requires that the MCU
+// "receives and acknowledges the correct command type", and receiving alone
+// is not acknowledging: without this byte the only evidence a return request
+// arrived is that nothing observable happened, which is indistinguishable
+// from the frame never arriving at all.
+//
+// The bit positions are deliberately the SAME as the CONTROL flags they echo,
+// so the Jetson can compare what it sent against what came back with a single
+// mask and no translation table.
+//
+// This is a live state, not a latch: the bits clear as soon as the Jetson
+// stops asserting them, so the byte answers "what are you acting on now?"
+// rather than "what did you ever see?".
+//
+// It occupies the byte TELEM_STATE previously transmitted as reserved-zero,
+// so the frame layout and its 8-byte size are unchanged.
+// ---------------------------------------------------------------------------
+
+enum : uint8_t {
+    ACK_STOP           = 0x01,  // mirrors CTRL_FLAG_STOP
+    ACK_AUTONOMY_ABORT = 0x02,  // mirrors CTRL_FLAG_AUTONOMY_ABORT
+    ACK_RETURN_REQUEST = 0x04,  // mirrors CTRL_FLAG_RETURN_REQUEST
+    ACK_MASK           = 0x07,  // bits 3-7 unused, transmitted as 0
+};
+
 // Low-level controller (motor driver / ESC) aggregate health.
 enum : uint8_t {
     CTRL_HEALTH_OK           = 0,
@@ -285,7 +314,9 @@ struct TelemetryState {
                                // absent or stale -- see c2LinkState()
     uint8_t controller_health; // CTRL_HEALTH_*
     uint8_t indicator_state;   // INDICATOR_* actually being displayed
-    uint8_t reserved;          // transmit as 0
+    uint8_t command_ack;       // ACK_* bitmask: which action commands the
+                               // controller is holding right now, echoed so
+                               // the Jetson can confirm the type it sent
 };
 
 // ---------------------------------------------------------------------------

@@ -252,6 +252,14 @@ TelemetryPower RoverController::buildPower(int16_t current_ca, int16_t voltage_c
     return m;
 }
 
+uint8_t RoverController::commandAck() const {
+    uint8_t ack = 0;
+    if (last_control_.stop)           ack |= ACK_STOP;
+    if (last_control_.autonomy_abort) ack |= ACK_AUTONOMY_ABORT;
+    if (last_control_.return_request) ack |= ACK_RETURN_REQUEST;
+    return ack;
+}
+
 TelemetryState RoverController::buildState(uint8_t controller_health) const {
     TelemetryState m;
     // An ECHO of the mode the controller believes it is in, so the operator
@@ -264,7 +272,10 @@ TelemetryState RoverController::buildState(uint8_t controller_health) const {
     m.c2_link           = c2LinkState();
     m.controller_health = controller_health;
     m.indicator_state   = indicatorState();
-    m.reserved          = 0;
+    // Which action commands we are holding, echoed back so the Jetson can
+    // confirm the controller received the TYPE it sent -- a return request is
+    // otherwise invisible, since by design it changes no behaviour here.
+    m.command_ack       = commandAck();
     return m;
 }
 

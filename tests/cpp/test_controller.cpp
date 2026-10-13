@@ -168,6 +168,61 @@ static void autonomy_abort_does_not_stop_a_teleoperated_rover() {
     CHECK_EQ(d, 800);
 }
 
+static void command_ack_echoes_the_action_command_held() {
+    // "Receives and acknowledges the correct command type". A return request
+    // deliberately changes no behaviour here, so without this echo the only
+    // evidence it arrived is that nothing happened -- which looks exactly like
+    // the frame never arriving.
+    RoverController ctl = freshController();
+    sendControl(ctl, 500, 0, MODE_AUTONOMOUS, false, false, /*ret=*/true);
+    CHECK_EQ(ctl.commandAck(), ACK_RETURN_REQUEST);
+    CHECK_EQ(ctl.buildState().command_ack, ACK_RETURN_REQUEST);
+}
+
+static void command_ack_tells_abort_apart_from_return() {
+    RoverController ctl = freshController();
+    sendControl(ctl, 500, 0, MODE_AUTONOMOUS, false, /*abort=*/true, false);
+    CHECK_EQ(ctl.buildState().command_ack, ACK_AUTONOMY_ABORT);
+
+    sendControl(ctl, 500, 0, MODE_AUTONOMOUS, false, false, /*ret=*/true);
+    CHECK_EQ(ctl.buildState().command_ack, ACK_RETURN_REQUEST);
+
+    // Both at once: the operator asked to abandon the task AND come home.
+    sendControl(ctl, 500, 0, MODE_AUTONOMOUS, false, /*abort=*/true, /*ret=*/true);
+    CHECK_EQ(ctl.buildState().command_ack,
+             ACK_AUTONOMY_ABORT | ACK_RETURN_REQUEST);
+
+    // Stop rides the same byte, so all three concepts stay distinguishable.
+    sendControl(ctl, 500, 0, MODE_AUTONOMOUS, /*stop=*/true, false, false);
+    CHECK_EQ(ctl.buildState().command_ack, ACK_STOP);
+}
+
+static void command_ack_is_a_live_state_not_a_latch() {
+    // It must answer "what are you acting on now?", not "what did you ever
+    // see?". A latched abort would read as still-aborting after release.
+    RoverController ctl = freshController();
+    sendControl(ctl, 500, 0, MODE_AUTONOMOUS, false, /*abort=*/true, /*ret=*/true);
+    CHECK_EQ(ctl.buildState().command_ack,
+             ACK_AUTONOMY_ABORT | ACK_RETURN_REQUEST);
+
+    sendControl(ctl, 500, 0, MODE_AUTONOMOUS, false, false, false);
+    CHECK_EQ(ctl.buildState().command_ack, 0);
+}
+
+static void a_rejected_frame_does_not_change_the_acknowledgment() {
+    // A frame the controller refused must not be able to retract a command it
+    // is still holding -- the acknowledgment has to describe the last VALID
+    // command, like every other field derived from last_control_.
+    RoverController ctl = freshController();
+    sendControl(ctl, 500, 0, MODE_AUTONOMOUS, false, /*abort=*/true, false);
+    CHECK_EQ(ctl.buildState().command_ack, ACK_AUTONOMY_ABORT);
+
+    uint8_t bad[8] = {0};                       // wrong DLC: rejected
+    CHECK(!ctl.ingestFrame(CAN_ID_CONTROL, bad, 4));
+    CHECK_EQ(ctl.buildState().command_ack, ACK_AUTONOMY_ABORT);
+    CHECK(ctl.effectiveStop());                 // and the abort still holds
+}
+
 static void return_request_is_carried_but_does_not_stop() {
     // A behaviour request for a higher layer, not a safety input.
     RoverController ctl = freshController();
@@ -584,6 +639,10 @@ int main() {
     RUN_TEST(autonomy_abort_stops_an_autonomous_rover);
     RUN_TEST(autonomy_abort_does_not_stop_a_teleoperated_rover);
     RUN_TEST(return_request_is_carried_but_does_not_stop);
+    RUN_TEST(command_ack_echoes_the_action_command_held);
+    RUN_TEST(command_ack_tells_abort_apart_from_return);
+    RUN_TEST(command_ack_is_a_live_state_not_a_latch);
+    RUN_TEST(a_rejected_frame_does_not_change_the_acknowledgment);
     RUN_TEST(wrong_dlc_does_not_refresh_the_watchdog);
     RUN_TEST(a_bad_crc_does_not_refresh_the_watchdog);
     RUN_TEST(foreign_can_id_does_not_refresh_the_watchdog);
