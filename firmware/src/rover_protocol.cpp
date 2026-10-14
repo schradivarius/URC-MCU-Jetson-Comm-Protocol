@@ -127,6 +127,14 @@ bool modePermitsMotion(uint8_t mode) {
     return mode == MODE_TELEOP || mode == MODE_AUTONOMOUS;
 }
 
+bool sourceOwnsMode(bool from_autonomy, uint8_t mode) {
+    // Only modes that permit motion have an owner -- in SAFE nothing may
+    // move, so there is nothing for a source to be wrong about and a caller
+    // asking the question gets "yes" rather than a spurious mismatch.
+    if (!modePermitsMotion(mode)) return true;
+    return from_autonomy == (mode == MODE_AUTONOMOUS);
+}
+
 bool isValidCommand(int16_t value) {
     return value >= CMD_MIN && value <= CMD_MAX;
 }
@@ -206,6 +214,7 @@ uint8_t encodeControl(const ControlMsg& msg, uint8_t* buf) {
     if (msg.autonomy_abort)  flags |= CTRL_FLAG_AUTONOMY_ABORT;
     if (msg.return_request)  flags |= CTRL_FLAG_RETURN_REQUEST;
     if (msg.c2_lost)         flags |= CTRL_FLAG_C2_LOST;
+    if (msg.from_autonomy)   flags |= CTRL_FLAG_FROM_AUTONOMY;
     flags |= static_cast<uint8_t>((msg.indicator_request << CTRL_INDICATOR_SHIFT)
                                   & CTRL_INDICATOR_MASK);
     buf[5] = flags;
@@ -228,9 +237,11 @@ DecodeResult decodeControl(uint32_t can_id, const uint8_t* buf, uint8_t len,
     // this firmware does not implement must stop this rover.
     if (!isCommandableMode(mode)) return DECODE_BAD_MODE;
 
-    // Reserved bits set means a newer sender is using a field we do not
-    // understand, so we cannot safely interpret the rest of the flags byte.
-    if (flags & CTRL_FLAG_RESERVED_MASK) return DECODE_BAD_FLAGS;
+    // No reserved-bit check remains: v0.6 took bit 7 for from_autonomy and
+    // the flags byte is full. A frame whose source does not own the mode is
+    // NOT rejected here -- it is well formed, and refusing it would stop the
+    // rover over a Jetson-side mux bug instead of reporting one. Authority is
+    // the controller's decision; see RoverController::commandAuthorized().
 
     const uint8_t indicator =
         static_cast<uint8_t>((flags & CTRL_INDICATOR_MASK) >> CTRL_INDICATOR_SHIFT);
@@ -249,6 +260,7 @@ DecodeResult decodeControl(uint32_t can_id, const uint8_t* buf, uint8_t len,
     out.autonomy_abort   = (flags & CTRL_FLAG_AUTONOMY_ABORT) != 0;
     out.return_request   = (flags & CTRL_FLAG_RETURN_REQUEST) != 0;
     out.c2_lost          = (flags & CTRL_FLAG_C2_LOST) != 0;
+    out.from_autonomy    = (flags & CTRL_FLAG_FROM_AUTONOMY) != 0;
     out.indicator_request = indicator;
     out.seq              = seq;
     return DECODE_OK;
@@ -305,6 +317,48 @@ DecodeResult decodeTelemetryPower(uint32_t can_id, const uint8_t* buf, uint8_t l
     return DECODE_OK;
 }
 
+// ---------------------------------------------------------------------------
+// Command-status byte
+// ---------------------------------------------------------------------------
+
+// Both fields are three bits wide, so the enums they carry have to fit. A
+// seventh DecodeResult or a fifth CMD_STATUS_* is fine; an eighth is not, and
+// would otherwise silently truncate onto the wire.
+static_assert(DECODE_BAD_RANGE <= 7, "DecodeResult no longer fits in 3 bits");
+static_assert(CMD_STATUS_NO_COMMAND <= 7, "CMD_STATUS_* no longer fits in 3 bits");
+
+uint8_t packCmdStatus(uint8_t status, DecodeResult decode, bool return_active) {
+    uint8_t packed = static_cast<uint8_t>(status & CMD_ECHO_STATUS_MASK);
+    packed = static_cast<uint8_t>(
+        packed | ((static_cast<uint8_t>(decode) << CMD_ECHO_DECODE_SHIFT)
+                  & CMD_ECHO_DECODE_MASK));
+    if (return_active) packed = static_cast<uint8_t>(packed | CMD_ECHO_RETURN_ACTIVE);
+    return packed;
+}
+
+uint8_t cmdStatusOf(uint8_t packed) {
+    return static_cast<uint8_t>(packed & CMD_ECHO_STATUS_MASK);
+}
+
+DecodeResult decodeResultOf(uint8_t packed) {
+    return static_cast<DecodeResult>(
+        (packed & CMD_ECHO_DECODE_MASK) >> CMD_ECHO_DECODE_SHIFT);
+}
+
+bool returnActiveOf(uint8_t packed) {
+    return (packed & CMD_ECHO_RETURN_ACTIVE) != 0;
+}
+
+const char* cmdStatusName(uint8_t status) {
+    switch (status) {
+        case CMD_STATUS_APPLIED:      return "APPLIED";
+        case CMD_STATUS_STOPPED:      return "STOPPED";
+        case CMD_STATUS_WRONG_SOURCE: return "WRONG_SOURCE";
+        case CMD_STATUS_NO_COMMAND:   return "NO_COMMAND";
+    }
+    return "UNKNOWN";
+}
+
 uint8_t encodeTelemetryState(const TelemetryState& msg, uint8_t seq, uint8_t* buf) {
     buf[0] = msg.mode;
     buf[1] = msg.jetson_link;
@@ -325,6 +379,25 @@ DecodeResult decodeTelemetryState(uint32_t can_id, const uint8_t* buf, uint8_t l
     out.controller_health = buf[3];
     out.indicator_state   = buf[4];
     out.reserved          = buf[5];
+    return DECODE_OK;
+}
+
+uint8_t encodeTelemetryCmdEcho(const TelemetryCmdEcho& msg, uint8_t seq, uint8_t* buf) {
+    putI16(buf + 0, msg.drive_applied);
+    putI16(buf + 2, msg.steer_applied);
+    buf[4] = msg.ack_seq;
+    buf[5] = msg.status;
+    return sealFrame(CAN_ID_TELEM_CMD_ECHO, seq, buf);
+}
+
+DecodeResult decodeTelemetryCmdEcho(uint32_t can_id, const uint8_t* buf, uint8_t len,
+                                    TelemetryCmdEcho& out, uint8_t& seq_out) {
+    DecodeResult r = openFrame(can_id, buf, len, seq_out);
+    if (r != DECODE_OK) return r;
+    out.drive_applied = getI16(buf + 0);
+    out.steer_applied = getI16(buf + 2);
+    out.ack_seq       = buf[4];
+    out.status        = buf[5];
     return DECODE_OK;
 }
 

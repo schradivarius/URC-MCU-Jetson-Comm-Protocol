@@ -13,6 +13,11 @@ D: autonomy abort while in AUTONOMOUS.
 E: a corrupted frame -- the application-layer CRC rejects it and the rover
    reports CRC_ERROR rather than acting on it.
 F: a sequence gap -- detected and reported as SEQ_GAP.
+
+This is the TASK 3 demonstration and stays focused on the link. The Task 4
+demonstration -- an autonomy decision reaching the drive stage, and autonomy
+and teleop commands being refused in each other's modes -- is
+host/autonomy_sim.py (`make autonomy`).
 """
 
 import os
@@ -88,7 +93,8 @@ def main():
 
         phase(jl, t0, 0.5, "D: autonomy abort while AUTONOMOUS",
               drive_cmd=800, steer_cmd=0, mode=rp.MODE_AUTONOMOUS, c2_lost=False,
-              autonomy_abort=True, indicator_request=rp.INDICATOR_AUTONOMOUS)
+              autonomy_abort=True, indicator_request=rp.INDICATOR_AUTONOMOUS,
+              from_autonomy=True)
 
         # The two link failures are NOT equivalent, and these two phases are
         # the demonstration of it. C2 loss with a healthy Jetson is expected on
@@ -96,7 +102,7 @@ def main():
         # while onboard autonomy keeps running.
         phase(jl, t0, 0.5, "D2: C2 lost while AUTONOMOUS -- keeps driving, fault raised",
               drive_cmd=800, steer_cmd=0, mode=rp.MODE_AUTONOMOUS, c2_lost=True,
-              indicator_request=rp.INDICATOR_AUTONOMOUS)
+              indicator_request=rp.INDICATOR_AUTONOMOUS, from_autonomy=True)
 
         phase(jl, t0, 0.5, "D3: C2 lost while TELEOP -- stops, nobody can reach it",
               drive_cmd=800, steer_cmd=0, mode=rp.MODE_TELEOP, c2_lost=True,
@@ -136,7 +142,7 @@ def main():
         assert jl.tele.complete_count > 10, "too few complete snapshots"
         assert jl.unknown_frames == 0, "unexpected CAN id seen"
         print()
-        print("PASS: snapshots reassembled from four frames throughout; the")
+        print("PASS: snapshots reassembled from five frames throughout; the")
         print("watchdog, stop flag and autonomy abort each forced a stop; C2")
         print("loss stopped a teleoperated rover but not an autonomous one; the")
         print("application-layer CRC rejected a corrupted frame; and a")

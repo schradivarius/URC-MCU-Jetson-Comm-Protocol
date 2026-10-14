@@ -21,25 +21,44 @@ import sys
 import threading
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import protocol_root  # noqa: E402
 from rover_config import CAN_BITRATE_HZ  # noqa: E402
 
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Resolved through protocol_root so that every reader of firmware/src -- this
+# module, the config-sync test and the golden-vector test -- agrees on which
+# checkout is in play. They did not always, and the suite went green over a
+# version mismatch as a result; see host/protocol_root.py.
+REPO = protocol_root.protocol_root()
 SIM_SOURCES = [
-    os.path.join(REPO, "tools", "rover_sim.cpp"),
-    os.path.join(REPO, "firmware", "src", "rover_controller.cpp"),
-    os.path.join(REPO, "firmware", "src", "rover_protocol.cpp"),
+    protocol_root.tools("rover_sim.cpp"),
+    protocol_root.firmware_src("rover_controller.cpp"),
+    protocol_root.firmware_src("rover_protocol.cpp"),
+    protocol_root.firmware_src("rover_drive.cpp"),
 ]
 # Headers count too: a constant changed only in rover_config.h must still
 # rebuild the simulator, or the tests run against stale message sizes.
 SIM_HEADERS = [
-    os.path.join(REPO, "firmware", "src", name)
-    for name in ("rover_config.h", "rover_protocol.h", "rover_controller.h")
+    protocol_root.firmware_src(name)
+    for name in ("rover_config.h", "rover_protocol.h", "rover_controller.h",
+                 "rover_drive.h")
 ]
-SIM_BINARY = os.path.join(REPO, "tests", "cpp", "build", "rover_sim")
+SIM_BINARY = os.path.join(protocol_root.build_dir(), "rover_sim")
 
 
 def build_sim(force=False):
     """Compile the simulator if needed. Returns its path."""
+    # Checked by name, and before the staleness comparison below, because the
+    # alternative symptoms are all worse: an OSError from getmtime, a compiler
+    # error naming a header nobody pointed at, or -- worst -- a cached binary
+    # from an earlier run that still looks perfectly good.
+    missing = [p for p in SIM_SOURCES + SIM_HEADERS if not os.path.exists(p)]
+    if missing:
+        hint = ("" if not protocol_root.is_overridden() else
+                "; %s is set, and must point at the root of a "
+                "protocol-repository checkout" % protocol_root.ENV_VAR)
+        raise RuntimeError("firmware sources missing under %s: %s%s"
+                           % (REPO, ", ".join(os.path.relpath(m, REPO)
+                                              for m in missing), hint))
     if not force and os.path.exists(SIM_BINARY):
         newest_src = max(os.path.getmtime(s) for s in SIM_SOURCES + SIM_HEADERS)
         if os.path.getmtime(SIM_BINARY) >= newest_src:

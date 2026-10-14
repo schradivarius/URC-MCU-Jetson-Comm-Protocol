@@ -72,9 +72,54 @@ public:
     // asking only about SAFE let every undefined mode read as drivable.
     bool effectiveStop() const;
 
-    // The drive/steer actually permitted right now: zeroed under stop, so a
-    // caller cannot accidentally act on a stale command.
+    // The drive/steer actually permitted right now: zeroed under stop AND
+    // under an authority mismatch, so a caller cannot accidentally act on a
+    // stale command or on one from the wrong half of the stack.
     void commandedOutputs(int16_t& drive, int16_t& steer) const;
+
+    // --- command authority ------------------------------------------------
+
+    // Does the producer of the last accepted CONTROL frame own the current
+    // mode? The autonomy stack owns AUTONOMOUS, the operator owns TELEOP, and
+    // SAFE has no owner because nothing may move in it.
+    //
+    // THIS IS A MUX, AND IT LIVES ON THE MCU ON PURPOSE. The Jetson could
+    // just as easily refuse to emit an autonomy command while teleoperated --
+    // and it should -- but then a single Jetson-side bug, a stale queue or a
+    // mode change that races a command in flight is enough to drive an
+    // autonomous rover from the teleop path. The controller is the one place
+    // that sees the mode and the command in the same frame, so it is the one
+    // place the two can be checked against each other.
+    //
+    // It gates MOTION and the indicator request, never the safety flags: stop,
+    // autonomy_abort and c2_lost are honoured from either source, because
+    // anyone who can see the rover is in trouble has to be able to stop it.
+    bool commandAuthorized() const;
+
+    // The authority failure worth REPORTING, which is not the same question.
+    // A stale frame's source is as stale as the rest of it, so this stays
+    // false once the watchdog has tripped -- the same rule that keeps
+    // c2LinkState() from vouching for a value it can no longer see.
+    bool sourceMismatch() const;
+
+    // CMD_STATUS_*: the single most important reason the drive stage is
+    // seeing what it is seeing. See the enum in rover_protocol.h for the
+    // precedence, which is NO_COMMAND, then STOPPED, then WRONG_SOURCE.
+    uint8_t commandStatus() const;
+
+    // The controller is holding a return-to-base request.
+    //
+    // REPORTED, NOT ACTED ON, and that is deliberate. Driving the rover back
+    // is route planning, which Task 4 explicitly places on the autonomy side,
+    // and PROTOCOL.md section 9 leaves the stop/abort/return semantics as a
+    // team decision rather than a firmware one. So the controller does the
+    // part only it can do -- acknowledge the request so the Jetson can prove
+    // it arrived -- and changes no safety behaviour. effectiveStop() is
+    // untouched.
+    //
+    // Only meaningful in AUTONOMOUS: an autonomous return is the thing being
+    // requested, and under teleoperation the operator is already driving.
+    bool returnRequestActive() const;
 
     // --- transmit scheduling ---------------------------------------------
 
@@ -96,6 +141,12 @@ public:
                                uint16_t sensor_faults = 0,
                                uint16_t extra_faults = 0) const;
     TelemetryState  buildState(uint8_t controller_health = CTRL_HEALTH_NOT_REPORTED) const;
+
+    // The acknowledgement frame. drive_applied/steer_applied are passed in
+    // rather than read back from a drive module, so this class keeps knowing
+    // nothing about the output stage -- the same shape as buildDriveL() taking
+    // sensor readings. Pass what commandedOutputs() returned.
+    TelemetryCmdEcho buildCmdEcho(int16_t drive_applied, int16_t steer_applied) const;
 
     // Every fault the controller itself knows about, OR-ed together. Exposed
     // so the firmware can report the same word it acts on.
@@ -144,6 +195,7 @@ public:
     bool autonomyAbort() const { return last_control_.autonomy_abort; }
     bool returnRequest() const { return last_control_.return_request; }
     bool c2Lost() const { return last_control_.c2_lost; }
+    bool commandFromAutonomy() const { return last_control_.from_autonomy; }
 
     uint32_t controlFramesAccepted() const { return control_frames_accepted_; }
     uint32_t framesIgnored() const { return frames_ignored_; }

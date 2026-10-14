@@ -39,6 +39,11 @@ RoverController::RoverController(MillisFn now_ms,
     // only visible through c2LinkState(), which reports NOT_REPORTED until a
     // real frame arrives, so this cannot masquerade as forwarded state.
     last_control_.c2_lost           = true;
+    // Boot as the operator's rover, not autonomy's. The mode boots SAFE
+    // so nothing can move either way, but if these two ever get out of step
+    // the safe default is the one that refuses autonomous motion until a real
+    // frame asks for it.
+    last_control_.from_autonomy     = false;
     last_control_.seq               = 0;
 }
 
@@ -143,8 +148,44 @@ bool RoverController::effectiveStop() const {
         || (last_control_.autonomy_abort && last_control_.mode == MODE_AUTONOMOUS);
 }
 
+bool RoverController::commandAuthorized() const {
+    if (!have_control_) return false;   // nobody has authority yet
+    return sourceOwnsMode(last_control_.from_autonomy, last_control_.mode);
+}
+
+bool RoverController::sourceMismatch() const {
+    // Suppressed once the frame is stale, for the same reason c2LinkState()
+    // suppresses a stale C2 bit: the controller must not report a condition
+    // it can no longer observe. A silent Jetson is a comm timeout, which the
+    // fault word already says, and claiming a source mismatch on top of it
+    // would send an operator chasing the wrong bug.
+    if (!have_control_ || watchdogTripped()) return false;
+    if (!modePermitsMotion(last_control_.mode)) return false;
+    return !commandAuthorized();
+}
+
+uint8_t RoverController::commandStatus() const {
+    // First match wins; see the CMD_STATUS_* comment in rover_protocol.h.
+    if (!have_control_)       return CMD_STATUS_NO_COMMAND;
+    if (effectiveStop())      return CMD_STATUS_STOPPED;
+    if (!commandAuthorized()) return CMD_STATUS_WRONG_SOURCE;
+    return CMD_STATUS_APPLIED;
+}
+
+bool RoverController::returnRequestActive() const {
+    // Reported, never acted on -- see the header. Not gated on authority:
+    // signalling a return is the OPERATOR's call under the 2027 scoring
+    // rules (1.e.xi), so it has to survive arriving from the teleop path.
+    if (!have_control_ || watchdogTripped()) return false;
+    return last_control_.return_request && last_control_.mode == MODE_AUTONOMOUS;
+}
+
 void RoverController::commandedOutputs(int16_t& drive, int16_t& steer) const {
-    if (effectiveStop()) { drive = 0; steer = 0; return; }
+    // Two independent reasons to be at zero. A stop is a safety decision; an
+    // authority mismatch is "this command is not yours to give right now".
+    // They are not the same thing and are reported separately, but both end
+    // here, so there is one place where a command becomes an output.
+    if (effectiveStop() || !commandAuthorized()) { drive = 0; steer = 0; return; }
     drive = last_control_.drive_cmd;
     steer = last_control_.steer_cmd;
 }
@@ -204,6 +245,11 @@ uint16_t RoverController::faultWord(uint16_t sensor_faults, uint16_t extra_fault
     // contact, which an operator needs whether or not it changes the driving.
     // Suppressed once the value is stale: see c2LinkState().
     if (c2LinkState() == LINK_LOST) faults |= FAULT_C2_LINK_LOST;
+    // The rover is being commanded by the wrong half of the stack. In the
+    // fault word as well as in TELEM_CMD_ECHO, because an operator watching
+    // faults is exactly who needs to know that a rover which looks idle is
+    // idle on purpose.
+    if (sourceMismatch()) faults |= FAULT_CMD_SOURCE;
     return faults;
 }
 
@@ -229,7 +275,16 @@ uint8_t RoverController::indicatorState() const {
     // 4. Autonomous. Only the ARRIVED request matters; anything else is red.
     //    `stop` deliberately does not change the light: a paused autonomous
     //    rover is still under autonomous operation.
-    if (last_control_.indicator_request == INDICATOR_ARRIVED) return INDICATOR_ARRIVED;
+    //
+    //    The request is honoured only from the source that owns this mode.
+    //    "I have arrived" is an assertion about what the AUTONOMY did, worth
+    //    25 points under rule 1.e.xvii, so a teleop-path frame claiming it
+    //    while the rover is autonomous is the one mix-up that could put
+    //    flashing green on a rover that has not arrived anywhere.
+    if (commandAuthorized()
+            && last_control_.indicator_request == INDICATOR_ARRIVED) {
+        return INDICATOR_ARRIVED;
+    }
     return INDICATOR_AUTONOMOUS;
 }
 
@@ -270,6 +325,21 @@ TelemetryState RoverController::buildState(uint8_t controller_health) const {
     m.controller_health = controller_health;
     m.indicator_state   = indicatorState();
     m.reserved          = 0;
+    return m;
+}
+
+TelemetryCmdEcho RoverController::buildCmdEcho(int16_t drive_applied,
+                                               int16_t steer_applied) const {
+    TelemetryCmdEcho m;
+    m.drive_applied = drive_applied;
+    m.steer_applied = steer_applied;
+    // The sequence number of the last frame that fully validated, which is
+    // what makes this an ACKNOWLEDGEMENT rather than a status: the Jetson can
+    // match it against the seq it sent and know that this exact command got
+    // through. Meaningless under NO_COMMAND, where no frame has arrived to
+    // acknowledge -- see the struct comment.
+    m.ack_seq = last_control_.seq;
+    m.status  = packCmdStatus(commandStatus(), last_decode_, returnRequestActive());
     return m;
 }
 

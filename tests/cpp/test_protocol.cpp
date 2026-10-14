@@ -88,11 +88,11 @@ static void seq_delta_is_correct_across_the_wrap() {
 
 static ControlMsg makeControl(int16_t d, int16_t s, uint8_t mode, bool stop,
                               bool abort, bool ret, uint8_t ind, uint8_t seq,
-                              bool c2_lost = false) {
+                              bool c2_lost = false, bool from_autonomy = false) {
     ControlMsg m;
     m.drive_cmd = d; m.steer_cmd = s; m.mode = mode;
     m.stop = stop; m.autonomy_abort = abort; m.return_request = ret;
-    m.c2_lost = c2_lost;
+    m.c2_lost = c2_lost; m.from_autonomy = from_autonomy;
     m.indicator_request = ind; m.seq = seq;
     return m;
 }
@@ -369,31 +369,130 @@ static void undefined_mode_is_rejected_at_decode() {
     }
 }
 
-static void reserved_flag_bits_are_rejected() {
-    // Reserved bits set means a newer sender is using a field we do not
-    // understand, so we cannot safely interpret the rest of the flags byte.
-    // Only bit 7 is reserved now: bit 6 carries c2_lost.
+static void every_flags_byte_value_now_decodes() {
+    // v0.5 rejected bit 7 as reserved. v0.6 gave it to from_autonomy, so the
+    // flags byte is full and no VALUE of it can be rejected any more -- only
+    // the indicator field inside it can still be out of range. This is the
+    // guard that the reserved check was actually removed rather than left
+    // checking a mask someone later sets back to non-zero.
     ControlMsg out;
-    uint8_t buf[8] = {0};
-    encodeControl(makeControl(0, 0, MODE_TELEOP, false, false, false,
-                              INDICATOR_OFF, 0), buf);
-    buf[5] |= CTRL_FLAG_RESERVED_MASK;
-    buf[FRAME_CRC_OFFSET] = frameCrc8(CAN_ID_CONTROL, buf, FRAME_SEQ_OFFSET + 1);
-    CHECK_EQ(decodeControl(CAN_ID_CONTROL, buf, FRAME_DLC, out), DECODE_BAD_FLAGS);
-    CHECK_EQ(CTRL_FLAG_RESERVED_MASK, 0x80);
+    for (int f = 0; f <= 255; ++f) {
+        uint8_t buf[8] = {0};
+        encodeControl(makeControl(0, 0, MODE_TELEOP, false, false, false,
+                                  INDICATOR_OFF, 0), buf);
+        buf[5] = static_cast<uint8_t>(f);
+        buf[FRAME_CRC_OFFSET] = frameCrc8(CAN_ID_CONTROL, buf, FRAME_SEQ_OFFSET + 1);
+        const uint8_t ind =
+            static_cast<uint8_t>((buf[5] & CTRL_INDICATOR_MASK) >> CTRL_INDICATOR_SHIFT);
+        const DecodeResult want =
+            isKnownIndicator(ind) ? DECODE_OK : DECODE_BAD_INDICATOR;
+        CHECK_EQ(decodeControl(CAN_ID_CONTROL, buf, FRAME_DLC, out), want);
+    }
 }
 
-static void the_c2_flag_bit_is_a_field_not_a_reserved_bit() {
-    // The guard against a typo'd reserved mask swallowing a live field: bit 6
-    // must decode as c2_lost, not reject the frame.
+static void the_c2_and_source_bits_are_fields_not_reserved_bits() {
+    // The guard against a stray mask swallowing a live field: bits 6 and 7
+    // must decode as c2_lost and from_autonomy, not reject the frame.
     ControlMsg out;
     uint8_t buf[8] = {0};
-    encodeControl(makeControl(0, 0, MODE_TELEOP, false, false, false,
-                              INDICATOR_OFF, 0, /*c2_lost=*/true), buf);
+    encodeControl(makeControl(0, 0, MODE_AUTONOMOUS, false, false, false,
+                              INDICATOR_OFF, 0, /*c2_lost=*/true,
+                              /*from_autonomy=*/true), buf);
     CHECK_EQ(buf[5] & CTRL_FLAG_C2_LOST, CTRL_FLAG_C2_LOST);
-    CHECK_EQ(buf[5] & CTRL_FLAG_RESERVED_MASK, 0);
+    CHECK_EQ(buf[5] & CTRL_FLAG_FROM_AUTONOMY, CTRL_FLAG_FROM_AUTONOMY);
     CHECK_EQ(decodeControl(CAN_ID_CONTROL, buf, FRAME_DLC, out), DECODE_OK);
     CHECK(out.c2_lost);
+    CHECK(out.from_autonomy);
+}
+
+static void the_source_bit_survives_a_round_trip_independently() {
+    // Every other flag must be unaffected by it, and it by them -- a mask
+    // off by one bit would show up as two fields moving together.
+    ControlMsg out;
+    for (int src = 0; src <= 1; ++src) {
+        for (int c2 = 0; c2 <= 1; ++c2) {
+            uint8_t buf[8] = {0};
+            ControlMsg in = makeControl(250, -250, MODE_AUTONOMOUS, true, true,
+                                        true, INDICATOR_ARRIVED, 9, c2 != 0,
+                                        src != 0);
+            encodeControl(in, buf);
+            CHECK_EQ(decodeControl(CAN_ID_CONTROL, buf, FRAME_DLC, out), DECODE_OK);
+            CHECK_EQ(out.from_autonomy, src != 0);
+            CHECK_EQ(out.c2_lost, c2 != 0);
+            CHECK(out.stop); CHECK(out.autonomy_abort); CHECK(out.return_request);
+            CHECK_EQ(out.indicator_request, INDICATOR_ARRIVED);
+        }
+    }
+}
+
+static void authority_is_a_whitelist_over_every_mode_and_source() {
+    // Exhaustive over the mode byte, both sources. The failure this catches
+    // is an undefined mode reading as owned by whoever asked.
+    for (int m = 0; m <= 255; ++m) {
+        const uint8_t mode = static_cast<uint8_t>(m);
+        const bool motion = modePermitsMotion(mode);
+        CHECK_EQ(sourceOwnsMode(true, mode),
+                 motion ? (mode == MODE_AUTONOMOUS) : true);
+        CHECK_EQ(sourceOwnsMode(false, mode),
+                 motion ? (mode == MODE_TELEOP) : true);
+    }
+}
+
+static void fault_has_no_owner() {
+    // FAULT is entered by the controller, never commanded, and nothing may
+    // move in it -- so neither half of the stack can be "wrong" about it.
+    CHECK(sourceOwnsMode(true, MODE_FAULT));
+    CHECK(sourceOwnsMode(false, MODE_FAULT));
+}
+
+static void the_command_status_byte_packs_and_unpacks() {
+    const uint8_t statuses[] = {CMD_STATUS_APPLIED, CMD_STATUS_STOPPED,
+                                CMD_STATUS_WRONG_SOURCE, CMD_STATUS_NO_COMMAND};
+    const DecodeResult decodes[] = {DECODE_OK, DECODE_BAD_DLC, DECODE_BAD_CRC,
+                                    DECODE_BAD_MODE, DECODE_BAD_FLAGS,
+                                    DECODE_BAD_INDICATOR, DECODE_BAD_RANGE};
+    for (uint8_t st : statuses) {
+        for (DecodeResult dr : decodes) {
+            for (int ret = 0; ret <= 1; ++ret) {
+                const uint8_t packed = packCmdStatus(st, dr, ret != 0);
+                CHECK_EQ(cmdStatusOf(packed), st);
+                CHECK_EQ(decodeResultOf(packed), dr);
+                CHECK_EQ(returnActiveOf(packed), ret != 0);
+                // Bit 7 is the last reserved bit anywhere in the protocol.
+                CHECK_EQ(packed & CMD_ECHO_RESERVED_MASK, 0);
+            }
+        }
+    }
+}
+
+static void the_cmd_echo_frame_round_trips() {
+    const struct { int16_t d, s; uint8_t ack, st; } cases[] = {
+        {0, 0, 0, CMD_STATUS_NO_COMMAND},
+        {1000, -1000, 255, CMD_STATUS_APPLIED},
+        {-1000, 1000, 128, CMD_STATUS_WRONG_SOURCE},
+        {0, 0, 42, CMD_STATUS_STOPPED},
+    };
+    for (const auto& c : cases) {
+        TelemetryCmdEcho in;
+        in.drive_applied = c.d; in.steer_applied = c.s; in.ack_seq = c.ack;
+        in.status = packCmdStatus(c.st, DECODE_OK, false);
+        uint8_t buf[8] = {0};
+        CHECK_EQ(encodeTelemetryCmdEcho(in, 77, buf), FRAME_DLC);
+
+        TelemetryCmdEcho out; uint8_t seq = 0;
+        CHECK_EQ(decodeTelemetryCmdEcho(CAN_ID_TELEM_CMD_ECHO, buf, FRAME_DLC,
+                                        out, seq), DECODE_OK);
+        CHECK_EQ(out.drive_applied, c.d);
+        CHECK_EQ(out.steer_applied, c.s);
+        CHECK_EQ(out.ack_seq, c.ack);
+        CHECK_EQ(cmdStatusOf(out.status), c.st);
+        CHECK_EQ(seq, 77);
+
+        // The CRC is seeded with the id, so the same bytes on another
+        // telemetry id must not be accepted as this message.
+        CHECK_EQ(decodeTelemetryCmdEcho(CAN_ID_TELEM_STATE, buf, FRAME_DLC,
+                                        out, seq), DECODE_BAD_CRC);
+    }
 }
 
 static void indicator_predicate_covers_all_256_values() {
@@ -520,8 +619,13 @@ int main() {
     RUN_TEST(fault_is_never_commanded_or_driven);
     RUN_TEST(mode_values_are_fixed_on_the_wire);
     RUN_TEST(undefined_mode_is_rejected_at_decode);
-    RUN_TEST(reserved_flag_bits_are_rejected);
-    RUN_TEST(the_c2_flag_bit_is_a_field_not_a_reserved_bit);
+    RUN_TEST(every_flags_byte_value_now_decodes);
+    RUN_TEST(the_c2_and_source_bits_are_fields_not_reserved_bits);
+    RUN_TEST(the_source_bit_survives_a_round_trip_independently);
+    RUN_TEST(authority_is_a_whitelist_over_every_mode_and_source);
+    RUN_TEST(fault_has_no_owner);
+    RUN_TEST(the_command_status_byte_packs_and_unpacks);
+    RUN_TEST(the_cmd_echo_frame_round_trips);
     RUN_TEST(indicator_predicate_covers_all_256_values);
     RUN_TEST(undefined_indicator_request_is_rejected);
     RUN_TEST(every_frame_is_exactly_eight_bytes);

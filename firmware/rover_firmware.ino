@@ -18,7 +18,7 @@
 // WHY THIS FILE IS SHORT
 //   All the protocol and safety logic lives in src/rover_protocol.* and
 //   src/rover_controller.*, which are pure C++ with no Arduino dependency and
-//   are unit-tested natively (`make -C tests/cpp test`, 38 tests). This file
+//   are unit-tested natively (`make -C tests/cpp test`). This file
 //   is only the hardware wiring around them. If you are reviewing safety
 //   behaviour, read rover_controller.h, not this.
 //
@@ -30,10 +30,15 @@
 //      except as a gap in telemetry, so the NEXT boot inspects the reset
 //      status register and raises FAULT_FIRMWARE_FAULT for the whole session.
 //   3. Command watchdog, in RoverController: no valid CONTROL frame within
-//      300 ms forces a stop and raises FAULT_JETSON_HEARTBEAT_LOST.
+//      300 ms forces a stop and raises FAULT_COMM_TIMEOUT.
 //   4. Commands are zeroed by commandedOutputs() before they ever reach the
 //      motor layer, so a future edit to setMotorOutputs() cannot accidentally
-//      act on a stale command.
+//      act on a stale command. DriveModule then refuses to energize anything
+//      when told not to, so the stop survives an edit to either layer.
+//   5. Command authority (v0.6). An autonomy-generated command may not drive
+//      a teleoperated rover and vice versa; see commandAuthorized(). The mux
+//      is here rather than on the Jetson so that a Jetson-side bug cannot
+//      drive an autonomous rover from the teleop path.
 //
 //   Note one honest difference from the CircuitPython version: there is no
 //   try/except guard here, because Arduino builds run without exceptions. The
@@ -44,6 +49,7 @@
 #include <Watchdog_t4.h>
 
 #include "src/rover_controller.h"
+#include "src/rover_drive.h"
 #include "src/rover_protocol.h"
 
 using namespace rover;
@@ -57,6 +63,19 @@ using namespace rover;
 // ---------------------------------------------------------------------------
 
 static const int LED_PIN = 13;   // Teensy onboard LED
+
+// Drive-stage output pins. PLACEHOLDERS -- nothing is wired to them yet, and
+// they need checking against the Teensy 4.1 PWM-capable pin list and against
+// whatever the drivetrain turns out to be. See setMotorOutputs().
+static const int PIN_DRIVE_L = 2;
+static const int PIN_DRIVE_R = 3;
+static const int PIN_STEER   = 4;
+
+// Servo/ESC pulse rate. 50 Hz is the universally safe default; many modern
+// ESCs accept far more, which is worth having once the hardware is known,
+// because 50 Hz puts up to 20 ms of latency on the end of a 20 Hz loop.
+static const int PWM_FREQUENCY_HZ = 50;
+static const int PWM_RESOLUTION_BITS = 12;
 // LED_PIN is a telemetry heartbeat blink ONLY. It is not the status indicator.
 //
 // TODO (hardware): the URC status light has no pin assignment and no driver
@@ -91,6 +110,7 @@ FlexCAN_T4<CAN3, RX_SIZE_256, TX_SIZE_16> Can;
 WDT_T4<WDT1> wdt;
 
 static RoverController* ctl = nullptr;
+static DriveModule drive_stage;
 static uint16_t g_boot_faults = 0;
 
 // ---------------------------------------------------------------------------
@@ -117,9 +137,14 @@ struct SensorReading {
     int16_t  voltage_cv;   // SIGNED centivolts (1 cV = 10 mV)
     uint16_t fault_bits;
     uint8_t  controller_health;  // CTRL_HEALTH_*
+    int16_t  drive_applied;      // what the drive stage was handed this cycle
+    int16_t  steer_applied;
 };
 
-static SensorReading readSensors(int16_t drive, int16_t steer, bool stopped) {
+// Takes the DRIVE STAGE's output rather than the raw command, so the
+// simulated plant reflects the mix the real hardware would receive -- the
+// same shape as tools/rover_sim.cpp, and the reason the two agree.
+static SensorReading readSensors(const DriveOutputs& out) {
     SensorReading r;
     if (!SIMULATE_SENSORS) {
         // --- real sensor reads go here ---
@@ -132,41 +157,66 @@ static SensorReading readSensors(int16_t drive, int16_t steer, bool stopped) {
         //                 which on a CAN bus arrives as its own messages
         r.enc_left = 0; r.enc_right = 0; r.steer_fb = 0;
         r.current_ca = 0; r.voltage_cv = 0; r.fault_bits = 0;
-        r.controller_health = CTRL_HEALTH_NOT_REPORTED;
+        r.controller_health = drive_stage.health();
+        r.drive_applied = 0; r.steer_applied = 0;   // filled in by loop()
         return r;
     }
 
-    const int16_t d = stopped ? 0 : drive;
-    const int16_t target = stopped ? 0 : steer;
+    const int16_t target = out.steer_effort;
 
     // wrapI32 takes int64 and wraps explicitly. Letting an int32 counter
     // overflow would be UNDEFINED BEHAVIOUR in C++ -- not a wrap, not an
     // exception, but a compiler free to do anything at all.
-    sim_enc_left  = wrapI32(static_cast<int64_t>(sim_enc_left)  + d / 10);
-    sim_enc_right = wrapI32(static_cast<int64_t>(sim_enc_right) + d / 10);
+    sim_enc_left  = wrapI32(static_cast<int64_t>(sim_enc_left)  + out.left_effort / 10);
+    sim_enc_right = wrapI32(static_cast<int64_t>(sim_enc_right) + out.right_effort / 10);
 
     if (sim_steer_fb < target)      sim_steer_fb = min(target, (int16_t)(sim_steer_fb + 25));
     else if (sim_steer_fb > target) sim_steer_fb = max(target, (int16_t)(sim_steer_fb - 25));
 
+    const int32_t effort_mag =
+        (abs(out.left_effort) + abs(out.right_effort)) / 2;
+
     r.enc_left   = sim_enc_left;
     r.enc_right  = sim_enc_right;
     r.steer_fb   = sim_steer_fb;
-    r.current_ca = stopped ? 0 : static_cast<int16_t>(abs(d) * 3 / 2);
+    r.current_ca = out.energized ? static_cast<int16_t>(effort_mag * 3 / 2) : 0;
     // Fake 24 V pack sagging a little under load.
-    r.voltage_cv = static_cast<int16_t>(2400 - abs(d) / 40);
+    r.voltage_cv = static_cast<int16_t>(2400 - effort_mag / 40);
     r.fault_bits = 0;
     if (r.current_ca > OVER_CURRENT_CA) r.fault_bits |= FAULT_OVER_CURRENT;
     if (r.voltage_cv < UNDERVOLTAGE_CV) r.fault_bits |= FAULT_UNDERVOLTAGE;
-    r.controller_health = CTRL_HEALTH_NOT_REPORTED;
+    // The drive stage reports its own health now. Still not real ESC
+    // telemetry -- that arrives as its own CAN messages and overrides this --
+    // but no longer a constant NOT_REPORTED.
+    r.controller_health = drive_stage.health();
+    r.drive_applied = 0;                        // filled in by loop()
+    r.steer_applied = 0;
     return r;
 }
 
-static void setMotorOutputs(int16_t drive, int16_t steer, bool stopped) {
-    (void)drive; (void)steer; (void)stopped;
-    // TODO once hardware exists: drive real motor/servo outputs here.
-    // When `stopped` is true this MUST de-energize the drives regardless of
-    // `drive` -- that is the entire point of the watchdog and stop paths.
-    // The caller already zeroes the commands, but honour the flag anyway.
+// Convert a pulse width to the duty value analogWrite() wants at the
+// configured frequency and resolution. Kept here rather than in rover_drive.*
+// because it is board configuration, not protocol: the module speaks
+// microseconds, which every servo and ESC datasheet also speaks.
+static uint32_t pulseToDuty(uint16_t pulse_us) {
+    const uint32_t full_scale = (1u << PWM_RESOLUTION_BITS) - 1u;
+    const uint32_t period_us = 1000000u / PWM_FREQUENCY_HZ;
+    return (static_cast<uint32_t>(pulse_us) * full_scale) / period_us;
+}
+
+static void setMotorOutputs(const DriveOutputs& out) {
+    // The module has already applied the stop: every channel reads neutral
+    // when it was told not to energize, so there is no second copy of the
+    // rule here and no way for this function to disagree with it.
+    //
+    // VERIFY ON HARDWARE. analogWrite() produces a continuous PWM waveform,
+    // which is what a brushed H-bridge or a PWM-input ESC wants. A hobby servo
+    // or a PPM-input ESC wants a 1-2 ms pulse in a 20 ms frame instead, which
+    // is the same numbers through a servo library rather than this. Check
+    // which the drive hardware expects BEFORE connecting anything that moves.
+    analogWrite(PIN_DRIVE_L, pulseToDuty(out.left_pwm_us));
+    analogWrite(PIN_DRIVE_R, pulseToDuty(out.right_pwm_us));
+    analogWrite(PIN_STEER,   pulseToDuty(out.steer_pwm_us));
 }
 
 // ---------------------------------------------------------------------------
@@ -227,6 +277,14 @@ static void sendTelemetry(const SensorReading& s) {
     frame.id  = CAN_ID_TELEM_STATE;
     frame.len = encodeTelemetryState(st, seq, frame.buf);
     Can.write(frame);
+
+    // The acknowledgement: what the controller accepted, which frame it came
+    // from, and why it is or is not being acted on. This is what lets the
+    // Jetson tell "my command got through" from "the rover is moving".
+    TelemetryCmdEcho ce = ctl->buildCmdEcho(s.drive_applied, s.steer_applied);
+    frame.id  = CAN_ID_TELEM_CMD_ECHO;
+    frame.len = encodeTelemetryCmdEcho(ce, seq, frame.buf);
+    Can.write(frame);
 }
 
 // ---------------------------------------------------------------------------
@@ -236,6 +294,15 @@ static void sendTelemetry(const SensorReading& s) {
 void setup() {
     pinMode(LED_PIN, OUTPUT);
     digitalWrite(LED_PIN, LOW);
+
+    // Bring the drive pins up at neutral BEFORE anything else can run. A pin
+    // left floating through setup() is a pin an ESC may read as a command.
+    analogWriteResolution(PWM_RESOLUTION_BITS);
+    for (int pin : {PIN_DRIVE_L, PIN_DRIVE_R, PIN_STEER}) {
+        pinMode(pin, OUTPUT);
+        analogWriteFrequency(pin, PWM_FREQUENCY_HZ);
+        analogWrite(pin, pulseToDuty(PWM_NEUTRAL_US));
+    }
 
     Serial.begin(115200);                   // USB console, for diagnostics only
     g_boot_faults = detectBootFault();
@@ -275,12 +342,22 @@ void loop() {
         ctl->ingestFrame(rx.id, rx.buf, rx.len);
     }
 
+    // The Task 4 chain, in order: the frame has been validated and the mode
+    // and authority checked above; the controller now says what may be
+    // driven, and the drive stage turns that into pin outputs.
     int16_t drive, steer;
-    ctl->commandedOutputs(drive, steer);        // already zeroed under stop
+    ctl->commandedOutputs(drive, steer);        // zeroed under stop OR under
+                                                // a command-authority mismatch
     const bool stopped = ctl->effectiveStop();
+    const DriveOutputs& out = drive_stage.update(drive, steer, !stopped);
 
-    SensorReading s = readSensors(drive, steer, stopped);
-    setMotorOutputs(drive, steer, stopped);
+    SensorReading s = readSensors(out);
+    // Not sensor readings, so they are filled in here rather than inside
+    // readSensors(): they are what the controller AUTHORISED, which is what
+    // the acknowledgement frame is about.
+    s.drive_applied = drive;
+    s.steer_applied = steer;
+    setMotorOutputs(out);
 
     if (ctl->telemetryDue()) {
         sendTelemetry(s);

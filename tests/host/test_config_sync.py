@@ -19,10 +19,16 @@ REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 sys.path.insert(0, os.path.join(REPO, "host"))
 
 import c2_link  # noqa: E402
+import protocol_root  # noqa: E402
 import rover_config as cfg  # noqa: E402
 import rover_protocol as rp  # noqa: E402
 
-HEADER_PATH = os.path.join(REPO, "firmware", "src", "rover_config.h")
+# Resolved, not derived from __file__: this test's whole job is to pin the
+# Python constants against the C++ ones, and it can only do that if it reads
+# the header belonging to the firmware can_link.py actually compiles. Deriving
+# it locally while can_link compiled an overridden checkout is how this suite
+# once passed over a PROTOCOL_VERSION mismatch.
+HEADER_PATH = protocol_root.firmware_src("rover_config.h")
 
 # Python name -> C++ name, for every constant that exists on both sides.
 SHARED = {
@@ -36,12 +42,15 @@ SHARED = {
     "CAN_ID_TELEM_DRIVE_R":  "CAN_ID_TELEM_DRIVE_R",
     "CAN_ID_TELEM_POWER":    "CAN_ID_TELEM_POWER",
     "CAN_ID_TELEM_STATE":    "CAN_ID_TELEM_STATE",
+    "CAN_ID_TELEM_CMD_ECHO": "CAN_ID_TELEM_CMD_ECHO",
     "MODE_SAFE":             "MODE_SAFE",
     "MODE_TELEOP":           "MODE_TELEOP",
     "MODE_AUTONOMOUS":       "MODE_AUTONOMOUS",
     "MODE_FAULT":            "MODE_FAULT",
     "CMD_MIN":               "CMD_MIN",
     "CMD_MAX":               "CMD_MAX",
+    "PWM_NEUTRAL_US":        "PWM_NEUTRAL_US",
+    "PWM_SPAN_US":           "PWM_SPAN_US",
 }
 
 # Frame geometry: stated on both sides, because the sequence and CRC bytes are
@@ -96,7 +105,7 @@ class TestConfigSync(unittest.TestCase):
         # the sequence number and CRC taking the rest of the frame.
         import struct
         for name in ("CONTROL_FMT", "DRIVE_L_FMT", "DRIVE_R_FMT",
-                     "POWER_FMT", "STATE_FMT"):
+                     "POWER_FMT", "STATE_FMT", "ECHO_FMT"):
             self.assertEqual(struct.calcsize(getattr(rp, name)),
                              self.cpp["FRAME_PAYLOAD"],
                              "%s is not FRAME_PAYLOAD bytes" % name)
@@ -139,6 +148,22 @@ class TestConfigSync(unittest.TestCase):
     def test_command_range_is_symmetric_and_nonzero(self):
         self.assertEqual(cfg.CMD_MIN, -cfg.CMD_MAX)
         self.assertGreater(cfg.CMD_MAX, 0)
+
+    def test_pwm_full_scale_stays_inside_the_servo_pulse_range(self):
+        # 1000-2000 us is what servo and ESC inputs expect. A span that pushed
+        # either end outside it would be rejected or, worse, misread by the
+        # hardware as a different command.
+        self.assertGreaterEqual(cfg.PWM_NEUTRAL_US - cfg.PWM_SPAN_US, 1000)
+        self.assertLessEqual(cfg.PWM_NEUTRAL_US + cfg.PWM_SPAN_US, 2000)
+        self.assertGreater(cfg.PWM_SPAN_US, 0)
+
+    def test_every_can_id_is_distinct_and_control_outranks_telemetry(self):
+        # On CAN the id IS the priority, lowest wins. A command arriving late
+        # can hurt the rover; late telemetry only annoys an operator.
+        ids = (cfg.CAN_ID_CONTROL,) + rp.TELEM_IDS
+        self.assertEqual(len(set(ids)), len(ids), "two frames share a CAN id")
+        self.assertEqual(min(ids), cfg.CAN_ID_CONTROL)
+        self.assertLessEqual(max(ids), 0x7FF, "not an 11-bit standard id")
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-# Rover Onboard Computer ↔ Embedded Controller Protocol (v0.5)
+# Rover Onboard Computer ↔ Embedded Controller Protocol (v0.6)
 
 **Scope:** Onboard computer (Jetson Orin Nano, candidate) ↔ embedded controller
 (**Teensy 4.1**, NXP i.MX RT1062, C++ / Teensyduino), over **CAN**.
@@ -27,6 +27,28 @@
 >   rover (§3.5). v0.4 forced `FAULT` on *any* fault bit, which would have
 >   taken the light away from red mid-autonomy over an undervoltage warning.
 >
+> **v0.6 — autonomy to the drive stage, and proof it arrived.** Task 3 proved a
+> command can reach the controller intact. Task 4 is about it reaching the
+> *drive stage*, and about the Jetson being able to prove that it did. Two
+> things were missing for that, and v0.6 adds exactly those two:
+>
+> * **A command source.** `flags` **bit 7**, previously reserved, is
+>   `from_autonomy`: did the onboard autonomy stack produce this frame's
+>   drive/steer, or the human operator? The controller refuses *motion* from a
+>   producer that does not own the current mode — a mux, deliberately on the
+>   MCU (§3.1.5). `FAULT_CMD_SOURCE` (`0x0400`) reports the refusal.
+> * **An acknowledgement frame.** `TELEM_CMD_ECHO` (`0x204`) carries the drive
+>   and steer actually handed to the drive stage, the sequence number they came
+>   from, and a verdict byte saying whether they are being applied, overridden
+>   by a stop, or refused for lacking authority (§3.6). Telemetry is therefore
+>   **five frames** per cycle, not four.
+>
+> Two consequences worth knowing before reading on. The flags byte now has **no
+> reserved bits**, so `DECODE_BAD_FLAGS` is kept in the enum but no longer
+> produced and the next field goes in the mode byte (§3.1.2). And
+> `controller_health` is no longer a constant `NOT_REPORTED`: the new drive
+> stage reports its own state (§3.5).
+>
 > Full field tables with types, units, ranges, meanings and update rates are in
 > section 3.
 
@@ -53,11 +75,11 @@
 | Bus | Teensy 4.1 **CAN3** (FD-capable) — CAN1/CAN2 work unchanged |
 | Frame format | Standard, 11-bit identifiers, **every frame DLC 8** |
 | CONTROL rate | 20 Hz (1 frame per cycle) |
-| TELEMETRY rate | 20 Hz (4 frames per cycle = 80 frames/s) |
+| TELEMETRY rate | 20 Hz (5 frames per cycle = 100 frames/s) |
 | Byte order | Little-endian, written byte-by-byte (not struct-punned) |
 
-At 500 kbps an 8-byte frame is roughly 220 µs of airtime. Five frames per cycle
-is ~1.1 ms of a 50 ms period — about **2% bus utilisation**. Throughput is
+At 500 kbps an 8-byte frame is roughly 220 µs of airtime. Six frames per cycle
+is ~1.3 ms of a 50 ms period — about **3% bus utilisation**. Throughput is
 nowhere near the constraint; CAN was chosen for determinism and noise immunity,
 not speed. Say so plainly when anyone asks.
 
@@ -75,6 +97,7 @@ This table is a priority ordering, not just a set of names.
 | **`0x201`** | `TELEM_DRIVE_R` | controller → Jetson | 8 | 20 Hz |
 | **`0x202`** | `TELEM_POWER` | controller → Jetson | 8 | 20 Hz |
 | **`0x203`** | `TELEM_STATE` | controller → Jetson | 8 | 20 Hz |
+| **`0x204`** | `TELEM_CMD_ECHO` | controller → Jetson | 8 | 20 Hz |
 
 Commands outrank telemetry because a late command can hurt the rover and late
 telemetry only annoys an operator.
@@ -95,24 +118,30 @@ Every frame, both directions, has the same shape:
 | `seq` | uint8 | frames | 0–255, **wraps** | Increments once per transmitted cycle. Receiver uses the delta: 1 healthy, 0 duplicate, >1 frames lost. |
 | `crc8` | uint8 | — | 0–255 | CRC-8/SAE-J1850 over the CAN id then bytes 0–6. See section 4. |
 
-**Why four telemetry frames and not one CAN FD frame.** 6 payload bytes × 4
-frames = 24 bytes, which is what the field list needs. One 64-byte FD frame
+**Why five telemetry frames and not one CAN FD frame.** 6 payload bytes × 5
+frames = 30 bytes, which is what the field list needs. One 64-byte FD frame
 would hold it all atomically, but would require FD-capable transceivers on
 every node of the bus including Classic-only motor controllers. The field
 definitions would not change if you later move telemetry to FD.
 
-**Snapshot tearing.** All four telemetry frames of one cycle carry the **same
-`seq`**. The Jetson therefore knows whether the four frames it holds came from
+**Snapshot tearing.** All five telemetry frames of one cycle carry the **same
+`seq`**. The Jetson therefore knows whether the five frames it holds came from
 one cycle or straddle two, and can discard or flag a torn snapshot instead of
 silently mixing a fresh encoder reading with a stale fault word.
 `host/jetson_test.py` counts torn snapshots; a clean link produces zero.
+
+**There is no version field on the wire** (§6), so a controller running an
+older revision simply sends fewer frames and the Jetson's snapshot never
+completes. That is silent, so `TelemetryAssembler.missing_ids()` names the ids
+nothing has ever arrived on and `jetson_test.py` prints them — which ids showed
+up *is* the version diagnostic.
 
 ## 3. Message definitions
 
 ### 3.0 Requirement coverage
 
-Every field the Task 3 brief enumerates, and where it lives. Nothing in either
-direction is "to be added later".
+Every field the Task 3 and Task 4 briefs enumerate, and where it lives.
+Nothing in either direction is "to be added later".
 
 **Jetson → MCU command packet** — one structured message, `CONTROL` (§3.1):
 
@@ -126,14 +155,15 @@ direction is "to be added later".
 | autonomy-abort flag | `flags` bit 1 | bool |
 | return-request flag | `flags` bit 2 | bool |
 | status-indicator request | `flags` bits 3–5 | uint8 enum |
+| command source (Task 4) | `flags` bit 7 | bool |
 | checksum / CRC | `CONTROL` byte 7 | uint8 CRC-8 |
 
-**MCU → Jetson telemetry packet** — one logical packet, sent as four frames of
-a shared cycle (§2.2, §3.2–3.5):
+**MCU → Jetson telemetry packet** — one logical packet, sent as five frames of
+a shared cycle (§2.2, §3.2–3.6):
 
 | Required field | Where | Type |
 |---|---|---|
-| sequence number | byte 6 of all four frames | uint8 |
+| sequence number | byte 6 of all five frames | uint8 |
 | encoder values | `TELEM_DRIVE_L` / `_R` bytes 0–3 | int32 ×2 |
 | steering feedback | `TELEM_DRIVE_L` bytes 4–5 | int16 |
 | current status | `TELEM_POWER` bytes 0–1 | int16 |
@@ -145,11 +175,23 @@ a shared cycle (§2.2, §3.2–3.5):
 | C2-link state (as forwarded) | `TELEM_STATE` byte 2 | uint8 enum |
 | low-level controller health | `TELEM_STATE` byte 3 | uint8 enum |
 | status-indicator state | `TELEM_STATE` byte 4 | uint8 enum |
-| checksum / CRC | byte 7 of all four frames | uint8 CRC-8 |
+| accepted drive command (Task 4) | `TELEM_CMD_ECHO` bytes 0–1 | int16 |
+| accepted steering command (Task 4) | `TELEM_CMD_ECHO` bytes 2–3 | int16 |
+| acknowledged sequence number (Task 4) | `TELEM_CMD_ECHO` byte 4 | uint8 |
+| command verdict (Task 4) | `TELEM_CMD_ECHO` byte 5, bits 0–2 | uint8 enum |
+| checksum / CRC | byte 7 of all five frames | uint8 CRC-8 |
+
+Task 4's feedback loop asks for six fields by name. Five were already here —
+current mode, controller health, command age and fault state, plus the
+sequence number that ties a cycle together. The two that were not are the
+**accepted drive and steering commands**, and their absence was the real gap:
+encoders and steering feedback say what the rover *did*, which an autonomy
+stack cannot use to tell "my command got through" from "the rover happens to
+be moving". `TELEM_CMD_ECHO` answers the second question.
 
 **Every field in both directions updates at 20 Hz**, the rate of its frame. The
 rate is per frame, not per field: there is no slow-changing field sent less
-often, because at 8 bytes a frame the bus is 2% utilised (§2) and a second rate
+often, because at 8 bytes a frame the bus is ~3% utilised (§2) and a second rate
 would only add a staleness question nobody needs to ask.
 
 ### 3.1 `CONTROL` — `0x100`, DLC 8, 20 Hz, Jetson → controller
@@ -159,7 +201,7 @@ would only add a staleness question nobody needs to ask.
 | 0–1 | `drive_cmd` | int16 | 0.1 % of full drive effort | −1000 … +1000 | Desired drive. Positive is forward. A value outside the range **rejects the whole frame** — see 3.1.4. |
 | 2–3 | `steer_cmd` | int16 | 0.1 % of full steering range | −1000 … +1000 | Desired steering. Positive is right. Range-checked exactly like `drive_cmd`. |
 | 4 | `mode` | uint8 | enum | **0, 1, 2 only** | `0=SAFE, 1=TELEOP, 2=AUTONOMOUS`. Any other value, including `3=FAULT`, **rejects the frame** — see 3.1.1. |
-| 5 | `flags` | uint8 | bitfield | see below | Five fields packed; see 3.1.2. |
+| 5 | `flags` | uint8 | bitfield | see below | Six fields packed, no spare bits; see 3.1.2. |
 | 6 | `seq` | uint8 | frames | 0–255 wraps | See 2.2. |
 | 7 | `crc8` | uint8 | — | 0–255 | See 4. |
 
@@ -202,10 +244,29 @@ controller on the bus *before* a host may send it.
 |---|---|---|---|---|
 | 0 | `stop` | bool | 0/1 | Stop now, regardless of `mode`. Takes effect on the cycle it arrives — no coast frame. Separate from `mode` so an e-stop can be asserted **and released** without a mode round trip. |
 | 1 | `autonomy_abort` | bool | 0/1 | Abandon the current autonomous task. **Forces a stop while `mode == AUTONOMOUS`**; in `TELEOP` the operator is already driving, so it has no autonomous task to abort and does not stop. ⚠️ *This behaviour is a judgement call, not spelled out by the requirement — flagged for review.* |
-| 2 | `return_request` | bool | 0/1 | Begin the return-to-base behaviour. Carried and reported; the controller takes no low-level action on it. |
+| 2 | `return_request` | bool | 0/1 | Begin the return-to-base behaviour. Carried, and since v0.6 **acknowledged** in `TELEM_CMD_ECHO` bit 6 while `mode == AUTONOMOUS`; the controller still takes no low-level action on it — see §3.1.6. |
 | 3–5 | `indicator_request` | uint8 | **0–4** | Requested status-indicator state. `0=OFF, 1=TELEOP, 2=AUTONOMOUS, 3=ARRIVED, 4=FAULT`. 5–7 are reachable on the wire and **reject the frame**. The controller honours this only where it agrees with its own mode — see §3.5. |
 | 6 | `c2_lost` | bool | 0/1 | `1` = the Jetson has lost the base-station (C2) link. The Jetson's report on a link the controller cannot see — see below. |
-| 7 | *reserved* | — | **must be 0** | A set bit **rejects the frame**: a newer sender is using a field we cannot interpret, so the rest of the byte is untrustworthy. |
+| 7 | `from_autonomy` | bool | 0/1 | **v0.6.** `1` = the onboard autonomy stack produced this frame's `drive_cmd`/`steer_cmd`; `0` = the human operator did. Gates **motion and the arrival claim only** — see §3.1.5. Reserved before v0.6. |
+
+**The flags byte is now full.** The next field to be added goes in the `mode`
+byte, whose top five bits are unused (`MODE_MAX` is 2, and `MODE_FAULT` is 3) and which already
+rejects anything that may not be commanded through `isCommandableMode()`. That is why
+`DECODE_BAD_FLAGS` is **kept in the `DecodeResult` enum but no longer
+produced**: a receiver still meets it from a v0.5 sender, and the next revision
+to reserve a bit revives it. Renumbering a wire enum to close a gap is how two
+ends come to disagree about what `5` means.
+
+**Version skew in both directions fails safe**, which is worth stating because
+there is no version field on the wire (§6):
+
+| Pairing | What happens |
+|---|---|
+| v0.6 Jetson → v0.5 controller | A teleop frame (bit 7 clear) is accepted normally. An **autonomy** frame (bit 7 set) hits v0.5's reserved-bit check, is rejected as `DECODE_BAD_FLAGS`, does not refresh the watchdog, and the rover stops. |
+| v0.5 Jetson → v0.6 controller | Every frame reads as teleop-sourced. `TELEOP` works; `AUTONOMOUS` refuses motion and raises `FAULT_CMD_SOURCE`, and the rover sits still. |
+
+Neither direction moves a rover on a misunderstood command, which is the only
+property that matters here.
 
 #### 3.1.3 `c2_lost` — the one field the controller cannot determine itself
 
@@ -266,6 +327,81 @@ protects the rover from a command we did not.
 boundary is pinned on both sides by the `RANGE` table in
 `tools/golden_vectors.cpp`.
 
+#### 3.1.5 `from_autonomy` — keeping manual and autonomous commands apart
+
+Both producers live inside the Jetson and both emit on `0x100`, so without a
+tag the controller cannot tell an autonomy-generated command from a
+teleoperated one. That is the mix-up Task 4 asks to be ruled out: a stale
+autonomy command executing after the operator has taken over, or the reverse.
+
+**The rule.** A producer may command *motion* only in the mode it owns:
+
+| `mode` | Owner | A frame from the other producer |
+|---|---|---|
+| `AUTONOMOUS` | the autonomy stack (`from_autonomy = 1`) | accepted, motion refused |
+| `TELEOP` | the human operator (`from_autonomy = 0`) | accepted, motion refused |
+| `SAFE` | nobody — nothing may move, so there is nothing to own | no mismatch possible |
+
+**Refused, not rejected.** A mismatched frame is *well formed*. It decodes, it
+refreshes the command watchdog, its `mode` is echoed and its safety flags are
+obeyed — only `drive_cmd`, `steer_cmd` and an `ARRIVED` indicator request are
+dropped. Rejecting it instead would turn a Jetson-side mux bug into a comm
+timeout, stopping the rover and pointing the operator at the wrong fault. What
+the operator gets instead is `CMD_STATUS_WRONG_SOURCE` in `TELEM_CMD_ECHO` and
+`FAULT_CMD_SOURCE` in `fault_status`, both naming the actual problem. The
+condition is self-clearing: the next authorised frame drops it.
+
+**Safety flags are never gated by it.** `stop`, `autonomy_abort`,
+`return_request` and `c2_lost` are honoured from either producer, because
+anyone who can see the rover is in trouble must be able to stop it, and because
+under rule 1.e.xi signalling a stop or a return is the *operator's* action
+during an autonomous run. Only the two fields that assert what the rover is
+*doing* — the motion command, and the arrival claim worth 25 points under
+1.e.xvii — need the source to own the mode.
+
+**The mux is on the MCU, and that is the point.** The Jetson could refuse to
+emit an autonomy command while teleoperated, and it should. But then one
+Jetson-side bug, one stale queue, or one mode change racing a command in
+flight is enough to drive an autonomous rover from the teleop path. The
+controller is the only place that sees the mode and the command *in the same
+frame*, so it is the only place the two can be checked against each other.
+
+**What this does not catch**, stated plainly: the check is between two fields
+of one frame, so a Jetson that sends a *stale mode* alongside a stale command
+is self-consistent and passes. That case is caught one layer up, by the mode
+echo in `TELEM_STATE` (§3.5) disagreeing with what the operator set — which is
+exactly why the echo exists. The gate narrows the window; it does not close it,
+and nothing inside one trusted sender can.
+
+**Why a bit and not a second CAN id.** A dedicated id per producer would bind
+the source to the frame through the CRC seed, which is strictly stronger. It
+would also put `mode`, `stop`, `c2_lost` and `indicator_request` in two frames
+at once and need a precedence table for every one of them — two sources of
+truth for every field, where today there is one. The producers are both inside
+one trusted node, so the weaker binding costs nothing real and the simpler
+state machine is worth a great deal.
+
+#### 3.1.6 `return_request` — acknowledged, deliberately not acted on
+
+`return_request` is in Task 4's command list, so the Jetson must be able to
+send it and see that it arrived. It is also one of the two items §9 leaves as a
+**team decision**, because changing what it *does* changes `effectiveStop()`
+and therefore safety behaviour.
+
+v0.6 does the part that is unambiguous and nothing more: while `mode ==
+AUTONOMOUS` and the frame is not stale, the controller reports the request in
+`TELEM_CMD_ECHO` bit 6. `effectiveStop()` is untouched, the indicator stays red
+(a returning rover is still under autonomous operation), and the drive stage
+sees no difference.
+
+That split is not a dodge. Driving back to a previously visited location is
+**route planning**, which Task 4 explicitly places on the autonomy side — so
+the behaviour belongs in the autonomy stack, which executes the return by
+sending ordinary drive and steer commands. What only the controller can do is
+confirm the request arrived, and that is what it now does. The open question in
+§9 — whether `return_request` should move the rover and whether
+`autonomy_abort` should stop it — is unchanged and still Calb's call.
+
 ### 3.2 `TELEM_DRIVE_L` — `0x200`, DLC 8, 20 Hz
 
 | Byte | Field | Type | Units | Valid range | Meaning |
@@ -313,7 +449,8 @@ left. Bits `0x0001`–`0x0040` keep their v0.3 values.
 | `0x0080` | `C2_LINK_LOST` | The last `CONTROL` frame reported the base-station link lost (`c2_lost = 1`). Raised in every mode; stops the rover only in `TELEOP` (§3.1.3). Cleared, not latched, once the value goes stale — see §3.5 |
 | `0x0100` | `SEQ_GAP` | CONTROL frames were lost, duplicated or reordered |
 | `0x0200` | `CRC_ERROR` | Application-layer CRC mismatch on our id |
-| `0x0400`–`0x8000` | *reserved* | |
+| `0x0400` | `CMD_SOURCE` | A command arrived from the producer that does not own the current mode: an autonomy frame in `TELEOP`, or an operator frame in `AUTONOMOUS`. Drive and steering are refused; see §3.1.5 |
+| `0x0800`–`0x8000` | *reserved* | |
 
 `PROTOCOL_ERROR`, `CRC_ERROR` and `SEQ_GAP` all self-clear when a valid,
 contiguous frame arrives, so fixing the sender clears the fault rather than
@@ -418,7 +555,7 @@ field:
    alone. If the controller hears the base station and the Jetson does not, the
    *Jetson's* radio or software is broken, not the link. If the Jetson hears it
    and the controller does not, the controller's receiver is. Either is worth a
-   fault bit from the reserved `0x0400`–`0x8000` range. **Do not pick the
+   fault bit from the reserved `0x0800`–`0x8000` range. **Do not pick the
    number until someone is building it** — v0.4 reserved `0x0080` for work that
    had not started, and reconciling that reservation is most of what v0.5 was.
 3. **What is the debounce?** This is the one that will bite. Today the stop
@@ -443,8 +580,20 @@ block, which is empty for exactly this purpose (§2.1). The two readings lead to
 different code, so the question is worth settling before anyone writes any.
 
 **Controller health enum** (`controller_health`): `0=OK, 1=DEGRADED,
-2=FAULT, 3=NOT_REPORTED`. Currently always `NOT_REPORTED` — no motor-driver
-telemetry is wired up yet.
+2=FAULT, 3=NOT_REPORTED`. **No longer a constant.** Since v0.6 it carries the
+drive stage's own state (`DriveModule::health()`, §5.4), which is the layer
+that actually knows:
+
+| Value | When |
+|---|---|
+| `NOT_REPORTED` | the drive stage has never been updated — honestly "we do not know", not a misleading OK |
+| `OK` | driving normally, or holding a stop at neutral |
+| `DEGRADED` | the last mix **saturated** and was scaled down, so the rover is not delivering the commanded combination of speed and turn. Live, not latched, and a normal thing to see at full throttle in a tight turn |
+| `FAULT` | **latched.** A command outside `CMD_MIN..CMD_MAX` reached the drive stage, which cannot happen while `decodeControl()` is doing its job — so something above it is broken |
+
+This is still not real ESC telemetry. When motor drivers arrive on the bus with
+their own messages, their aggregate health supersedes this and the field does
+not change shape.
 
 #### 3.5.1 The status indicator, and why request and state are two fields
 
@@ -502,7 +651,14 @@ controller overrides it. Checked top to bottom, first match wins
 | 2 | `TELEOP` with `c2_lost = 1` (active mode `FAULT`) | `FAULT` | ignored |
 | 3 | Mode `SAFE` | `OFF` | ignored |
 | 4 | Mode `TELEOP` | `TELEOP` | ignored — a human-driven rover never shows red or green |
-| 5 | Mode `AUTONOMOUS` | `ARRIVED` if `ARRIVED` was requested, else `AUTONOMOUS` | only `ARRIVED` matters |
+| 5 | Mode `AUTONOMOUS` | `ARRIVED` if `ARRIVED` was requested **by the autonomy stack**, else `AUTONOMOUS` | only `ARRIVED`, and only from the source that owns the mode |
+
+**Rule 5 gained the authority test in v0.6** (§3.1.5). "I have arrived" is an
+assertion about what the *autonomy* did, and under rule 1.e.xvii it is worth 25
+points, so a teleop-path frame claiming it during an autonomous run is the one
+mix-up that could put flashing green on a rover that has arrived nowhere. Every
+other indicator request is already decided by the mode alone, so the gate
+changes nothing else.
 
 Rules 1 and 2 are the two ways nothing can be driving the rover, and they show
 `FAULT` rather than `OFF` because `OFF` reads as a legitimate idle state.
@@ -520,6 +676,61 @@ autonomous operation, so it stays red.
 Comparing `indicator_request` against `indicator_state` tells an operator
 immediately whether the controller honoured the request, and rule 4 means a
 disagreement is normal rather than alarming.
+
+### 3.6 `TELEM_CMD_ECHO` — `0x204`, DLC 8, 20 Hz
+
+The acknowledgement. Everything in it is about the **command**, not the plant:
+what the controller accepted, which frame it came from, and why it is or is not
+being acted on.
+
+| Byte | Field | Type | Units | Valid range | Meaning |
+|---|---|---|---|---|---|
+| 0–1 | `drive_applied` | int16 | 0.1 % of full drive effort | −1000 … +1000 | The drive handed to the drive stage this cycle. **0** under any stop or authority refusal. |
+| 2–3 | `steer_applied` | int16 | 0.1 % of full steering range | −1000 … +1000 | The steering handed to the drive stage this cycle. |
+| 4 | `ack_seq` | uint8 | frames | 0–255 wraps | The `seq` of the `CONTROL` frame those values came from. **Meaningless while `cmd_status` reads `NO_COMMAND`** — no frame has arrived to acknowledge, and 0 is an ordinary sequence number. |
+| 5 | `status` | uint8 | bitfield | see below | Verdict, last decode result, return flag. |
+| 6 | `seq` | uint8 | frames | 0–255 wraps | The telemetry cycle's own sequence number. See 2.2. |
+| 7 | `crc8` | uint8 | — | 0–255 | See 4. |
+
+**`status` byte (byte 5)**
+
+| Bits | Field | Range | Meaning |
+|---|---|---|---|
+| 0–2 | `cmd_status` | 0–3 | What is being done with the last accepted command. |
+| 3–5 | `last_decode` | 0–6 | `DecodeResult` for the **last frame seen on `0x100`**, or `DECODE_OK`. |
+| 6 | `return_active` | 0/1 | The controller is holding a return request (§3.1.6). |
+| 7 | *reserved* | **0** | The last reserved bit anywhere in this protocol. |
+
+**`cmd_status`** — checked in this order, first match wins, so the value is
+always the single most important reason the drive stage is seeing what it is:
+
+| Value | Name | Meaning |
+|---|---|---|
+| 0 | `APPLIED` | the echoed drive and steer are what the drive stage was handed |
+| 1 | `STOPPED` | a stop condition zeroed them: the command watchdog, the `stop` flag, a mode that does not permit motion, an autonomy abort, or C2 loss in `TELEOP`. *Which* one is in `fault_status` and the mode echo |
+| 2 | `WRONG_SOURCE` | the frame was valid and the rover is not stopped, but its producer does not own the current mode, so its motion was refused (§3.1.5) |
+| 3 | `NO_COMMAND` | no valid `CONTROL` frame has ever arrived |
+
+**`last_decode` is a separate field from the verdict, on purpose.** A frame can
+be rejected — a bad CRC, say — while an older accepted command is still being
+applied; those are two different facts and collapsing them would lose one.
+`fault_status` already says *that* something was rejected; this says *what*,
+which is what an operator debugging a link at a competition actually needs.
+
+**Why this is an acknowledgement and not a status.** `ack_seq` names the exact
+frame the controller acted on, so the Jetson can match it against the `seq` it
+sent and distinguish "my command got through" from "a command got through".
+`host/autonomy_sim.py` is built on precisely that: every mission step ignores
+any snapshot whose `ack_seq` predates the step's first frame, so a step can
+never pass on telemetry caused by the previous one — the classic way an
+integration test goes green while proving nothing.
+
+**Why the accepted command rather than the drive stage's output.** They are the
+same number today, because the drive stage applies no rate limiting (§9). If a
+slew limiter is ever added, this field must keep reporting what was *accepted*:
+the question it answers is whether the command survived validation, mode and
+authority, and a ramp would blur that with how fast the drivetrain can respond.
+The ramp would belong in `TELEM_DRIVE_L`'s feedback, beside `steer_fb`.
 
 ## 4. Integrity: two CRCs, covering different things
 
@@ -618,6 +829,23 @@ The Jetson separately considers the *link* down after 500 ms with no telemetry.
 That is informational only; the rover's safety never depends on the Jetson
 noticing anything.
 
+**v0.6 added a second, independent reason for the outputs to be zero**, and it
+is deliberately *not* folded into `effectiveStop()`: a command whose producer
+does not own the current mode is refused by `commandAuthorized()` (§3.1.5).
+The two are different facts and are reported differently — a stop means the
+rover must not move, a refusal means *this command* is not the rover's to obey
+— but both end in `commandedOutputs()`, so there is still exactly one place
+where a command becomes an output.
+
+One consequence is worth stating rather than discovering. A rover receiving
+only unauthorised commands is **not stopped**: it sits in a motion-permitting
+mode with the drive stage energized at neutral, ready to move the instant an
+authorised command arrives, with `FAULT_CMD_SOURCE` and
+`CMD_STATUS_WRONG_SOURCE` reported at 20 Hz. It is not moving, so it is not a
+hazard, and treating it as a stop would need a timer and more state for no
+behavioural gain. It would also make a mux bug look like a safety event, which
+is the fault-diagnosis mistake this protocol has already fixed once.
+
 ### 5.2 Surviving a firmware fault
 
 1. **Hardware watchdog** (`WDT_T4`, 1 s), fed once per loop. A hang resets the
@@ -650,6 +878,41 @@ of 1 rather than a 255-frame loss.
 `millis()` test was verified to *fail* against a naive timestamp-comparison
 implementation. It is a real regression test, not decoration.
 
+### 5.4 The drive stage
+
+`firmware/src/rover_drive.*` is the last layer before a pin, and it is
+deliberately **dumb about policy**. It knows nothing about modes, watchdogs,
+faults, stop flags or who sent a command: every one of those decisions has
+already been made by `RoverController`, which hands it a drive, a steer, and
+one boolean saying whether the drives may be energized at all. Two layers
+deciding when to stop is how a rover ends up with two answers.
+
+What it does do:
+
+1. **Refuses to energize.** `energized == false` puts every channel at neutral
+   before anything else is considered, so no ordering mistake and no later edit
+   can let a stale command through a stop. The caller has already zeroed the
+   commands; this is the second, independent reason.
+2. **Mixes.** `left = drive + steer`, `right = drive - steer`, scaled down
+   **proportionally** if that saturates. Clamping each channel instead would
+   change the *ratio* between them, which is the turn: a rover asked for a hard
+   turn at full throttle would straighten out exactly when it was working
+   hardest. Scaling gives up speed and keeps the turn, which is the right thing
+   to lose.
+3. **Converts to servo/ESC pulse widths** — 1500 µs neutral, ±500 µs full
+   scale — which is the one output language nearly all small-rover drive
+   hardware understands. Three channels are emitted: `left`/`right` for a
+   skid-steer drivetrain and `steer` for a steering actuator. Which gets wired
+   is a hardware decision, so the module emits both rather than guessing. **Do
+   not wire both**, or the differential mix and the steering actuator each
+   apply the same turn.
+4. **Reports its own health**, which is what finally gives
+   `TELEM_STATE.controller_health` a real value (§3.5).
+
+Like `rover_protocol.*` and `rover_controller.*` it is pure C++ with no
+Arduino dependency, so `tests/cpp/test_drive.cpp` exercises it natively and
+`tools/rover_sim` links the same source the Teensy compiles.
+
 ## 6. Configuration constants
 
 Every value in this section lives in **`firmware/src/rover_config.h`**,
@@ -668,7 +931,7 @@ in `rover_protocol.h` beside the structs they describe.
 | Constant | Value | Notes |
 |---|---|---|
 | `CONTROL` rate | 20 Hz | 1 frame per cycle (`CONTROL_RATE_HZ`, Jetson side) |
-| `TELEMETRY` rate | 20 Hz | 4 frames per cycle |
+| `TELEMETRY` rate | 20 Hz | 5 frames per cycle |
 | `WATCHDOG_TIMEOUT_MS` | 300 | 6× the control period. `DEFAULT_WATCHDOG_TIMEOUT_MS` in C++ |
 | `TELEMETRY_PERIOD_MS` | 50 | `DEFAULT_TELEMETRY_PERIOD_MS` in C++ |
 | `LINK_DEGRADED_HOLD_MS` | 1000 | How long a gap or CRC error keeps the link `DEGRADED` |
@@ -687,21 +950,54 @@ converged, a single radio hiccup would start stopping the rover in `TELEOP`.
 
 | Constant | Value | Notes |
 |---|---|---|
-| `PROTOCOL_VERSION` | 5 | Bump when a message's layout or meaning changes. Not sent on the wire; DLC and the CRC are the runtime mismatch signals |
+| `PROTOCOL_VERSION` | 6 | Bump when a message's layout or meaning changes. Not sent on the wire; DLC and the CRC are the runtime mismatch signals, plus *which ids arrive* (§2.2) |
 | `CAN_BITRATE_HZ` | 500000 | Every node on the bus must match |
-| `CAN_ID_*` | `0x100`, `0x200`–`0x203` | §2.1 |
+| `CAN_ID_*` | `0x100`, `0x200`–`0x204` | §2.1 |
 | `FRAME_DLC`, `FRAME_PAYLOAD` | 8, 6 | Plus `FRAME_SEQ_OFFSET` 6 and `FRAME_CRC_OFFSET` 7 |
 | `MODE_*`, `MODE_MAX` | 0, 1, 2 | §3.1.1 |
 | `CMD_MIN`, `CMD_MAX` | −1000, 1000 | Valid `drive_cmd`/`steer_cmd` range (§3.1.4) |
 | `OVER_CURRENT_CA` | 4000 | 40.00 A, placeholder (C++ only) |
 | `UNDERVOLTAGE_CV` | 2000 | 20.00 V, placeholder (C++ only) |
+| `PWM_NEUTRAL_US` | 1500 | Servo/ESC neutral pulse width (§5.4) |
+| `PWM_SPAN_US` | 500 | Full scale either side of neutral, so `CMD_MIN..CMD_MAX` maps onto 1000–2000 µs |
 
 ## 7. Demonstration and tests — no hardware required
 
 ```
-make test     # 74 C++ tests + 57 host tests
-make demo     # the message-exchange demonstration
+make test      # 126 C++ tests + 98 host tests
+make demo      # the Task 3 message-exchange demonstration
+make autonomy  # the Task 4 mock-autonomy mission
 ```
+
+`make autonomy` runs `host/autonomy_sim.py`: a fake autonomy stack driving the
+real compiled controller through the real protocol — the same codec, the same
+CAN ids, the same frames as `jetson_test.py`, with no side channel and no
+shortcut. It runs the Task 4 command sequence and then the mode-separation
+demonstration, verifying each step against telemetry before moving on:
+
+```
+PASS 1. start in SAFE                     PASS 8.  TELEOP refuses an autonomy command
+PASS 2. receive AUTONOMOUS                PASS 9.  AUTONOMOUS accepts the same command
+PASS 3. command forward movement          PASS 10. AUTONOMOUS refuses a teleop command
+PASS 4. change steering                   PASS 11. an arrival claim needs authority too
+PASS 5. stop                              PASS 12. stop overrides an authorised command
+PASS 6. report TARGET_REACHED             PASS 13. abort overrides an authorised command
+PASS 7. request autonomous return         PASS 14. teleop drives again afterwards
+
+feedback loop: every required field reached the Jetson
+  mode=TELEOP  applied=(+400,+0)  health=OK  age=38ms  faults=none
+```
+
+Steps 8 and 9 send an **identical** drive command and differ only in the mode;
+step 14 is there because a safety gate that cannot be left is a rover that has
+to be power-cycled at a competition.
+
+A passing harness that cannot fail is not evidence, so
+`tests/host/test_autonomy_mission.py` runs the **negative controls** too: a
+step with an impossible expectation must fail and stop the run, a dead
+controller must fail rather than hang, and no two steps may pass on the same
+acknowledged frame — which is the check that a step is reading telemetry it
+caused rather than the previous step's.
 
 `make demo` runs a live exchange against `tools/rover_sim`, then exercises a
 link cut, the stop flag, an autonomy abort, **C2 loss in each of the two modes
@@ -750,9 +1046,14 @@ runs it, and asserts Python produces identical output for:
 - `seqDelta` across the wrap
 - `isCommandableMode` and `modePermitsMotion` for **all 256** values
 - `isKnownIndicator` for **all 256** values
-- `c2_lost` round-tripping in every mode, and bit 6 decoding as a field rather
-  than as a reserved bit — the guard against a typo'd reserved mask quietly
-  swallowing a live flag
+- `c2_lost` and `from_autonomy` round-tripping in every mode, and bits 6 and 7
+  decoding as fields rather than as reserved bits — the guard against a typo'd
+  reserved mask quietly swallowing a live flag
+- `sourceOwnsMode` for **both sources × all 256** mode values, so the command
+  mux cannot mean one thing on the Jetson and another on the Teensy
+- `packCmdStatus` for every verdict × decode result × return flag: two 3-bit
+  fields and a flag sharing one byte is exactly the packing that goes wrong on
+  one side only
 
 Verified to fail on an injected endianness change.
 
@@ -764,8 +1065,24 @@ Verified to fail on an injected endianness change.
   six, and one current figure cannot identify *which* wheel is stalling. Both
   change the payload when they grow — likely into per-corner frames, which CAN
   makes cheap.
-- **`controller_health` is always `NOT_REPORTED`** — no motor-driver telemetry
-  is wired up. On a CAN bus that arrives as the drivers' own messages.
+- **`controller_health` now reports the drive stage, not the motor drivers.**
+  v0.6 gave it `DriveModule::health()` (§3.5, §5.4), which is a real value from
+  a real layer — but it is the health of a software output stage, not of an
+  ESC. Real motor-driver telemetry arrives on a CAN bus as the drivers' own
+  messages and supersedes it without changing the field.
+- **The drive stage applies no rate limiting, deliberately.** A slew limiter
+  would make the drive *applied* differ from the drive *accepted*, and
+  `TELEM_CMD_ECHO` exists to report the latter (§3.6). Ramping belongs in the
+  ESC or in a motor controller that knows the drivetrain's inertia; inventing a
+  rate here would mean inventing a tuning constant with nothing behind it. If
+  one is ever added, it goes below the echo, not above it.
+- **The drive pins are placeholders and the PWM mode is unverified.**
+  `PIN_DRIVE_L/R` and `PIN_STEER` in `rover_firmware.ino` are not wired to
+  anything and need checking against the Teensy 4.1 PWM-capable pin list.
+  `analogWrite()` produces a continuous PWM waveform, which suits a brushed
+  H-bridge or a PWM-input ESC; a hobby servo or a PPM-input ESC wants a 1–2 ms
+  pulse in a 20 ms frame instead. **Establish which the drive hardware expects
+  before connecting anything that moves.**
 - **`INDICATOR_FAULT` is yellow** (§3.5.1). Checked against the 2027 rules:
   1.e.ii is a minimum signalling requirement with no exclusivity clause, so a
   fourth indication is permitted. This one is settled, not open.
@@ -805,7 +1122,12 @@ Verified to fail on an injected endianness change.
      is a 20% option; teleoperating back is 50%. A rover that cannot return
      under its own control leaves only the 50% route, so the field that
      currently has no behaviour is the one guarding 30 percentage points per
-     task.
+     task. **v0.6 narrowed this but did not close it** (§3.1.6): the request is
+     now acknowledged in `TELEM_CMD_ECHO`, so the Jetson can prove it arrived,
+     and the autonomy stack can execute the return with ordinary drive and
+     steer commands. What is still undecided is whether the *controller* should
+     do anything with it, and that remains this open question rather than a
+     firmware decision.
   2. **`autonomy_abort` forcing a stop makes it close to a duplicate of
      `stop`**, differing only in being ignored outside `AUTONOMOUS`. If abort
      is meant to be the "stop autonomy but stay able to return" signal, then
@@ -829,15 +1151,26 @@ Verified to fail on an injected endianness change.
   since a raw local reading has none of the smoothing `C2Monitor` applies
   today. Settle first whether this radio is a second path to the base station
   or a dedicated e-stop receiver — the latter is a third link, not this field.
+  **Note the reserved fault range has moved**: v0.6 took `0x0400` for
+  `FAULT_CMD_SOURCE` under the same rule — someone was actually building the
+  thing that needed it — so the free bits are now `0x0800`–`0x8000` and a
+  C2-observer disagreement takes `0x0800`.
 - **Not yet used:** CAN FD, the second and third CAN buses, and a dedicated
   high-priority e-stop frame in the reserved `0x000`–`0x0FF` block.
-- **Mode names are being revised in parallel.**
-  [PR #18](https://github.com/schradivarius/URC-task3/pull/18) renames
-  `MODE_SAFE`/`MODE_TELEOP` to `MODE_SAFE`/`MODE_TELEOP`, adds a
-  non-commandable `MODE_FAULT = 3` and introduces `activeMode()`. No wire
-  values change. Whichever lands second applies a mechanical rename; and
-  `TELEM_STATE.mode` (§3.5) should then echo `activeMode()` rather than the
-  commanded mode, which is strictly more informative and what #18 expects.
+- **The authority gate compares two fields of one frame**, so a Jetson that
+  sends a stale *mode* alongside a stale command is self-consistent and passes
+  it (§3.1.5). The mode echo in `TELEM_STATE` is what catches that, one layer
+  up. Nothing inside a single trusted sender can close the window entirely;
+  this narrows it.
+- **`TELEM_STATE.mode` still echoes the *commanded* mode.**
+  [PR #18](https://github.com/schradivarius/URC-MCU-Jetson-Comm-Protocol/pull/18)
+  (merged via #24) renamed the modes to `SAFE`/`TELEOP`/`AUTONOMOUS`, added a
+  non-commandable `MODE_FAULT = 3` and introduced `activeMode()`. Echoing
+  `activeMode()` instead would let the Jetson see `FAULT`, which is strictly
+  more informative, but it changes what goes on the wire and is a team
+  decision. `MODE_FAULT` has no owner under §3.1.5: `sourceOwnsMode()` falls
+  through `modePermitsMotion()` to "no mismatch possible", which is pinned by
+  `fault_has_no_owner`.
 
 ## 10. Repository layout and build
 
@@ -846,14 +1179,17 @@ Verified to fail on an injected endianness change.
 | `firmware/rover_firmware.ino` | Teensy 4.1 | Hardware wiring only |
 | `firmware/src/rover_protocol.*` | **Both** | Message definitions, CRC, codec |
 | `firmware/src/rover_controller.*` | **Both** | Command/safety state machine |
+| `firmware/src/rover_drive.*` | **Both** | Drive/steering output stage (§5.4) |
 | `host/rover_protocol.py` | Jetson | Python codec (pinned to the C++ one) |
+| `host/protocol_root.py` | Jetson | Resolves which checkout `firmware/src` and `tools/` come from — the one place that decides |
 | `host/can_link.py` | Jetson | Sim and python-can backends |
 | `host/c2_link.py` | Jetson | C2 (base-station) link-loss detection, and a fake link for testing |
 | `host/jetson_test.py` | Jetson | Live harness, snapshot reassembly |
-| `host/demo.py` | Jetson | The demonstration in section 7 |
+| `host/demo.py` | Jetson | The Task 3 demonstration in section 7 |
+| `host/autonomy_sim.py` | Jetson | Mock autonomy stack: the Task 4 mission (§7) |
 | `tools/rover_sim.cpp` | dev machine | Simulator: real controller, fake plant |
 | `tools/golden_vectors.cpp` | dev machine | Emits vectors for cross-language pinning |
-| `tests/cpp/`, `tests/host/` | dev machine | 131 tests total |
+| `tests/cpp/`, `tests/host/` | dev machine | 224 tests total |
 
 ### 10.1 Flashing the Teensy 4.1
 
@@ -870,3 +1206,68 @@ Verified to fail on an injected endianness change.
 - Each CAN bus needs a **transceiver**; the MCU cannot drive a differential bus.
 - The bus needs **120 Ω termination at both physical ends.** Exactly one
   resistor, or three, is the most common CAN bring-up failure.
+
+### 10.2 Running the autonomy program from a separate repository
+
+The autonomy program is a *consumer* of this protocol, not part of it, so it
+**can** live in a repository of its own. It currently does not, and this section
+describes an option rather than a plan: two files move and nothing else.
+
+| Moves to the autonomy repository | Stays here |
+|---|---|
+| `host/autonomy_sim.py` | `host/rover_protocol.py`, `host/rover_config.py` |
+| `tests/host/test_autonomy_mission.py` | `host/protocol_root.py`, `host/can_link.py`, `host/jetson_test.py` |
+| | everything under `firmware/` and `tools/` |
+
+Worth saying plainly before the mechanics: the ratio argues against doing this
+yet. Task 4 added 5 files and modified 23 existing ones, because it was a wire
+change (v0.5 → v0.6) as much as a new program. 23 of those 28 files are on the
+protocol side of this seam, the two that move import four modules that stay, and
+`ci.yml`'s autonomy step is the only place a real consumer exercises the
+protocol end to end. The seam below is built and tested so that the move is
+cheap *later* — when the autonomy stack is real perception code in its own
+toolchain, or someone outside the team needs the protocol without it.
+
+What must **not** move, and must not be copied either, is the Python codec. It
+is a hand-written mirror of the C++ headers, and §8 keeps the two honest with
+golden vectors emitted by the C++ and asserted by the Python **in one CI run**.
+Split them across repositories and that check still passes on both sides while
+the two drift apart — the single failure this whole design is built to prevent.
+
+So the autonomy repository takes a checkout of *this* repository (a submodule,
+or a CI checkout step) and points `ROVER_PROTOCOL_ROOT` at it:
+
+```sh
+ROVER_PROTOCOL_ROOT=../protocol python3 autonomy/autonomy_sim.py --mock
+```
+
+Everything that reads `firmware/src/` or `tools/` resolves the root through
+`host/protocol_root.py`, which falls back to the enclosing repository when the
+variable is unset, so a shared checkout needs nothing. The two files that have
+to locate `host/` before they can import anything from it — `autonomy_sim.py`
+and `test_autonomy_mission.py` — read the variable by name instead, and are the
+only places that do. A root that does not contain `firmware/src` and
+`tools/rover_sim.cpp` fails by name at `build_sim()`, before the staleness
+check, so a binary left over from an earlier run cannot quietly stand in for
+sources that are not there.
+
+Two consequences worth knowing before relying on it:
+
+- The simulator is compiled **into** the protocol checkout
+  (`tests/cpp/build/`), so that checkout has to be writable. A read-only
+  submodule cache is the one layout this does not serve.
+- The autonomy repository pins a **commit** of this one, and moving that pin is
+  how an autonomy change opts in to a new protocol version. Nothing on the wire
+  reports the version (§6), so a pin nobody moves is caught the same way any
+  other revision mismatch is: by *which ids arrive*. A v0.5 controller sends
+  four telemetry frames, the Jetson's snapshot never completes, and
+  `TelemetryAssembler.missing_ids()` names `0x204` (§2.2). The skew table in
+  §3.1.2 covers the other direction. `PROTOCOL_VERSION` itself is compile-time
+  only, pinned across the two languages by `test_config_sync.py`.
+- That pinning is **only** honest if it reads the checkout being compiled.
+  Every path into `firmware/src/` and `tools/` resolves through
+  `host/protocol_root.py` for that reason: when only `can_link.py` honoured the
+  variable, the integration suite drove the overridden firmware while the
+  pinning suite checked the local pair, and the host suite passed over a
+  `PROTOCOL_VERSION` mismatch.
+  `test_the_pinning_follows_the_firmware_that_is_actually_compiled` pins it.

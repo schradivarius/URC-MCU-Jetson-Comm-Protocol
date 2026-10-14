@@ -15,8 +15,9 @@ here anyway, because "one place to change a timeout" is the point of the file.
 
 # --- protocol version: bump whenever a message's layout or meaning changes ---
 # v0.5 is the first revision with the application-layer CRC and sequence
-# number. Not carried on the wire.
-PROTOCOL_VERSION = 5
+# number; v0.6 adds the command-source bit and TELEM_CMD_ECHO. Not carried on
+# the wire.
+PROTOCOL_VERSION = 6
 
 # --- link ---
 CAN_BITRATE_HZ = 500000       # 500 kbps; every node must match
@@ -39,6 +40,7 @@ CAN_ID_TELEM_DRIVE_L = 0x200
 CAN_ID_TELEM_DRIVE_R = 0x201
 CAN_ID_TELEM_POWER   = 0x202
 CAN_ID_TELEM_STATE   = 0x203
+CAN_ID_TELEM_CMD_ECHO = 0x204
 
 # --- operating modes ---
 # The Jetson commands SAFE, TELEOP or AUTONOMOUS; the controller enters FAULT
@@ -52,3 +54,10 @@ MODE_MAX        = MODE_AUTONOMOUS   # highest COMMANDABLE mode
 # --- valid command range for drive_cmd / steer_cmd (tenths of a percent) ---
 CMD_MIN = -1000
 CMD_MAX = 1000
+
+# --- drive / steering output stage ---
+# Servo/ESC pulse widths: 1500 us neutral, +/-500 us full scale, which is what
+# CMD_MIN..CMD_MAX maps onto. Mirrored here only so the Jetson side can check
+# the numbers it reads back; nothing on the Jetson drives a pin.
+PWM_NEUTRAL_US = 1500
+PWM_SPAN_US    = 500
