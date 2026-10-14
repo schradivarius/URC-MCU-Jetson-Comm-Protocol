@@ -100,15 +100,15 @@ class TestTheMissionCanFail(MissionFixture):
     def test_an_impossible_expectation_fails_the_run(self):
         steps = [
             mission.Step("ok", dict(drive_cmd=0, steer_cmd=0,
-                                    mode=rp.MODE_DISABLED, c2_lost=False),
-                         mission.expect(mode=rp.MODE_DISABLED), timeout_s=1.5),
+                                    mode=rp.MODE_SAFE, c2_lost=False),
+                         mission.expect(mode=rp.MODE_SAFE), timeout_s=1.5),
             # The controller cannot be in two modes at once.
             mission.Step("impossible", dict(drive_cmd=0, steer_cmd=0,
-                                            mode=rp.MODE_DISABLED, c2_lost=False),
+                                            mode=rp.MODE_SAFE, c2_lost=False),
                          mission.expect(mode=rp.MODE_AUTONOMOUS), timeout_s=0.7),
             mission.Step("never reached", dict(drive_cmd=0, steer_cmd=0,
-                                               mode=rp.MODE_DISABLED, c2_lost=False),
-                         mission.expect(mode=rp.MODE_DISABLED), timeout_s=0.7),
+                                               mode=rp.MODE_SAFE, c2_lost=False),
+                         mission.expect(mode=rp.MODE_SAFE), timeout_s=0.7),
         ]
         report = mission.run_mission(self.link, steps=steps, verbose=False)
         self.assertFalse(report.ok)
@@ -122,8 +122,8 @@ class TestTheMissionCanFail(MissionFixture):
         self.link.close()                       # the controller is gone
         steps = [mission.Step("no controller",
                               dict(drive_cmd=0, steer_cmd=0,
-                                   mode=rp.MODE_DISABLED, c2_lost=False),
-                              mission.expect(mode=rp.MODE_DISABLED),
+                                   mode=rp.MODE_SAFE, c2_lost=False),
+                              mission.expect(mode=rp.MODE_SAFE),
                               timeout_s=0.7)]
         started = time.monotonic()
         report = mission.run_mission(self.link, steps=steps, verbose=False,

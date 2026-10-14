@@ -73,13 +73,17 @@ enum : uint8_t {
     FRAME_CRC_OFFSET = 7,
 };
 
-// --- Operating modes (ControlMsg::mode) ------------------------------------
+// --- Operating modes -------------------------------------------------------
+// The Jetson commands SAFE, TELEOP or AUTONOMOUS in ControlMsg::mode; the
+// controller enters FAULT on its own (RoverController::activeMode()) and a
+// CONTROL frame carrying it is rejected.
 enum : uint8_t {
-    MODE_DISABLED   = 0,
-    MODE_MANUAL     = 1,
-    MODE_AUTONOMOUS = 2,
+    MODE_SAFE       = 0,  // stopped on purpose
+    MODE_TELEOP     = 1,  // an operator is driving
+    MODE_AUTONOMOUS = 2,  // the Jetson is driving
+    MODE_FAULT      = 3,  // stopped because a link the mode needs is gone
 };
-static const uint8_t MODE_MAX = MODE_AUTONOMOUS;   // highest defined mode
+static const uint8_t MODE_MAX = MODE_AUTONOMOUS;   // highest COMMANDABLE mode
 
 // --- Sensor thresholds -----------------------------------------------------
 // Placeholders until the real sensors are characterised, but they belong here

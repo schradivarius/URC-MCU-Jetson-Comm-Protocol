@@ -109,7 +109,7 @@ namespace rover {
 //
 // THE FLAGS BYTE IS NOW FULL. The next field to be added goes in the mode
 // byte, whose top five bits are unused -- MODE_MAX is 2 -- and which already
-// rejects anything it does not define through isKnownMode(). That is why
+// rejects anything it does not define through isCommandableMode(). That is why
 // DECODE_BAD_FLAGS is kept in the DecodeResult enum below but no longer
 // produced: a receiver still has to understand it, from an older sender or a
 // future revision that reserves a bit again.
@@ -143,9 +143,9 @@ enum : uint8_t {
 // ---------------------------------------------------------------------------
 // Command authority: which producer owns which mode.
 //
-//   MODE_MANUAL      the human operator  (from_autonomy == false)
+//   MODE_TELEOP      the human operator  (from_autonomy == false)
 //   MODE_AUTONOMOUS  the autonomy stack  (from_autonomy == true)
-//   MODE_DISABLED    neither -- nothing may move, so there is nothing to own
+//   MODE_SAFE    neither -- nothing may move, so there is nothing to own
 //
 // A frame whose source does not own the current mode is NOT malformed and is
 // NOT rejected at decode. It is a well-formed statement that this command has
@@ -238,7 +238,7 @@ enum : uint8_t {
 //                 echoed commands mean nothing yet.
 //   STOPPED       a stop condition zeroed the outputs: the command watchdog,
 //                 the stop flag, a mode that does not permit motion, an
-//                 autonomy abort, or C2 loss in MANUAL. Which one it is, is
+//                 autonomy abort, or C2 loss in TELEOP. Which one it is, is
 //                 in fault_status and the mode echo -- this byte says only
 //                 that safety, not authority, is why nothing is moving.
 //   WRONG_SOURCE  the frame was valid and the rover is not stopped, but the
@@ -266,7 +266,10 @@ enum : uint16_t {
 static const int32_t INT32_MIN_V = -2147483647 - 1;
 static const int32_t INT32_MAX_V = 2147483647;
 
-bool isKnownMode(uint8_t mode);
+// isCommandableMode: may the Jetson send this mode in CONTROL? SAFE is a
+// legitimate command meaning "do not move"; FAULT is not -- only the
+// controller enters it (RoverController::activeMode()).
+bool isCommandableMode(uint8_t mode);
 bool modePermitsMotion(uint8_t mode);
 bool isKnownIndicator(uint8_t indicator);
 

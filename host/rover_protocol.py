@@ -32,7 +32,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from rover_config import (  # noqa: E402,F401
     CAN_ID_CONTROL, CAN_ID_TELEM_DRIVE_L, CAN_ID_TELEM_DRIVE_R,
     CAN_ID_TELEM_POWER, CAN_ID_TELEM_STATE, CAN_ID_TELEM_CMD_ECHO,
-    MODE_DISABLED, MODE_MANUAL, MODE_AUTONOMOUS, MODE_MAX,
+    MODE_SAFE, MODE_TELEOP, MODE_AUTONOMOUS, MODE_FAULT, MODE_MAX,
     CMD_MIN, CMD_MAX, PROTOCOL_VERSION, PWM_NEUTRAL_US, PWM_SPAN_US,
 )
 
@@ -40,11 +40,11 @@ TELEM_IDS = (CAN_ID_TELEM_DRIVE_L, CAN_ID_TELEM_DRIVE_R,
              CAN_ID_TELEM_POWER, CAN_ID_TELEM_STATE, CAN_ID_TELEM_CMD_ECHO)
 
 # --- operating modes (values in rover_config.py) ---
-MODE_NAMES = {MODE_DISABLED: "DISABLED", MODE_MANUAL: "MANUAL",
-              MODE_AUTONOMOUS: "AUTONOMOUS"}
+MODE_NAMES = {MODE_SAFE: "SAFE", MODE_TELEOP: "TELEOP",
+              MODE_AUTONOMOUS: "AUTONOMOUS", MODE_FAULT: "FAULT"}
 
-KNOWN_MODES  = (MODE_DISABLED, MODE_MANUAL, MODE_AUTONOMOUS)
-MOTION_MODES = (MODE_MANUAL, MODE_AUTONOMOUS)
+COMMANDABLE_MODES  = (MODE_SAFE, MODE_TELEOP, MODE_AUTONOMOUS)
+MOTION_MODES = (MODE_TELEOP, MODE_AUTONOMOUS)
 
 # --- CONTROL flags byte (wire byte 5) ---
 CTRL_FLAG_STOP           = 0x01
@@ -188,22 +188,23 @@ def fault_names(bitmask):
     return [name for bit, name in FAULT_NAMES if bitmask & bit]
 
 
-def is_known_mode(mode):
-    """Is this a mode the protocol defines? DISABLED counts: it is a legitimate
-    command that happens to mean "do not move"."""
-    return mode in KNOWN_MODES
+def is_commandable_mode(mode):
+    """May the Jetson send this mode in CONTROL? SAFE counts: it is a
+    legitimate command that happens to mean "do not move". FAULT does not:
+    only the controller enters it. Mirrors isCommandableMode() in C++."""
+    return mode in COMMANDABLE_MODES
 
 
 def mode_permits_motion(mode):
     """May the rover move in this mode? A WHITELIST, deliberately -- `mode` is a
-    uint8, so 256 values fit where 3 are defined."""
+    uint8, so 256 values fit where 4 are defined."""
     return mode in MOTION_MODES
 
 
 def source_owns_mode(from_autonomy, mode):
     """May this producer command motion in this mode?
 
-    The autonomy stack owns AUTONOMOUS, the operator owns MANUAL. DISABLED has
+    The autonomy stack owns AUTONOMOUS, the operator owns TELEOP. SAFE has
     no owner because nothing may move in it, so the question does not arise and
     the answer is True rather than a spurious mismatch.
 
@@ -370,7 +371,7 @@ def decode_control(frame, can_id=CAN_ID_CONTROL):
     if result != DECODE_OK:
         return result, None
     drive, steer, mode, flags = struct.unpack(CONTROL_FMT, payload)
-    if not is_known_mode(mode):
+    if not is_commandable_mode(mode):
         return DECODE_BAD_MODE, None
     # No reserved-bit check: v0.6 took bit 7 for from_autonomy and the flags
     # byte is full. A frame whose source does not own the mode is NOT rejected

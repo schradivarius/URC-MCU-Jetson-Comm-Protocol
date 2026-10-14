@@ -206,7 +206,7 @@ def build_mission():
     """The Task 4 command sequence, then the mode-separation demonstration.
 
     c2_lost is False on every step and that is not decoration: a lost C2 link
-    stops a MANUAL rover, which would mask the WRONG_SOURCE verdict the
+    stops a TELEOP rover, which would mask the WRONG_SOURCE verdict the
     separation steps exist to show with an ordinary STOPPED.
     """
     # Captured by the `moving` check so a later step can compare against an
@@ -218,14 +218,14 @@ def build_mission():
         return None
 
     auto = dict(mode=rp.MODE_AUTONOMOUS, c2_lost=False, from_autonomy=True)
-    teleop = dict(mode=rp.MODE_MANUAL, c2_lost=False, from_autonomy=False)
+    teleop = dict(mode=rp.MODE_TELEOP, c2_lost=False, from_autonomy=False)
 
     return [
         # --- the autonomous command sequence from the task ------------------
         Step("1. start in SAFE",
-             dict(drive_cmd=0, steer_cmd=0, mode=rp.MODE_DISABLED,
+             dict(drive_cmd=0, steer_cmd=0, mode=rp.MODE_SAFE,
                   c2_lost=False, from_autonomy=False),
-             all_of(expect(mode=rp.MODE_DISABLED,
+             all_of(expect(mode=rp.MODE_SAFE,
                            cmd_status=rp.CMD_STATUS_STOPPED,
                            drive_applied=0, steer_applied=0,
                            indicator_state=rp.INDICATOR_OFF),
@@ -281,9 +281,9 @@ def build_mission():
 
         # --- manual and autonomous commands must not get mixed up -----------
         Step("8. TELEOP refuses an autonomy command",
-             dict(drive_cmd=FAST, steer_cmd=0, mode=rp.MODE_MANUAL,
+             dict(drive_cmd=FAST, steer_cmd=0, mode=rp.MODE_TELEOP,
                   c2_lost=False, from_autonomy=True),
-             all_of(expect(mode=rp.MODE_MANUAL,
+             all_of(expect(mode=rp.MODE_TELEOP,
                            cmd_status=rp.CMD_STATUS_WRONG_SOURCE,
                            drive_applied=0, steer_applied=0),
                     # Refused, NOT stopped: the rover is perfectly able to
@@ -330,7 +330,7 @@ def build_mission():
              # The last word: none of the above left the rover latched into a
              # refusing state. A safety gate that cannot be left is a rover
              # that has to be power-cycled at a competition.
-             all_of(expect(mode=rp.MODE_MANUAL,
+             all_of(expect(mode=rp.MODE_TELEOP,
                            cmd_status=rp.CMD_STATUS_APPLIED,
                            drive_applied=CRUISE,
                            indicator_state=rp.INDICATOR_TELEOP),
@@ -365,7 +365,7 @@ def run_mission(link, steps=None, verbose=True, settle_s=0.4):
     # for the simulator to launch and fails for a reason that is not its own.
     deadline = time.monotonic() + settle_s
     while time.monotonic() < deadline:
-        jl.send_control(drive_cmd=0, steer_cmd=0, mode=rp.MODE_DISABLED,
+        jl.send_control(drive_cmd=0, steer_cmd=0, mode=rp.MODE_SAFE,
                         c2_lost=False)
         jl.poll()
         time.sleep(period)

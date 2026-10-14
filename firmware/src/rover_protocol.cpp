@@ -117,18 +117,18 @@ uint8_t frameCrc8(uint32_t can_id, const uint8_t* payload, size_t len) {
 // Validation predicates
 // ---------------------------------------------------------------------------
 
-bool isKnownMode(uint8_t mode) {
-    return mode == MODE_DISABLED || mode == MODE_MANUAL || mode == MODE_AUTONOMOUS;
+bool isCommandableMode(uint8_t mode) {
+    return mode == MODE_SAFE || mode == MODE_TELEOP || mode == MODE_AUTONOMOUS;
 }
 
 bool modePermitsMotion(uint8_t mode) {
-    // Whitelist. Every value not named here -- including DISABLED and every
+    // Whitelist. Every value not named here -- including SAFE and every
     // undefined value -- means stop. A safety predicate must fail CLOSED.
-    return mode == MODE_MANUAL || mode == MODE_AUTONOMOUS;
+    return mode == MODE_TELEOP || mode == MODE_AUTONOMOUS;
 }
 
 bool sourceOwnsMode(bool from_autonomy, uint8_t mode) {
-    // Only modes that permit motion have an owner -- in DISABLED nothing may
+    // Only modes that permit motion have an owner -- in SAFE nothing may
     // move, so there is nothing for a source to be wrong about and a caller
     // asking the question gets "yes" rather than a spurious mismatch.
     if (!modePermitsMotion(mode)) return true;
@@ -230,11 +230,12 @@ DecodeResult decodeControl(uint32_t can_id, const uint8_t* buf, uint8_t len,
     const uint8_t mode  = buf[4];
     const uint8_t flags = buf[5];
 
-    // An undefined mode means the sender disagrees with us about the protocol.
-    // Reject the whole frame rather than storing a value we cannot reason
+    // A mode the Jetson may not send (undefined, or FAULT, which only the
+    // controller enters) means the sender disagrees with us about the
+    // protocol. Reject the whole frame rather than storing a value we cannot reason
     // about. Deliberately NOT forward-compatible: a newer peer sending a mode
     // this firmware does not implement must stop this rover.
-    if (!isKnownMode(mode)) return DECODE_BAD_MODE;
+    if (!isCommandableMode(mode)) return DECODE_BAD_MODE;
 
     // No reserved-bit check remains: v0.6 took bit 7 for from_autonomy and
     // the flags byte is full. A frame whose source does not own the mode is

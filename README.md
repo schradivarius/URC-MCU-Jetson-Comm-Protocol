@@ -16,7 +16,7 @@ autonomy and teleop commands are refused in each other's modes.
 
 | | |
 |---|---|
-| Protocol, safety logic, firmware | Implemented, **214 tests** passing |
+| Protocol, safety logic, firmware | Implemented, **224 tests** passing |
 | Cross-language codec | Pinned byte-for-byte, plus every validation predicate |
 | Autonomy → drive-stage loop (Task 4) | Closed and verified end to end (`make autonomy`) |
 | **Validated on real hardware** | **Not yet — see [Known gaps](#known-gaps)** |
@@ -33,7 +33,7 @@ than mocking them, so there is no dependency to manage.
 git clone https://github.com/schradivarius/URC-MCU-Jetson-Comm-Protocol.git
 cd URC-MCU-Jetson-Comm-Protocol
 
-make test      # 116 C++ tests + 98 host tests
+make test      # 126 C++ tests + 98 host tests
 make demo      # no-hardware message-exchange demonstration (Task 3)
 make autonomy  # mock autonomy stack driving the firmware (Task 4)
 ```
@@ -68,7 +68,7 @@ tools/
   rover_sim.cpp                simulator: REAL controller + drive stage, fake plant
   golden_vectors.cpp           emits vectors for cross-language pinning
 
-tests/cpp/                   116 tests — firmware core
+tests/cpp/                   126 tests — firmware core
 tests/host/                  98 tests — config sync, golden vectors, integration,
                                         the autonomy mission
 ```
@@ -96,8 +96,8 @@ make test-host   # host side only — compiles the C++ core
 
 | Suite | Tests | Answers |
 |---|---:|---|
-| `tests/cpp/test_protocol.cpp` | 38 | Wire format, CRC-8, and every validation predicate |
-| `tests/cpp/test_controller.cpp` | 61 | **Does the rover stop when it should?** And: does it refuse a command from the wrong half of the stack? |
+| `tests/cpp/test_protocol.cpp` | 41 | Wire format, CRC-8, and every validation predicate |
+| `tests/cpp/test_controller.cpp` | 68 | **Does the rover stop when it should?** And: does it refuse a command from the wrong half of the stack? |
 | `tests/cpp/test_drive.cpp` | 17 | Does a command become the right motor output — and never one it was told not to? |
 | `tests/host/test_config_sync.py` | 14 | Do the C++ and Python configs hold the same constants? |
 | `tests/host/test_golden_vectors.py` | 30 | Do C++ and Python agree byte-for-byte? |
@@ -130,10 +130,10 @@ implementation, rather than merely assumed to work:
   autonomous, so an undervoltage warning must not take the light away from
   what the rover is actually doing
 - `undefined_mode_does_not_permit_motion` — fails against the pre-fix
-  `mode == MODE_DISABLED` check, which permitted full throttle on any
+  `mode == MODE_DISABLED` check (that mode is `MODE_SAFE` now), which permitted full throttle on any
   undefined mode ([issue #4](https://github.com/schradivarius/URC-MCU-Jetson-Comm-Protocol/issues/4))
 - `the_same_command_is_accepted_once_the_mode_matches` — one command, refused
-  in `MANUAL` and applied in `AUTONOMOUS`, with nothing else changed: the Task
+  in `TELEOP` and applied in `AUTONOMOUS`, with nothing else changed: the Task
   4 claim that manual and autonomous commands do not get mixed up
 - `test_an_impossible_expectation_fails_the_run` and
   `test_every_step_passed_on_telemetry_it_caused` — the negative controls for

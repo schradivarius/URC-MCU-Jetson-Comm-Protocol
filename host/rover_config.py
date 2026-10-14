@@ -43,10 +43,13 @@ CAN_ID_TELEM_STATE   = 0x203
 CAN_ID_TELEM_CMD_ECHO = 0x204
 
 # --- operating modes ---
-MODE_DISABLED   = 0
-MODE_MANUAL     = 1
+# The Jetson commands SAFE, TELEOP or AUTONOMOUS; the controller enters FAULT
+# on its own when a link the mode needs is gone.
+MODE_SAFE       = 0
+MODE_TELEOP     = 1
 MODE_AUTONOMOUS = 2
-MODE_MAX        = MODE_AUTONOMOUS
+MODE_FAULT      = 3
+MODE_MAX        = MODE_AUTONOMOUS   # highest COMMANDABLE mode
 
 # --- valid command range for drive_cmd / steer_cmd (tenths of a percent) ---
 CMD_MIN = -1000

@@ -30,7 +30,7 @@ RoverController::RoverController(MillisFn now_ms,
     // from the first cycle, and the rover cannot move until the Jetson asks.
     last_control_.drive_cmd         = 0;
     last_control_.steer_cmd         = 0;
-    last_control_.mode              = MODE_DISABLED;
+    last_control_.mode              = MODE_SAFE;
     last_control_.stop              = true;
     last_control_.autonomy_abort    = false;
     last_control_.return_request    = false;
@@ -39,7 +39,7 @@ RoverController::RoverController(MillisFn now_ms,
     // only visible through c2LinkState(), which reports NOT_REPORTED until a
     // real frame arrives, so this cannot masquerade as forwarded state.
     last_control_.c2_lost           = true;
-    // Boot as the operator's rover, not autonomy's. The mode boots DISABLED
+    // Boot as the operator's rover, not autonomy's. The mode boots SAFE
     // so nothing can move either way, but if these two ever get out of step
     // the safe default is the one that refuses autonomous motion until a real
     // frame asks for it.
@@ -120,12 +120,24 @@ bool RoverController::watchdogTripped() const {
     return elapsedSinceControl() >= watchdog_timeout_ms_;
 }
 
+uint8_t RoverController::activeMode() const {
+    // Nothing is driving: the Jetson has gone silent, or never spoke.
+    if (watchdogTripped()) return MODE_FAULT;
+    // C2 lost in TELEOP: the operator's commands can no longer reach the
+    // Jetson, so nobody is driving. In AUTONOMOUS the Jetson IS driving and is
+    // provably alive, or the watchdog above would already have tripped -- and
+    // the autonomy course deliberately runs out of base-station line of sight.
+    // In SAFE we are stopped anyway.
+    if (last_control_.c2_lost && last_control_.mode == MODE_TELEOP) return MODE_FAULT;
+    return last_control_.mode;
+}
+
 bool RoverController::effectiveStop() const {
-    return watchdogTripped()
-        || last_control_.stop
-        || !modePermitsMotion(last_control_.mode)
+    return last_control_.stop
+        // Covers SAFE, the comm timeout and C2 lost in TELEOP: see activeMode().
+        || !modePermitsMotion(activeMode())
         // An autonomy abort means "stop what you are doing autonomously". In
-        // AUTONOMOUS that is a stop; in MANUAL the operator is already in
+        // AUTONOMOUS that is a stop; in TELEOP the operator is already in
         // control so it has no autonomous task to abort.
         //
         // NOTE FOR REVIEW: this behaviour is a judgement call, not something
@@ -133,13 +145,7 @@ bool RoverController::effectiveStop() const {
         // and let a higher layer act on it -- but a defined field with no
         // effect anywhere is the antipattern we already had to fix once with
         // FAULT_FIRMWARE_FAULT, so it acts here until someone decides better.
-        || (last_control_.autonomy_abort && last_control_.mode == MODE_AUTONOMOUS)
-        // C2 lost in MANUAL: the operator's commands can no longer reach the
-        // Jetson, so nobody is driving. In AUTONOMOUS the Jetson IS driving
-        // and is provably alive, or the watchdog above would already have
-        // stopped us -- and the autonomy course deliberately runs out of
-        // base-station line of sight. In DISABLED we are stopped anyway.
-        || (last_control_.c2_lost && last_control_.mode == MODE_MANUAL);
+        || (last_control_.autonomy_abort && last_control_.mode == MODE_AUTONOMOUS);
 }
 
 bool RoverController::commandAuthorized() const {
@@ -234,7 +240,7 @@ uint16_t RoverController::faultWord(uint16_t sensor_faults, uint16_t extra_fault
     if (protocol_error_)   faults |= FAULT_PROTOCOL_ERROR;
     if (crc_error_)        faults |= FAULT_CRC_ERROR;
     if (seq_gap_)          faults |= FAULT_SEQ_GAP;
-    // Raised in EVERY mode, even though it only stops the rover in MANUAL.
+    // Raised in EVERY mode, even though it only stops the rover in TELEOP.
     // During an autonomous run it is the one sign that the rover is out of
     // contact, which an operator needs whether or not it changes the driving.
     // Suppressed once the value is stale: see c2LinkState().
@@ -256,16 +262,15 @@ uint8_t RoverController::indicatorState() const {
 
     // 1. Nothing is driving this rover, or nothing can reach it. Not "off":
     //    OFF is a legitimate idle state and this is a failure, so say so.
-    if (watchdogTripped()) return INDICATOR_FAULT;
-    if (last_control_.c2_lost && last_control_.mode == MODE_MANUAL) {
-        return INDICATOR_FAULT;
-    }
+    //    This is exactly MODE_FAULT; see activeMode().
+    const uint8_t mode = activeMode();
+    if (mode == MODE_FAULT) return INDICATOR_FAULT;
 
     // 2. Commanded not to move. A legitimate state, not a fault.
-    if (last_control_.mode == MODE_DISABLED) return INDICATOR_OFF;
+    if (mode == MODE_SAFE) return INDICATOR_OFF;
 
     // 3. A human-driven rover never shows red or green, whatever is requested.
-    if (last_control_.mode == MODE_MANUAL) return INDICATOR_TELEOP;
+    if (mode == MODE_TELEOP) return INDICATOR_TELEOP;
 
     // 4. Autonomous. Only the ARRIVED request matters; anything else is red.
     //    `stop` deliberately does not change the light: a paused autonomous
