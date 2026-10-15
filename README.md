@@ -160,11 +160,33 @@ python3 host/jetson_test.py --channel vcan0
 
 ### The real Teensy
 
-1. Arduino IDE + Teensyduino, board **Teensy 4.1**.
+Either toolchain builds the same sources; the sketch layout suits both.
+
+**Arduino IDE + Teensyduino**
+
+1. Board **Teensy 4.1**.
 2. Install **FlexCAN_T4** (`tonton81/FlexCAN_T4`) and **WDT_T4**
    (`tonton81/WDT_T4`).
 3. Open `firmware/rover_firmware.ino` and upload.
-4. `python3 host/jetson_test.py --channel can0 --bitrate 500000`
+
+**PlatformIO** (`platformio.ini` is in the repo root; it names both libraries,
+so there is nothing to install by hand)
+
+```bash
+pio run              # compile for the Teensy 4.1
+pio run -t upload    # compile and flash
+pio device monitor   # the boot banner, 115200
+```
+
+Then, either way:
+
+```bash
+python3 host/jetson_test.py --channel can0 --bitrate 500000
+```
+
+First flash is worth doing with **nothing connected to the drive pins or the
+CAN bus** — the boot banner alone exercises the build, the boot-fault check and
+the watchdog arming, with nothing able to move.
 
 > **Before powering anything.**
 > - Teensy 4.1 is **3.3 V and NOT 5 V tolerant.** A 5 V sensor on a pin
@@ -190,8 +212,11 @@ crashed — see `PROTOCOL.md` §5.2.
 Stated plainly, so nobody builds on an unchecked assumption:
 
 - **Never run on a real Teensy or a real CAN bus.** Every library call was
-  verified against the `FlexCAN_T4` and `WDT_T4` headers, but the firmware has
-  not been compiled by Teensyduino or flashed. Bench validation is owed.
+  verified against the `FlexCAN_T4` and `WDT_T4` headers, and the sketch
+  type-checks under `-Wall -Wextra` against stub headers for `Arduino.h`,
+  `FlexCAN_T4.h` and `Watchdog_t4.h` — but it has not been compiled by
+  Teensyduino or PlatformIO, and never flashed. The first real compile happens
+  on whoever's machine runs it. Bench validation is owed.
 - **`SRC_SRSR` watchdog bit mask is unverified.** It fails safe — an
   unrecognised reset cause reports nothing — but confirm it by deliberately
   hanging the loop once on the bench.
