@@ -59,7 +59,7 @@ FRAME_GEOMETRY = ("FRAME_DLC", "FRAME_PAYLOAD", "FRAME_SEQ_OFFSET",
                   "FRAME_CRC_OFFSET")
 
 # No Python counterpart, so the comparison above cannot catch these drifting
-# back out into rover_firmware.ino.
+# back out into rover_firmware.cpp.
 FIRMWARE_ONLY = ("HW_WATCHDOG_MS", "OVER_CURRENT_CA", "UNDERVOLTAGE_CV")
 
 
