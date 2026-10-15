@@ -1077,7 +1077,7 @@ Verified to fail on an injected endianness change.
   rate here would mean inventing a tuning constant with nothing behind it. If
   one is ever added, it goes below the echo, not above it.
 - **The drive pins are placeholders and the PWM mode is unverified.**
-  `PIN_DRIVE_L/R` and `PIN_STEER` in `rover_firmware.ino` are not wired to
+  `PIN_DRIVE_L/R` and `PIN_STEER` in `rover_firmware.cpp` are not wired to
   anything and need checking against the Teensy 4.1 PWM-capable pin list.
   `analogWrite()` produces a continuous PWM waveform, which suits a brushed
   H-bridge or a PWM-input ESC; a hobby servo or a PPM-input ESC wants a 1–2 ms
@@ -1090,7 +1090,7 @@ Verified to fail on an injected endianness change.
   than a TODO.** The chain stops at telemetry: the protocol defines the
   states, `indicatorState()` decides which applies, `TELEM_STATE` reports it,
   and there is no pin assignment and no driver. The only LED in
-  `rover_firmware.ino` is `LED_PIN = 13`, the Teensy's onboard one, used as a
+  `rover_firmware.cpp` is `LED_PIN = 13`, the Teensy's onboard one, used as a
   telemetry heartbeat blink and unrelated to the indicator. So
   `indicator_state` is a value the Jetson can read and nobody can see.
   Rule 1.e.xvii scores a target as reached only on *"autonomously stopping
@@ -1139,7 +1139,7 @@ Verified to fail on an injected endianness change.
   stack *do* with them. Left as-is pending that call, because changing
   `effectiveStop()` changes safety behaviour.
 - **Motor and sensor I/O is stubbed** behind `readSensors()` and
-  `setMotorOutputs()` in `rover_firmware.ino`.
+  `setMotorOutputs()` in `rover_firmware.cpp`.
 - **`SRC_SRSR` watchdog bit mask is unverified on hardware.** It fails safe,
   but confirm it by deliberately hanging the loop once on the bench.
 - **A controller-side radio is planned, and the packets are ready for it.**
@@ -1176,7 +1176,7 @@ Verified to fail on an injected endianness change.
 
 | Path | Runs on | Purpose |
 |---|---|---|
-| `firmware/rover_firmware.ino` | Teensy 4.1 | Hardware wiring only |
+| `firmware/rover_firmware.cpp` | Teensy 4.1 | Hardware wiring only |
 | `firmware/src/rover_protocol.*` | **Both** | Message definitions, CRC, codec |
 | `firmware/src/rover_controller.*` | **Both** | Command/safety state machine |
 | `firmware/src/rover_drive.*` | **Both** | Drive/steering output stage (§5.4) |
@@ -1193,11 +1193,11 @@ Verified to fail on an injected endianness change.
 
 ### 10.1 Flashing the Teensy 4.1
 
-1. Arduino IDE + Teensyduino, board **Teensy 4.1**.
-2. Install **FlexCAN_T4** (`tonton81/FlexCAN_T4`) and **WDT_T4**
-   (`tonton81/WDT_T4`).
-3. Open `firmware/rover_firmware.ino` and upload. Sources under `src/` are
-   compiled automatically.
+1. PlatformIO, with `platformio.ini` from the repo root. It names the board
+   (`teensy41`) and both libraries — **FlexCAN_T4** (`tonton81/FlexCAN_T4`) and
+   **WDT_T4** (`tonton81/WDT_T4`) — so there is nothing to install by hand.
+2. `pio run -t upload`. Sources under `src/` are compiled automatically.
+3. `pio device monitor` at 115200 for the boot banner.
 
 **Before powering anything:**
 
