@@ -223,22 +223,6 @@ def build_mission():
     teleop = dict(mode=rp.MODE_TELEOP, c2_lost=False, from_autonomy=False)
     return [
         # --- the autonomous command sequence from the task ------------------
-
-        """
-        1.start in safe
-        2.receive mode AUTONOMOUS
-        3.command full forward movement
-        simulated encoder feedback should increase with speed/drive percentage
-        4.command differential sides, left forward, right backward
-        encoder feedback reflects differential
-        5.stop all motors
-        6.begin processing forward at half drive percentage/effort
-        7.send STOP byte
-        encoder feedback should fall to 0
-        8.jetson recieves target reached flag
-        9.send success LED indicator
-        10.return to safe
-        """
       
         Step("1. start in SAFE",
              dict(drive_cmd=0, steer_cmd=0, mode=rp.MODE_SAFE,
