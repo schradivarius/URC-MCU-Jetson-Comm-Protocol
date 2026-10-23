@@ -112,7 +112,7 @@ private:
 };
 
 // Map a CMD_MIN..CMD_MAX effort onto a servo/ESC pulse width. Exposed because
-// the .ino and the tests both need it and neither should re-derive it.
+// rover_firmware.cpp and the tests both need it and neither should re-derive it.
 uint16_t effortToPwmUs(int16_t effort);
 
 }  // namespace rover

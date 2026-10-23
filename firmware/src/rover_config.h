@@ -87,7 +87,7 @@ static const uint8_t MODE_MAX = MODE_AUTONOMOUS;   // highest COMMANDABLE mode
 
 // --- Sensor thresholds -----------------------------------------------------
 // Placeholders until the real sensors are characterised, but they belong here
-// rather than in the .ino: they are values someone will tune, not board
+// rather than in rover_firmware.cpp: they are values someone will tune, not board
 // wiring. Units match the telemetry fields they are compared against.
 static const int16_t OVER_CURRENT_CA = 4000;   // 40.00 A
 static const int16_t UNDERVOLTAGE_CV = 2000;   // 20.00 V

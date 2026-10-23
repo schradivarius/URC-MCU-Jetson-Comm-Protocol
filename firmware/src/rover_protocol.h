@@ -3,7 +3,7 @@
 // PURE C++. No Arduino.h, no FlexCAN, no hardware. That is deliberate: this
 // file and rover_controller.* compile unchanged for the Teensy AND natively on
 // a laptop, so the safety-critical logic is unit-tested by `make test` with no
-// board attached. Only rover_firmware.ino touches hardware.
+// board attached. Only rover_firmware.cpp touches hardware.
 //
 // ---------------------------------------------------------------------------
 // v0.6: a command SOURCE, and an acknowledgement of what was acted on

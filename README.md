@@ -48,7 +48,7 @@ Two languages, because the two ends of the link are different machines:
 
 ```
 firmware/                    C++ — runs on the Teensy 4.1
-  rover_firmware.ino           hardware wiring ONLY (CAN, watchdog, pins)
+  rover_firmware.cpp           hardware wiring ONLY (CAN, watchdog, pins)
   src/rover_config.h           every protocol + timing constant ─┐
   src/rover_protocol.*         message definitions + codec      ─┤ pure C++,
   src/rover_controller.*       command/safety state machine      │ no Arduino
@@ -75,7 +75,7 @@ tests/host/                  98 tests — config sync, golden vectors, integrati
 
 The files under `firmware/src/` have **no Arduino dependency and no hardware
 calls**, which is what lets the safety-critical logic be unit-tested natively
-with a fake clock. `rover_firmware.ino` is only the wiring around them. **If
+with a fake clock. `rover_firmware.cpp` is only the wiring around them. **If
 you are reviewing safety behaviour, read `rover_controller.h`.**
 
 The autonomy program can also live in a repository of its own — it is a
@@ -160,11 +160,34 @@ python3 host/jetson_test.py --channel vcan0
 
 ### The real Teensy
 
-1. Arduino IDE + Teensyduino, board **Teensy 4.1**.
-2. Install **FlexCAN_T4** (`tonton81/FlexCAN_T4`) and **WDT_T4**
-   (`tonton81/WDT_T4`).
-3. Open `firmware/rover_firmware.ino` and upload.
-4. `python3 host/jetson_test.py --channel can0 --bitrate 500000`
+**PlatformIO.** `platformio.ini` is in the repo root and names the board and
+both libraries, so there is nothing to install by hand:
+
+```bash
+pio run              # compile for the Teensy 4.1
+pio run -t upload    # compile and flash
+pio device monitor   # the boot banner, 115200
+```
+
+Then, from the Jetson side:
+
+```bash
+python3 host/jetson_test.py --channel can0 --bitrate 500000
+```
+
+> **Why not the Arduino IDE.** The entry point is `firmware/rover_firmware.cpp`,
+> a plain translation unit rather than an Arduino `.ino` sketch. The IDE needs a
+> `.ino` to open a sketch at all, so it cannot build this tree as it stands. The
+> gain is that nothing rewrites the file before the compiler sees it: a sketch
+> gets forward declarations injected near the top, which land ahead of the
+> structs they name in a file shaped like this one. If you do want the IDE back,
+> add a `firmware/rover_firmware.ino` containing the single line
+> `#include "rover_firmware.cpp"` — but then keep both toolchains honest, because
+> only one of them is exercised here.
+
+First flash is worth doing with **nothing connected to the drive pins or the
+CAN bus** — the boot banner alone exercises the build, the boot-fault check and
+the watchdog arming, with nothing able to move.
 
 > **Before powering anything.**
 > - Teensy 4.1 is **3.3 V and NOT 5 V tolerant.** A 5 V sensor on a pin
@@ -190,8 +213,13 @@ crashed — see `PROTOCOL.md` §5.2.
 Stated plainly, so nobody builds on an unchecked assumption:
 
 - **Never run on a real Teensy or a real CAN bus.** Every library call was
-  verified against the `FlexCAN_T4` and `WDT_T4` headers, but the firmware has
-  not been compiled by Teensyduino or flashed. Bench validation is owed.
+  verified against the `FlexCAN_T4` and `WDT_T4` headers, and the whole
+  firmware — `rover_firmware.cpp` plus everything in `src/` — compiles *and
+  links* under a host compiler at `-Wall -Wextra -Werror` against stub
+  `Arduino.h`, `FlexCAN_T4.h` and `Watchdog_t4.h`. What that does not cover is
+  the real `arm-none-eabi` build against the actual Teensyduino and library
+  headers, which has never run, and the board, which has never been flashed.
+  Bench validation is owed.
 - **`SRC_SRSR` watchdog bit mask is unverified.** It fails safe — an
   unrecognised reset cause reports nothing — but confirm it by deliberately
   hanging the loop once on the bench.
