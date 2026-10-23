@@ -22,8 +22,11 @@ namespace rover {
 // Bump whenever a message's layout or meaning changes. Not carried on the
 // wire yet; DLC and the application-layer CRC are the only runtime mismatch
 // signals. v0.5 is the first revision with the CRC and sequence number; v0.6
-// adds the command-source bit and the TELEM_CMD_ECHO acknowledgement frame.
-static const uint8_t PROTOCOL_VERSION = 6;
+// adds the command-source bit and the TELEM_CMD_ECHO acknowledgement frame;
+// v0.7 makes the mode a controller-owned state machine: transitions are
+// checked (transitionAllowed()), FAULT latches, and TELEM_STATE.mode reports
+// the state the controller is actually in rather than echoing the request.
+static const uint8_t PROTOCOL_VERSION = 7;
 
 // --- Link ------------------------------------------------------------------
 static const uint32_t CAN_BITRATE_HZ = 500000;   // 500 kbps; every node must match
@@ -74,14 +77,15 @@ enum : uint8_t {
 };
 
 // --- Operating modes -------------------------------------------------------
-// The Jetson commands SAFE, TELEOP or AUTONOMOUS in ControlMsg::mode; the
-// controller enters FAULT on its own (RoverController::activeMode()) and a
-// CONTROL frame carrying it is rejected.
+// The Jetson REQUESTS SAFE, TELEOP or AUTONOMOUS in ControlMsg::mode; the
+// controller decides whether to move there (transitionAllowed()). It enters
+// FAULT on its own and a CONTROL frame carrying FAULT is rejected.
 enum : uint8_t {
-    MODE_SAFE       = 0,  // stopped on purpose
+    MODE_SAFE       = 0,  // stopped on purpose; the only way out of FAULT
     MODE_TELEOP     = 1,  // an operator is driving
     MODE_AUTONOMOUS = 2,  // the Jetson is driving
-    MODE_FAULT      = 3,  // stopped because a link the mode needs is gone
+    MODE_FAULT      = 3,  // LATCHED stop: a link the mode needs was lost or a
+                          // critical fault was seen while the rover could move
 };
 static const uint8_t MODE_MAX = MODE_AUTONOMOUS;   // highest COMMANDABLE mode
 

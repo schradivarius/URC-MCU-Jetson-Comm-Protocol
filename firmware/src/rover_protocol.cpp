@@ -135,6 +135,34 @@ bool sourceOwnsMode(bool from_autonomy, uint8_t mode) {
     return from_autonomy == (mode == MODE_AUTONOMOUS);
 }
 
+// One row per controller state, one column per commandable mode, indexed by
+// the MODE_* values themselves -- which is why the table is only safe to
+// index after the range checks in transitionAllowed().
+namespace {
+enum Rule : uint8_t { DENY, ANYONE, OPERATOR };
+
+const Rule TRANSITIONS[MODE_FAULT + 1][MODE_MAX + 1] = {
+    //              to SAFE  to TELEOP  to AUTONOMOUS
+    /* SAFE   */  { ANYONE,  OPERATOR,  OPERATOR },
+    /* TELEOP */  { ANYONE,  ANYONE,    OPERATOR },
+    /* AUTO   */  { ANYONE,  OPERATOR,  ANYONE   },
+    /* FAULT  */  { ANYONE,  DENY,      DENY     },
+};
+}  // namespace
+
+bool transitionAllowed(uint8_t from, uint8_t to, bool from_autonomy) {
+    // Both indices are range-checked before they touch the table: `from` and
+    // `to` are uint8, so 256 values fit where 4 and 3 are defined, and reading
+    // past the end of an array is undefined behaviour, not a refusal.
+    if (from > MODE_FAULT || !isCommandableMode(to)) return false;
+    switch (TRANSITIONS[from][to]) {
+        case ANYONE:   return true;
+        case OPERATOR: return !from_autonomy;
+        case DENY:     return false;
+    }
+    return false;
+}
+
 bool isValidCommand(int16_t value) {
     return value >= CMD_MIN && value <= CMD_MAX;
 }
@@ -355,6 +383,7 @@ const char* cmdStatusName(uint8_t status) {
         case CMD_STATUS_STOPPED:      return "STOPPED";
         case CMD_STATUS_WRONG_SOURCE: return "WRONG_SOURCE";
         case CMD_STATUS_NO_COMMAND:   return "NO_COMMAND";
+        case CMD_STATUS_MODE_REFUSED: return "MODE_REFUSED";
     }
     return "UNKNOWN";
 }

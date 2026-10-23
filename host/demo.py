@@ -7,9 +7,11 @@ natively, with only the plant and the transport simulated. So what you see
 below is the actual safety logic that gets flashed to the Teensy.
 
 A: normal 20 Hz operation, four telemetry frames reassembled per cycle.
-B: a deliberate 800 ms silence (well past the 300 ms command watchdog).
+B: a deliberate 800 ms silence (well past the 300 ms command watchdog). The
+   rover latches FAULT and stays there when the link returns, until the
+   operator commands SAFE and grants TELEOP again.
 C: the explicit stop flag at full throttle.
-D: autonomy abort while in AUTONOMOUS.
+D: autonomy abort while in AUTONOMOUS, after the operator grants that mode.
 E: a corrupted frame -- the application-layer CRC rejects it and the rover
    reports CRC_ERROR rather than acting on it.
 F: a sequence gap -- detected and reported as SEQ_GAP.
@@ -83,13 +85,26 @@ def main():
         phase(jl, t0, 0.8, "B: link cut -- Jetson stops sending (800ms > 300ms watchdog)",
               send=False)
 
-        phase(jl, t0, 0.8, "B: link restored",
+        phase(jl, t0, 0.5, "B: link restored -- FAULT is latched, nothing moves",
+              drive_cmd=300, steer_cmd=100, mode=rp.MODE_TELEOP, c2_lost=False,
+              indicator_request=rp.INDICATOR_TELEOP)
+
+        phase(jl, t0, 0.3, "B: operator commands SAFE -- the only way out of FAULT",
+              drive_cmd=0, steer_cmd=0, mode=rp.MODE_SAFE, c2_lost=False)
+
+        phase(jl, t0, 0.5, "B: operator grants TELEOP again",
               drive_cmd=300, steer_cmd=100, mode=rp.MODE_TELEOP, c2_lost=False,
               indicator_request=rp.INDICATOR_TELEOP)
 
         phase(jl, t0, 0.5, "C: explicit stop asserted at full throttle",
               drive_cmd=1000, steer_cmd=500, mode=rp.MODE_TELEOP, c2_lost=False,
               stop=True)
+
+        # Only the operator may grant AUTONOMOUS: a stopped frame from the
+        # operator path asking for it, before the autonomy stack takes over.
+        phase(jl, t0, 0.2, "D: operator grants AUTONOMOUS",
+              drive_cmd=0, steer_cmd=0, mode=rp.MODE_AUTONOMOUS, c2_lost=False,
+              stop=True, from_autonomy=False)
 
         phase(jl, t0, 0.5, "D: autonomy abort while AUTONOMOUS",
               drive_cmd=800, steer_cmd=0, mode=rp.MODE_AUTONOMOUS, c2_lost=False,
@@ -104,7 +119,11 @@ def main():
               drive_cmd=800, steer_cmd=0, mode=rp.MODE_AUTONOMOUS, c2_lost=True,
               indicator_request=rp.INDICATOR_AUTONOMOUS, from_autonomy=True)
 
-        phase(jl, t0, 0.5, "D3: C2 lost while TELEOP -- stops, nobody can reach it",
+        phase(jl, t0, 0.3, "D3: operator takes back TELEOP",
+              drive_cmd=800, steer_cmd=0, mode=rp.MODE_TELEOP, c2_lost=False,
+              indicator_request=rp.INDICATOR_TELEOP)
+
+        phase(jl, t0, 0.5, "D3: C2 lost while TELEOP -- latches FAULT, nobody can reach it",
               drive_cmd=800, steer_cmd=0, mode=rp.MODE_TELEOP, c2_lost=True,
               indicator_request=rp.INDICATOR_TELEOP)
 
@@ -143,8 +162,9 @@ def main():
         assert jl.unknown_frames == 0, "unexpected CAN id seen"
         print()
         print("PASS: snapshots reassembled from five frames throughout; the")
-        print("watchdog, stop flag and autonomy abort each forced a stop; C2")
-        print("loss stopped a teleoperated rover but not an autonomous one; the")
+        print("watchdog, stop flag and autonomy abort each forced a stop; the")
+        print("watchdog trip latched FAULT until SAFE was commanded; C2 loss")
+        print("faulted a teleoperated rover but not an autonomous one; the")
         print("application-layer CRC rejected a corrupted frame; and a")
         print("sequence gap was detected and reported.")
     finally:

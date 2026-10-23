@@ -8,6 +8,10 @@ RoverController::RoverController(MillisFn now_ms,
     : now_ms_(now_ms),
       watchdog_timeout_ms_(watchdog_timeout_ms),
       telemetry_period_ms_(telemetry_period_ms),
+      mode_(MODE_SAFE),
+      latched_faults_(0),
+      hw_faults_(0),
+      hw_health_(CTRL_HEALTH_NOT_REPORTED),
       have_control_(false),
       last_control_ms_(0),
       next_telemetry_ms_(now_ms ? now_ms() : 0),
@@ -54,6 +58,12 @@ bool RoverController::ingestFrame(uint32_t can_id, const uint8_t* buf, uint8_t l
 
     ControlMsg msg;
     const DecodeResult r = decodeControl(can_id, buf, len, msg);
+
+    // Latch anything that became true BEFORE this frame, while the old frame
+    // still stands. The case that matters is a watchdog trip: once
+    // last_control_ms_ is refreshed below, the evidence that the Jetson went
+    // silent is gone, and a TELEOP rover would simply carry on.
+    latchIfFaulted();
     last_decode_ = r;
 
     if (r != DECODE_OK) {
@@ -101,7 +111,73 @@ bool RoverController::ingestFrame(uint32_t can_id, const uint8_t* buf, uint8_t l
     have_control_    = true;
     last_control_ms_ = now_ms_();
     control_frames_accepted_++;
+
+    // The frame is good; now decide what it may change. Order matters: the
+    // mode first, then the latch check, so what this frame reports (C2 lost,
+    // say) is judged against the mode the frame leaves the rover in.
+    requestMode(msg);
+    latchIfFaulted();
     return true;
+}
+
+void RoverController::updateFaults(uint16_t hardware_faults, uint8_t controller_health) {
+    hw_faults_ = hardware_faults;
+    hw_health_ = controller_health;
+    latchIfFaulted();
+}
+
+void RoverController::requestMode(const ControlMsg& msg) {
+    const uint8_t to = msg.mode;
+    if (to == mode_) return;                 // not a transition
+
+    // The table: who may move from here to there. See transitionAllowed().
+    if (!transitionAllowed(mode_, to, msg.from_autonomy)) return;
+
+    // FAULT -> SAFE is "the operator has seen it, stand the rover down". A
+    // fault that is STILL present has not been dealt with, so the request is
+    // refused and the rover stays in FAULT. The link causes are not checked:
+    // this frame arriving is itself proof the Jetson is back, and SAFE needs
+    // no C2 link to be safe.
+    if (mode_ == MODE_FAULT && hardwareFaultActive()) return;
+
+    // Entering TELEOP with C2 already reported lost would only latch FAULT on
+    // the very same frame. Refusing it instead keeps the rover where it was,
+    // which is the more useful answer to "the operator cannot reach me".
+    if (to == MODE_TELEOP && msg.c2_lost) return;
+
+    mode_ = to;
+    if (to == MODE_SAFE) latched_faults_ = 0;    // leaving FAULT clears its cause
+}
+
+uint16_t RoverController::faultCauses() const {
+    uint16_t causes = static_cast<uint16_t>(hw_faults_ & FAULT_CRITICAL_MASK);
+    // Nothing is driving: the Jetson has gone silent.
+    if (watchdogTripped()) causes |= FAULT_COMM_TIMEOUT;
+    // C2 lost in TELEOP: the operator's commands can no longer reach the
+    // Jetson, so nobody is driving. In AUTONOMOUS the Jetson IS driving and is
+    // provably alive, or the watchdog above would already have tripped -- and
+    // the autonomy course deliberately runs out of base-station line of sight.
+    if (mode_ == MODE_TELEOP && last_control_.c2_lost) causes |= FAULT_C2_LINK_LOST;
+    return causes;
+}
+
+bool RoverController::hardwareFaultActive() const {
+    return (hw_faults_ & FAULT_CRITICAL_MASK) != 0
+        || hw_health_ == CTRL_HEALTH_FAULT;
+}
+
+bool RoverController::faultConditionPresent() const {
+    // Only a rover that could move can fault. SAFE is already stopped, and
+    // FAULT is already FAULT -- the spec enters FAULT from TELEOP or
+    // AUTONOMOUS (or the future DEGRADED), never from standby.
+    if (!modePermitsMotion(mode_)) return false;
+    return faultCauses() != 0 || hw_health_ == CTRL_HEALTH_FAULT;
+}
+
+void RoverController::latchIfFaulted() {
+    if (!faultConditionPresent()) return;
+    latched_faults_ = faultCauses();
+    mode_ = MODE_FAULT;
 }
 
 // Unsigned subtraction, computed modulo 2^32, so this stays correct when
@@ -121,15 +197,19 @@ bool RoverController::watchdogTripped() const {
 }
 
 uint8_t RoverController::activeMode() const {
-    // Nothing is driving: the Jetson has gone silent, or never spoke.
-    if (watchdogTripped()) return MODE_FAULT;
-    // C2 lost in TELEOP: the operator's commands can no longer reach the
-    // Jetson, so nobody is driving. In AUTONOMOUS the Jetson IS driving and is
-    // provably alive, or the watchdog above would already have tripped -- and
-    // the autonomy course deliberately runs out of base-station line of sight.
-    // In SAFE we are stopped anyway.
-    if (last_control_.c2_lost && last_control_.mode == MODE_TELEOP) return MODE_FAULT;
-    return last_control_.mode;
+    // A fault that has happened but not been latched yet still counts. This
+    // is a const query and cannot latch anything itself, but a watchdog that
+    // tripped a moment ago must read as FAULT now, not on the next frame --
+    // the next frame may never come. latchIfFaulted() makes it stick.
+    if (faultConditionPresent()) return MODE_FAULT;
+    return mode_;
+}
+
+bool RoverController::modeRefused() const {
+    // Same staleness rule as c2LinkState(): once the watchdog has tripped we
+    // cannot speak for what the last frame wanted.
+    if (!have_control_ || watchdogTripped()) return false;
+    return last_control_.mode != activeMode();
 }
 
 bool RoverController::effectiveStop() const {
@@ -145,12 +225,15 @@ bool RoverController::effectiveStop() const {
         // and let a higher layer act on it -- but a defined field with no
         // effect anywhere is the antipattern we already had to fix once with
         // FAULT_FIRMWARE_FAULT, so it acts here until someone decides better.
-        || (last_control_.autonomy_abort && last_control_.mode == MODE_AUTONOMOUS);
+        || (last_control_.autonomy_abort && activeMode() == MODE_AUTONOMOUS);
 }
 
 bool RoverController::commandAuthorized() const {
     if (!have_control_) return false;   // nobody has authority yet
-    return sourceOwnsMode(last_control_.from_autonomy, last_control_.mode);
+    // A sender that disagrees with us about the mode does not get to drive,
+    // whichever half of the stack it is. See the header.
+    if (last_control_.mode != activeMode()) return false;
+    return sourceOwnsMode(last_control_.from_autonomy, activeMode());
 }
 
 bool RoverController::sourceMismatch() const {
@@ -160,13 +243,18 @@ bool RoverController::sourceMismatch() const {
     // fault word already says, and claiming a source mismatch on top of it
     // would send an operator chasing the wrong bug.
     if (!have_control_ || watchdogTripped()) return false;
-    if (!modePermitsMotion(last_control_.mode)) return false;
+    if (!modePermitsMotion(activeMode())) return false;
+    // A refused mode change is its own verdict (MODE_REFUSED), not a source
+    // problem, and a frame that only asks to stop is not trying to drive --
+    // that is how the operator hands AUTONOMOUS over without a false alarm.
+    if (modeRefused() || last_control_.stop) return false;
     return !commandAuthorized();
 }
 
 uint8_t RoverController::commandStatus() const {
     // First match wins; see the CMD_STATUS_* comment in rover_protocol.h.
     if (!have_control_)       return CMD_STATUS_NO_COMMAND;
+    if (modeRefused())        return CMD_STATUS_MODE_REFUSED;
     if (effectiveStop())      return CMD_STATUS_STOPPED;
     if (!commandAuthorized()) return CMD_STATUS_WRONG_SOURCE;
     return CMD_STATUS_APPLIED;
@@ -177,7 +265,7 @@ bool RoverController::returnRequestActive() const {
     // signalling a return is the OPERATOR's call under the 2027 scoring
     // rules (1.e.xi), so it has to survive arriving from the teleop path.
     if (!have_control_ || watchdogTripped()) return false;
-    return last_control_.return_request && last_control_.mode == MODE_AUTONOMOUS;
+    return last_control_.return_request && activeMode() == MODE_AUTONOMOUS;
 }
 
 void RoverController::commandedOutputs(int16_t& drive, int16_t& steer) const {
@@ -234,6 +322,8 @@ uint8_t RoverController::c2LinkState() const {
 
 uint16_t RoverController::faultWord(uint16_t sensor_faults, uint16_t extra_faults) const {
     uint16_t faults = static_cast<uint16_t>(sensor_faults | extra_faults);
+    // Why we are in FAULT, even once the cause itself has gone away.
+    faults |= latched_faults_;
     if (watchdogTripped()) faults |= FAULT_COMM_TIMEOUT;
     // Without these the rover could halt or degrade while telemetry read "no
     // faults, link healthy" -- a silent stop is its own hazard.
@@ -314,10 +404,11 @@ TelemetryPower RoverController::buildPower(int16_t current_ca, int16_t voltage_c
 
 TelemetryState RoverController::buildState(uint8_t controller_health) const {
     TelemetryState m;
-    // An ECHO of the mode the controller believes it is in, so the operator
-    // can confirm the controller agrees with what was commanded. Without it a
-    // dropped or misread mode change is invisible from the outside.
-    m.mode              = last_control_.mode;
+    // The mode the controller is actually IN, FAULT included (v0.7). Before
+    // the mode was a state machine this echoed the request, which was the same
+    // thing; now a refused or overridden change is exactly what the operator
+    // needs to see, and echoing the request would hide it.
+    m.mode              = activeMode();
     m.jetson_link       = jetsonLinkState();
     // Reported, never derived from the Jetson link: they are separate links
     // and must not be treated as equivalent.

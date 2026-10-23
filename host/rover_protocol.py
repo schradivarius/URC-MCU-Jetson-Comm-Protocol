@@ -104,6 +104,10 @@ FAULT_NAMES = [
     (FAULT_CMD_SOURCE, "CMD_SOURCE"),
 ]
 
+# The faults that put a MOVING rover into FAULT (v0.7). Mirrors
+# FAULT_CRITICAL_MASK in rover_protocol.h; see the reasoning there.
+FAULT_CRITICAL_MASK = FAULT_OVER_CURRENT | FAULT_ESTOP_ACTIVE
+
 # --- link health. Jetson and C2 are SEPARATE and never collapsed. ---
 LINK_OK           = 0
 LINK_DEGRADED     = 1
@@ -123,16 +127,18 @@ CTRL_HEALTH_NAMES = {CTRL_HEALTH_OK: "OK", CTRL_HEALTH_DEGRADED: "DEGRADED",
 
 # --- what the controller is doing with the last command it accepted ---
 # TelemetryCmdEcho.status bits 0-2. First match wins, in this order:
-# NO_COMMAND, STOPPED, WRONG_SOURCE, APPLIED.
+# NO_COMMAND, MODE_REFUSED, STOPPED, WRONG_SOURCE, APPLIED.
 CMD_STATUS_APPLIED      = 0
 CMD_STATUS_STOPPED      = 1
 CMD_STATUS_WRONG_SOURCE = 2
 CMD_STATUS_NO_COMMAND   = 3
+CMD_STATUS_MODE_REFUSED = 4   # v0.7: asked for a mode the controller is not in
 CMD_STATUS_MAX          = 7
 CMD_STATUS_NAMES = {CMD_STATUS_APPLIED: "APPLIED",
                     CMD_STATUS_STOPPED: "STOPPED",
                     CMD_STATUS_WRONG_SOURCE: "WRONG_SOURCE",
-                    CMD_STATUS_NO_COMMAND: "NO_COMMAND"}
+                    CMD_STATUS_NO_COMMAND: "NO_COMMAND",
+                    CMD_STATUS_MODE_REFUSED: "MODE_REFUSED"}
 
 # --- TelemetryCmdEcho.status packing ---
 CMD_ECHO_STATUS_MASK   = 0x07
@@ -215,6 +221,36 @@ def source_owns_mode(from_autonomy, mode):
     if not mode_permits_motion(mode):
         return True
     return bool(from_autonomy) == (mode == MODE_AUTONOMOUS)
+
+
+# Who may move the controller from one mode to another (v0.7). Rows are the
+# controller's state, columns the requested mode. Mirrors TRANSITIONS in
+# firmware/src/rover_protocol.cpp; tests/host/test_golden_vectors.py pins the
+# two together.
+_DENY, _ANYONE, _OPERATOR = range(3)
+_TRANSITIONS = {
+    #                to SAFE   to TELEOP  to AUTONOMOUS
+    MODE_SAFE:       (_ANYONE, _OPERATOR, _OPERATOR),
+    MODE_TELEOP:     (_ANYONE, _ANYONE,   _OPERATOR),
+    MODE_AUTONOMOUS: (_ANYONE, _OPERATOR, _ANYONE),
+    MODE_FAULT:      (_ANYONE, _DENY,     _DENY),
+}
+
+
+def transition_allowed(from_mode, to_mode, from_autonomy):
+    """May a frame from this producer move the controller between modes?
+
+    Anyone may command SAFE, which is also the only way out of FAULT. Only the
+    operator may grant TELEOP or AUTONOMOUS. Mirrors transitionAllowed() in
+    C++; the controller enforces it, and this copy is so the Jetson can know a
+    request will be refused before it reads MODE_REFUSED back.
+    """
+    if from_mode not in _TRANSITIONS or not is_commandable_mode(to_mode):
+        return False
+    rule = _TRANSITIONS[from_mode][to_mode]
+    if rule == _OPERATOR:
+        return not from_autonomy
+    return rule == _ANYONE
 
 
 def is_valid_command(value):

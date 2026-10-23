@@ -445,9 +445,46 @@ static void fault_has_no_owner() {
     CHECK(sourceOwnsMode(false, MODE_FAULT));
 }
 
+static void the_transition_table_matches_the_spec() {
+    // Written out in full rather than derived, so that this test is the spec
+    // and the table in rover_protocol.cpp has to agree with it -- not the
+    // other way round. Rows are `from`, columns are `to`; each cell is
+    // {operator may, autonomy may}.
+    struct Cell { bool op, aut; };
+    const Cell expected[4][3] = {
+        //            SAFE           TELEOP          AUTONOMOUS
+        /* SAFE  */ {{true, true},  {true, false},  {true, false}},
+        /* TELEOP*/ {{true, true},  {true, true},   {true, false}},
+        /* AUTO  */ {{true, true},  {true, false},  {true, true}},
+        /* FAULT */ {{true, true},  {false, false}, {false, false}},
+    };
+    for (uint8_t from = 0; from <= MODE_FAULT; ++from) {
+        for (uint8_t to = 0; to <= MODE_MAX; ++to) {
+            CHECK_EQ(transitionAllowed(from, to, false), expected[from][to].op);
+            CHECK_EQ(transitionAllowed(from, to, true), expected[from][to].aut);
+        }
+    }
+}
+
+static void transitions_fail_closed_outside_the_table() {
+    // Both sides are uint8, so 256 values fit where 4 and 3 are defined. Every
+    // value off the table is a refusal -- and, as importantly, never an array
+    // read past the end of it.
+    for (int from = 0; from <= 255; ++from) {
+        for (int to = 0; to <= 255; ++to) {
+            if (from <= MODE_FAULT && to <= MODE_MAX) continue;
+            for (int src = 0; src <= 1; ++src) {
+                CHECK(!transitionAllowed(static_cast<uint8_t>(from),
+                                         static_cast<uint8_t>(to), src != 0));
+            }
+        }
+    }
+}
+
 static void the_command_status_byte_packs_and_unpacks() {
     const uint8_t statuses[] = {CMD_STATUS_APPLIED, CMD_STATUS_STOPPED,
-                                CMD_STATUS_WRONG_SOURCE, CMD_STATUS_NO_COMMAND};
+                                CMD_STATUS_WRONG_SOURCE, CMD_STATUS_NO_COMMAND,
+                                CMD_STATUS_MODE_REFUSED};
     const DecodeResult decodes[] = {DECODE_OK, DECODE_BAD_DLC, DECODE_BAD_CRC,
                                     DECODE_BAD_MODE, DECODE_BAD_FLAGS,
                                     DECODE_BAD_INDICATOR, DECODE_BAD_RANGE};
@@ -624,6 +661,8 @@ int main() {
     RUN_TEST(the_source_bit_survives_a_round_trip_independently);
     RUN_TEST(authority_is_a_whitelist_over_every_mode_and_source);
     RUN_TEST(fault_has_no_owner);
+    RUN_TEST(the_transition_table_matches_the_spec);
+    RUN_TEST(transitions_fail_closed_outside_the_table);
     RUN_TEST(the_command_status_byte_packs_and_unpacks);
     RUN_TEST(the_cmd_echo_frame_round_trips);
     RUN_TEST(indicator_predicate_covers_all_256_values);

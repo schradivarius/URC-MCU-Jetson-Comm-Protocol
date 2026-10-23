@@ -15,9 +15,10 @@ here anyway, because "one place to change a timeout" is the point of the file.
 
 # --- protocol version: bump whenever a message's layout or meaning changes ---
 # v0.5 is the first revision with the application-layer CRC and sequence
-# number; v0.6 adds the command-source bit and TELEM_CMD_ECHO. Not carried on
-# the wire.
-PROTOCOL_VERSION = 6
+# number; v0.6 adds the command-source bit and TELEM_CMD_ECHO; v0.7 makes the
+# mode a controller-owned state machine (checked transitions, latched FAULT,
+# TELEM_STATE.mode reports the actual state). Not carried on the wire.
+PROTOCOL_VERSION = 7
 
 # --- link ---
 CAN_BITRATE_HZ = 500000       # 500 kbps; every node must match

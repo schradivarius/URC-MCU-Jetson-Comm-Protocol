@@ -30,13 +30,14 @@ static bool sourceBit(Source src, uint8_t mode) {
     return src == SRC_AUTONOMY;
 }
 
-// Send a well-formed CONTROL frame. seq increments so the healthy path never
-// trips the gap detector by accident.
+// Send ONE well-formed CONTROL frame, exactly as given. seq increments so the
+// healthy path never trips the gap detector by accident. The mode-transition
+// tests use this directly, because they are about what one frame may change.
 static uint8_t g_seq = 0;
-static bool sendControl(RoverController& ctl, int16_t drive, int16_t steer,
-                        uint8_t mode, bool stop, bool abort = false,
-                        bool ret = false, uint8_t ind = INDICATOR_OFF,
-                        bool c2_lost = false, Source src = SRC_OWNER) {
+static bool sendFrame(RoverController& ctl, int16_t drive, int16_t steer,
+                      uint8_t mode, bool stop, bool abort = false,
+                      bool ret = false, uint8_t ind = INDICATOR_OFF,
+                      bool c2_lost = false, Source src = SRC_OWNER) {
     ControlMsg m;
     m.drive_cmd = drive; m.steer_cmd = steer; m.mode = mode;
     m.stop = stop; m.autonomy_abort = abort; m.return_request = ret;
@@ -44,6 +45,28 @@ static bool sendControl(RoverController& ctl, int16_t drive, int16_t steer,
     m.indicator_request = ind; m.seq = ++g_seq;
     uint8_t buf[8] = {0};
     return ctl.ingestFrame(CAN_ID_CONTROL, buf, encodeControl(m, buf));
+}
+
+// The operator granting a motion mode (v0.7): a stopped, operator-sourced
+// frame asking for it. This is what the Jetson sends when C2 says "go
+// autonomous", before the autonomy stack's own frames start arriving.
+static void grantMode(RoverController& ctl, uint8_t mode, bool c2_lost = false) {
+    sendFrame(ctl, 0, 0, mode, /*stop=*/true, false, false, INDICATOR_OFF,
+              c2_lost, SRC_TELEOP);
+}
+
+// Send a CONTROL frame in `mode`, having the operator grant that mode first if
+// the controller is not already in it. Same idea as SRC_OWNER: a test that is
+// not ABOUT transitions does not have to think about them. The ones that are
+// use sendFrame() and say so.
+static bool sendControl(RoverController& ctl, int16_t drive, int16_t steer,
+                        uint8_t mode, bool stop, bool abort = false,
+                        bool ret = false, uint8_t ind = INDICATOR_OFF,
+                        bool c2_lost = false, Source src = SRC_OWNER) {
+    if (modePermitsMotion(mode) && ctl.activeMode() != mode) {
+        grantMode(ctl, mode, c2_lost);
+    }
+    return sendFrame(ctl, drive, steer, mode, stop, abort, ret, ind, c2_lost, src);
 }
 
 static bool sendWithSeq(RoverController& ctl, uint8_t seq, int16_t drive = 400) {
@@ -64,7 +87,11 @@ static void boots_stopped_and_safe() {
     CHECK(ctl.watchdogTripped());
     CHECK_EQ(ctl.cmdAgeMs(), CMD_AGE_UNKNOWN);
     CHECK_EQ(ctl.lastControl().mode, MODE_SAFE);
-    CHECK_EQ(ctl.activeMode(), MODE_FAULT);   // nobody has spoken yet
+    // Standing by, not faulted (v0.7): FAULT is entered from a mode that could
+    // move, and a booting rover is not one. The silent Jetson is still
+    // reported -- as a comm timeout and a lost link, not as a mode.
+    CHECK_EQ(ctl.activeMode(), MODE_SAFE);
+    CHECK(ctl.faultWord() & FAULT_COMM_TIMEOUT);
     CHECK_EQ(ctl.jetsonLinkState(), LINK_LOST);
     int16_t d, s; ctl.commandedOutputs(d, s);
     CHECK_EQ(d, 0); CHECK_EQ(s, 0);
@@ -397,17 +424,20 @@ static void c2_loss_stops_a_teleoperated_rover_but_not_an_autonomous_one() {
     ctl.commandedOutputs(drive, steer);
     CHECK_EQ(drive, 800);
 
-    sendControl(ctl, 800, 0, MODE_TELEOP, false, false, false,
+    RoverController tele = freshController();
+    sendControl(tele, 800, 0, MODE_TELEOP, false, false, false, INDICATOR_TELEOP);
+    sendControl(tele, 800, 0, MODE_TELEOP, false, false, false,
                 INDICATOR_TELEOP, /*c2_lost=*/true);
-    CHECK(ctl.effectiveStop());
-    ctl.commandedOutputs(drive, steer);
+    CHECK(tele.effectiveStop());
+    tele.commandedOutputs(drive, steer);
     CHECK_EQ(drive, 0);
 
-    // And it releases again when the Jetson says the link is back, without a
-    // mode round trip.
-    sendControl(ctl, 800, 0, MODE_TELEOP, false, false, false,
+    // And since v0.7 it does NOT release when the Jetson says the link is
+    // back: FAULT latches, and only a SAFE command leaves it.
+    sendControl(tele, 800, 0, MODE_TELEOP, false, false, false,
                 INDICATOR_TELEOP, /*c2_lost=*/false);
-    CHECK(!ctl.effectiveStop());
+    CHECK(tele.effectiveStop());
+    CHECK_EQ(tele.activeMode(), MODE_FAULT);
 }
 
 static void the_c2_fault_is_raised_in_every_mode() {
@@ -469,8 +499,8 @@ static void active_mode_follows_the_commanded_mode() {
     }
 }
 
-static void comm_timeout_is_a_fault_in_every_mode() {
-    const uint8_t modes[] = {MODE_SAFE, MODE_TELEOP, MODE_AUTONOMOUS};
+static void comm_timeout_faults_a_moving_rover() {
+    const uint8_t modes[] = {MODE_TELEOP, MODE_AUTONOMOUS};
     for (uint8_t mode : modes) {
         RoverController ctl = freshController();
         sendControl(ctl, 500, 0, mode, false);
@@ -481,27 +511,118 @@ static void comm_timeout_is_a_fault_in_every_mode() {
     }
 }
 
-static void fault_clears_when_commands_resume() {
-    // Not latched: the controller reports what it is doing NOW.
+static void comm_timeout_in_safe_is_reported_but_is_not_a_fault() {
+    // The spec enters FAULT from TELEOP or AUTONOMOUS. A rover in SAFE is not
+    // moving and was not going to, so a silent Jetson there is a link problem
+    // to report, not a reason to latch the rover into a state it then has to
+    // be talked out of.
+    RoverController ctl = freshController();
+    sendControl(ctl, 0, 0, MODE_SAFE, false);
+    advance(DEFAULT_WATCHDOG_TIMEOUT_MS);
+    CHECK_EQ(ctl.activeMode(), MODE_SAFE);
+    CHECK(ctl.faultWord() & FAULT_COMM_TIMEOUT);
+    CHECK_EQ(ctl.jetsonLinkState(), LINK_LOST);
+    CHECK(ctl.effectiveStop());
+}
+
+static void fault_latches_until_safe_is_commanded() {
+    // v0.7: getting the link back does not resume driving. The rover stopped
+    // for a reason, and someone has to acknowledge it -- by commanding SAFE --
+    // before it may be given a motion mode again.
     RoverController ctl = freshController();
     sendControl(ctl, 500, 0, MODE_TELEOP, false);
     advance(DEFAULT_WATCHDOG_TIMEOUT_MS);
     CHECK_EQ(ctl.activeMode(), MODE_FAULT);
+
+    // The link is back and the Jetson carries on as if nothing happened.
+    CHECK(sendFrame(ctl, 500, 0, MODE_TELEOP, false));
+    CHECK_EQ(ctl.activeMode(), MODE_FAULT);
+    CHECK(ctl.modeRefused());
+    CHECK_EQ(ctl.commandStatus(), CMD_STATUS_MODE_REFUSED);
+    int16_t d, s; ctl.commandedOutputs(d, s);
+    CHECK_EQ(d, 0); CHECK_EQ(s, 0);
+    // The reason is still there, although the link itself is fine now.
+    CHECK(!ctl.watchdogTripped());
+    CHECK(ctl.faultWord() & FAULT_COMM_TIMEOUT);
+
+    // SAFE is the way out, and it clears the latched reason.
+    CHECK(sendFrame(ctl, 0, 0, MODE_SAFE, false));
+    CHECK_EQ(ctl.activeMode(), MODE_SAFE);
+    CHECK_EQ(ctl.latchedFaults(), 0);
+    CHECK(!(ctl.faultWord() & FAULT_COMM_TIMEOUT));
+
+    // And from SAFE the operator can drive again.
+    CHECK(sendFrame(ctl, 500, 0, MODE_TELEOP, false));
+    ctl.commandedOutputs(d, s);
+    CHECK_EQ(d, 500);
+}
+
+static void fault_cannot_be_left_straight_into_motion() {
+    // FAULT -> TELEOP and FAULT -> AUTONOMOUS are refused even from the
+    // operator: SAFE first, every time.
+    const uint8_t modes[] = {MODE_TELEOP, MODE_AUTONOMOUS};
+    for (uint8_t mode : modes) {
+        RoverController ctl = freshController();
+        sendControl(ctl, 500, 0, MODE_TELEOP, false);
+        advance(DEFAULT_WATCHDOG_TIMEOUT_MS);
+        CHECK(sendFrame(ctl, 0, 0, mode, true, false, false, INDICATOR_OFF,
+                        false, SRC_TELEOP));
+        CHECK_EQ(ctl.activeMode(), MODE_FAULT);
+    }
+}
+
+static void a_timeout_latches_even_if_nobody_looked_in_between() {
+    // Nothing queries the controller between the trip and the next frame. The
+    // frame must still find the rover faulted: ingestFrame() latches BEFORE it
+    // refreshes the watchdog, or the evidence would be overwritten.
+    RoverController ctl = freshController();
     sendControl(ctl, 500, 0, MODE_TELEOP, false);
-    CHECK_EQ(ctl.activeMode(), MODE_TELEOP);
+    advance(DEFAULT_WATCHDOG_TIMEOUT_MS + 50);
+    sendFrame(ctl, 500, 0, MODE_TELEOP, false);
+    CHECK_EQ(ctl.activeMode(), MODE_FAULT);
+}
+
+static void the_latched_reason_outlives_the_condition() {
+    RoverController ctl = freshController();
+    sendControl(ctl, 500, 0, MODE_TELEOP, false);
+    sendFrame(ctl, 500, 0, MODE_TELEOP, false, false, false, INDICATOR_OFF,
+              /*c2_lost=*/true);
+    CHECK_EQ(ctl.activeMode(), MODE_FAULT);
+    CHECK_EQ(ctl.latchedFaults(), FAULT_C2_LINK_LOST);
+
+    // C2 is back. The bit stays, so the operator can see WHY the rover is
+    // sitting in FAULT; otherwise it would read as a fault with no cause.
+    sendFrame(ctl, 500, 0, MODE_TELEOP, false);
+    CHECK_EQ(ctl.c2LinkState(), LINK_OK);
+    CHECK(ctl.faultWord() & FAULT_C2_LINK_LOST);
+
+    sendFrame(ctl, 0, 0, MODE_SAFE, false);
+    CHECK(!(ctl.faultWord() & FAULT_C2_LINK_LOST));
+}
+
+static void the_state_frame_reports_fault() {
+    // v0.7: TELEM_STATE.mode is the mode the controller is IN. Before, it
+    // echoed the request, and a faulted rover reported the mode it had been
+    // told rather than the one it was executing.
+    RoverController ctl = freshController();
+    sendControl(ctl, 500, 0, MODE_AUTONOMOUS, false);
+    advance(DEFAULT_WATCHDOG_TIMEOUT_MS);
+    CHECK_EQ(ctl.buildState().mode, MODE_FAULT);
 }
 
 static void c2_loss_faults_teleop_but_not_autonomy() {
     RoverController ctl = freshController();
+    sendControl(ctl, 500, 0, MODE_TELEOP, false, false, false, INDICATOR_TELEOP);
     sendControl(ctl, 500, 0, MODE_TELEOP, false, false, false,
                 INDICATOR_TELEOP, /*c2_lost=*/true);
     CHECK_EQ(ctl.activeMode(), MODE_FAULT);
     CHECK(ctl.effectiveStop());
 
-    sendControl(ctl, 500, 0, MODE_AUTONOMOUS, false, false, false,
+    RoverController aut = freshController();
+    sendControl(aut, 500, 0, MODE_AUTONOMOUS, false, false, false,
                 INDICATOR_AUTONOMOUS, /*c2_lost=*/true);
-    CHECK_EQ(ctl.activeMode(), MODE_AUTONOMOUS);
-    CHECK(!ctl.effectiveStop());
+    CHECK_EQ(aut.activeMode(), MODE_AUTONOMOUS);
+    CHECK(!aut.effectiveStop());
 }
 
 static void a_pause_or_abort_is_not_a_fault() {
@@ -596,6 +717,7 @@ static void the_indicator_shows_fault_when_nothing_is_driving() {
 
     // C2 lost in TELEOP is the other case where nobody is driving.
     RoverController ctl2 = freshController();
+    sendControl(ctl2, 500, 0, MODE_TELEOP, false, false, false, INDICATOR_TELEOP);
     sendControl(ctl2, 500, 0, MODE_TELEOP, false, false, false,
                 INDICATOR_TELEOP, /*c2_lost=*/true);
     CHECK_EQ(ctl2.indicatorState(), INDICATOR_FAULT);
@@ -693,7 +815,7 @@ static void an_autonomy_command_is_refused_while_teleoperated() {
                       INDICATOR_OFF, false, SRC_AUTONOMY));
     // Accepted as a frame...
     CHECK_EQ(ctl.lastDecodeResult(), DECODE_OK);
-    CHECK_EQ(ctl.controlFramesAccepted(), 1u);
+    CHECK_EQ(ctl.controlFramesAccepted(), 2u);   // the operator's grant, then this
     CHECK(!ctl.watchdogTripped());
     // ...but not acted on, and NOT by pretending the rover is stopped.
     CHECK(!ctl.commandAuthorized());
@@ -973,9 +1095,14 @@ static void outputs_are_nonzero_only_when_permitted_and_authorised() {
                                 // undefined mode leaves the controller in its
                                 // boot state, and "nobody has spoken to me" is
                                 // the more useful of the two things to say.
+                                //
+                                // MODE_REFUSED when the frame asked for a mode
+                                // the rover never entered: TELEOP while C2 is
+                                // reported lost.
                                 CHECK_EQ(ctl.commandStatus(),
-                                         accepted ? CMD_STATUS_STOPPED
-                                                  : CMD_STATUS_NO_COMMAND);
+                                         !accepted        ? CMD_STATUS_NO_COMMAND
+                                         : ctl.modeRefused() ? CMD_STATUS_MODE_REFUSED
+                                                             : CMD_STATUS_STOPPED);
                                 stopped_count++;
                             } else {
                                 CHECK(!authorised);
@@ -1018,6 +1145,194 @@ static void a_refused_command_is_not_a_stop() {
     CHECK_EQ(d, 700); CHECK_EQ(s, 300);
 }
 
+// --- mode transitions (v0.7) ------------------------------------------------
+// The mode is the controller's state, and a frame only REQUESTS a change.
+// These use sendFrame() rather than sendControl(), because they are about
+// exactly what one frame is and is not allowed to change.
+
+static void autonomy_cannot_put_itself_in_charge() {
+    // The spec's "explicit C2 operator command" to enter AUTONOMOUS, enforced
+    // where it cannot be bypassed by a Jetson-side bug.
+    RoverController ctl = freshController();
+    CHECK(sendFrame(ctl, 600, 0, MODE_AUTONOMOUS, false, false, false,
+                    INDICATOR_OFF, false, SRC_AUTONOMY));
+    CHECK_EQ(ctl.activeMode(), MODE_SAFE);
+    CHECK(ctl.modeRefused());
+    CHECK_EQ(ctl.commandStatus(), CMD_STATUS_MODE_REFUSED);
+    CHECK_EQ(ctl.buildState().mode, MODE_SAFE);
+    int16_t d, s; ctl.commandedOutputs(d, s);
+    CHECK_EQ(d, 0); CHECK_EQ(s, 0);
+    // A refused transition is its own verdict, not a source mismatch.
+    CHECK(!(ctl.faultWord() & FAULT_CMD_SOURCE));
+    // And it is a valid frame from a live Jetson, so it feeds the watchdog.
+    CHECK(!ctl.watchdogTripped());
+}
+
+static void autonomy_cannot_take_over_from_the_operator() {
+    RoverController ctl = freshController();
+    sendFrame(ctl, 300, 0, MODE_TELEOP, false);
+    CHECK(sendFrame(ctl, 600, 0, MODE_AUTONOMOUS, false, false, false,
+                    INDICATOR_OFF, false, SRC_AUTONOMY));
+    CHECK_EQ(ctl.activeMode(), MODE_TELEOP);
+    CHECK_EQ(ctl.commandStatus(), CMD_STATUS_MODE_REFUSED);
+}
+
+static void a_refused_mode_change_does_not_drive_in_the_old_mode() {
+    // The trap this closes: autonomy asks for TELEOP while the rover is
+    // AUTONOMOUS. The change is refused, so the rover is still AUTONOMOUS, and
+    // the frame IS from autonomy -- but it was written for a different mode,
+    // and obeying it would act on a command its sender never meant for here.
+    RoverController ctl = freshController();
+    grantMode(ctl, MODE_AUTONOMOUS);
+    CHECK(sendFrame(ctl, 600, 0, MODE_TELEOP, false, false, false,
+                    INDICATOR_OFF, false, SRC_AUTONOMY));
+    CHECK_EQ(ctl.activeMode(), MODE_AUTONOMOUS);
+    CHECK(!ctl.commandAuthorized());
+    int16_t d, s; ctl.commandedOutputs(d, s);
+    CHECK_EQ(d, 0); CHECK_EQ(s, 0);
+    // Refused, not stopped: the next agreeing frame drives straight away.
+    CHECK(!ctl.effectiveStop());
+}
+
+static void the_operator_hands_over_and_autonomy_drives() {
+    // The whole handover: the operator grants AUTONOMOUS with a stopped
+    // frame, then the autonomy stack's frames drive.
+    RoverController ctl = freshController();
+    grantMode(ctl, MODE_AUTONOMOUS);
+    CHECK_EQ(ctl.activeMode(), MODE_AUTONOMOUS);
+    CHECK_EQ(ctl.commandStatus(), CMD_STATUS_STOPPED);
+    // The grant is the operator's frame in autonomy's mode, but it asks for
+    // nothing to move, so it is not a source mismatch and raises no alarm.
+    CHECK(!(ctl.faultWord() & FAULT_CMD_SOURCE));
+
+    CHECK(sendFrame(ctl, 600, 100, MODE_AUTONOMOUS, false));
+    CHECK_EQ(ctl.commandStatus(), CMD_STATUS_APPLIED);
+    int16_t d, s; ctl.commandedOutputs(d, s);
+    CHECK_EQ(d, 600); CHECK_EQ(s, 100);
+}
+
+static void the_operator_can_switch_between_the_motion_modes() {
+    // The spec lets TELEOP and AUTONOMOUS go to each other directly, as long
+    // as the operator is the one asking.
+    RoverController ctl = freshController();
+    sendFrame(ctl, 0, 0, MODE_TELEOP, false);
+    grantMode(ctl, MODE_AUTONOMOUS);
+    CHECK_EQ(ctl.activeMode(), MODE_AUTONOMOUS);
+    sendFrame(ctl, 0, 0, MODE_TELEOP, false);
+    CHECK_EQ(ctl.activeMode(), MODE_TELEOP);
+}
+
+static void either_source_can_stand_the_rover_down() {
+    // Anyone may make the rover safer. Same principle as the stop flag.
+    const uint8_t modes[] = {MODE_TELEOP, MODE_AUTONOMOUS};
+    for (uint8_t mode : modes) {
+        for (int src = 0; src <= 1; ++src) {
+            RoverController ctl = freshController();
+            sendControl(ctl, 500, 0, mode, false);
+            CHECK(sendFrame(ctl, 0, 0, MODE_SAFE, false, false, false,
+                            INDICATOR_OFF, false,
+                            src ? SRC_AUTONOMY : SRC_TELEOP));
+            CHECK_EQ(ctl.activeMode(), MODE_SAFE);
+        }
+    }
+}
+
+static void teleop_is_not_entered_while_c2_is_lost() {
+    // It would only fault on the same frame. Refusing keeps the rover where
+    // it was, which is a better answer to "the operator cannot reach me".
+    RoverController ctl = freshController();
+    sendFrame(ctl, 500, 0, MODE_TELEOP, false, false, false, INDICATOR_OFF,
+              /*c2_lost=*/true);
+    CHECK_EQ(ctl.activeMode(), MODE_SAFE);
+    CHECK_EQ(ctl.commandStatus(), CMD_STATUS_MODE_REFUSED);
+}
+
+static void a_refusal_is_not_reported_once_it_is_stale() {
+    RoverController ctl = freshController();
+    sendFrame(ctl, 0, 0, MODE_AUTONOMOUS, false, false, false, INDICATOR_OFF,
+              false, SRC_AUTONOMY);
+    CHECK(ctl.modeRefused());
+    advance(DEFAULT_WATCHDOG_TIMEOUT_MS);
+    CHECK(!ctl.modeRefused());
+    CHECK_EQ(ctl.commandStatus(), CMD_STATUS_STOPPED);
+}
+
+// --- critical hardware faults (v0.7) -----------------------------------------
+// updateFaults() is how the firmware tells the controller what the sensors
+// and the drive stage see. Which bits stop the rover is FAULT_CRITICAL_MASK.
+
+static void a_critical_fault_faults_a_moving_rover() {
+    const uint16_t critical[] = {FAULT_OVER_CURRENT, FAULT_ESTOP_ACTIVE};
+    for (uint16_t bit : critical) {
+        RoverController ctl = freshController();
+        sendControl(ctl, 500, 0, MODE_TELEOP, false);
+        ctl.updateFaults(bit, CTRL_HEALTH_OK);
+        CHECK_EQ(ctl.activeMode(), MODE_FAULT);
+        CHECK(ctl.effectiveStop());
+        CHECK_EQ(ctl.latchedFaults(), bit);
+
+        // The condition clears; the rover stays put until SAFE.
+        ctl.updateFaults(0, CTRL_HEALTH_OK);
+        CHECK_EQ(ctl.activeMode(), MODE_FAULT);
+        CHECK(ctl.faultWord() & bit);
+    }
+}
+
+static void a_drive_stage_fault_faults_a_moving_rover() {
+    RoverController ctl = freshController();
+    sendControl(ctl, 500, 0, MODE_AUTONOMOUS, false);
+    ctl.updateFaults(0, CTRL_HEALTH_FAULT);
+    CHECK_EQ(ctl.activeMode(), MODE_FAULT);
+}
+
+static void safe_is_refused_while_the_fault_is_still_there() {
+    // "Validate system checks": FAULT -> SAFE is an acknowledgement that the
+    // problem has been dealt with, and it has not been while it is present.
+    RoverController ctl = freshController();
+    sendControl(ctl, 500, 0, MODE_TELEOP, false);
+    ctl.updateFaults(FAULT_OVER_CURRENT, CTRL_HEALTH_OK);
+
+    CHECK(sendFrame(ctl, 0, 0, MODE_SAFE, false));
+    CHECK_EQ(ctl.activeMode(), MODE_FAULT);
+    CHECK_EQ(ctl.commandStatus(), CMD_STATUS_MODE_REFUSED);
+
+    ctl.updateFaults(0, CTRL_HEALTH_OK);
+    CHECK(sendFrame(ctl, 0, 0, MODE_SAFE, false));
+    CHECK_EQ(ctl.activeMode(), MODE_SAFE);
+}
+
+static void non_critical_faults_are_reported_but_do_not_stop_the_rover() {
+    // These are what the planned DEGRADED state is for: the rover can still
+    // finish its task or get home. Until then they are reported, not acted on.
+    const uint16_t minor[] = {FAULT_UNDERVOLTAGE, FAULT_ENCODER_FAULT,
+                              FAULT_FIRMWARE_FAULT};
+    for (uint16_t bit : minor) {
+        RoverController ctl = freshController();
+        sendControl(ctl, 500, 0, MODE_TELEOP, false);
+        ctl.updateFaults(bit, CTRL_HEALTH_DEGRADED);
+        CHECK_EQ(ctl.activeMode(), MODE_TELEOP);
+        int16_t d, s; ctl.commandedOutputs(d, s);
+        CHECK_EQ(d, 500);
+        CHECK(ctl.buildPower(0, 2400, bit).fault_status & bit);
+    }
+}
+
+static void a_critical_fault_in_safe_does_not_latch_but_blocks_driving() {
+    // SAFE is not moving, so nothing latches there. Asking to move while the
+    // fault is present enters the mode and faults on the same frame, which
+    // the operator sees as FAULT with the reason in the fault word.
+    RoverController ctl = freshController();
+    sendFrame(ctl, 0, 0, MODE_SAFE, false);
+    ctl.updateFaults(FAULT_OVER_CURRENT, CTRL_HEALTH_OK);
+    CHECK_EQ(ctl.activeMode(), MODE_SAFE);
+
+    sendFrame(ctl, 500, 0, MODE_TELEOP, false);
+    CHECK_EQ(ctl.activeMode(), MODE_FAULT);
+    int16_t d, s; ctl.commandedOutputs(d, s);
+    CHECK_EQ(d, 0);
+    CHECK(ctl.faultWord() & FAULT_OVER_CURRENT);
+}
+
 int main() {
     std::printf("test_controller\n");
     RUN_TEST(boots_stopped_and_safe);
@@ -1051,8 +1366,13 @@ int main() {
     RUN_TEST(a_stale_c2_bit_is_reported_as_unknown_not_as_ok_or_lost);
     RUN_TEST(state_echoes_the_mode_the_controller_believes_in);
     RUN_TEST(active_mode_follows_the_commanded_mode);
-    RUN_TEST(comm_timeout_is_a_fault_in_every_mode);
-    RUN_TEST(fault_clears_when_commands_resume);
+    RUN_TEST(comm_timeout_faults_a_moving_rover);
+    RUN_TEST(comm_timeout_in_safe_is_reported_but_is_not_a_fault);
+    RUN_TEST(fault_latches_until_safe_is_commanded);
+    RUN_TEST(fault_cannot_be_left_straight_into_motion);
+    RUN_TEST(a_timeout_latches_even_if_nobody_looked_in_between);
+    RUN_TEST(the_latched_reason_outlives_the_condition);
+    RUN_TEST(the_state_frame_reports_fault);
     RUN_TEST(c2_loss_faults_teleop_but_not_autonomy);
     RUN_TEST(a_pause_or_abort_is_not_a_fault);
     RUN_TEST(fault_cannot_be_commanded);
@@ -1088,5 +1408,18 @@ int main() {
     RUN_TEST(the_echo_reports_an_active_return_request);
     RUN_TEST(outputs_are_nonzero_only_when_permitted_and_authorised);
     RUN_TEST(a_refused_command_is_not_a_stop);
+    RUN_TEST(autonomy_cannot_put_itself_in_charge);
+    RUN_TEST(autonomy_cannot_take_over_from_the_operator);
+    RUN_TEST(a_refused_mode_change_does_not_drive_in_the_old_mode);
+    RUN_TEST(the_operator_hands_over_and_autonomy_drives);
+    RUN_TEST(the_operator_can_switch_between_the_motion_modes);
+    RUN_TEST(either_source_can_stand_the_rover_down);
+    RUN_TEST(teleop_is_not_entered_while_c2_is_lost);
+    RUN_TEST(a_refusal_is_not_reported_once_it_is_stale);
+    RUN_TEST(a_critical_fault_faults_a_moving_rover);
+    RUN_TEST(a_drive_stage_fault_faults_a_moving_rover);
+    RUN_TEST(safe_is_refused_while_the_fault_is_still_there);
+    RUN_TEST(non_critical_faults_are_reported_but_do_not_stop_the_rover);
+    RUN_TEST(a_critical_fault_in_safe_does_not_latch_but_blocks_driving);
     return testing::summary("test_controller");
 }

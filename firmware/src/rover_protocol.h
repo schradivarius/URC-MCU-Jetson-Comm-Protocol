@@ -164,6 +164,36 @@ enum : uint8_t {
 
 bool sourceOwnsMode(bool from_autonomy, uint8_t mode);
 
+// ---------------------------------------------------------------------------
+// Mode transitions (v0.7): may a frame from this producer move the controller
+// from `from` to `to`?
+//
+//                 to SAFE   to TELEOP       to AUTONOMOUS
+//   from SAFE     yes       operator only   operator only
+//   from TELEOP   yes       (no change)     operator only
+//   from AUTO     yes       operator only   (no change)
+//   from FAULT    yes       no              no
+//
+// Two rules make that table:
+//   1. ANYONE may make the rover safer. SAFE is always reachable, from either
+//      source, because whoever sees a problem must be able to stand it down.
+//      It is also the only way out of FAULT.
+//   2. Only the OPERATOR may grant motion. Entering TELEOP or AUTONOMOUS
+//      needs from_autonomy == false, so the autonomy stack can never put
+//      itself in charge -- the spec's "explicit C2 operator command".
+//
+// Asking for the mode you are already in is not a transition and is always
+// allowed; whether that frame may DRIVE is sourceOwnsMode()'s question, not
+// this one's. Undefined modes on either side answer false: fail closed.
+//
+// This is the TABLE only. RoverController adds the two conditions a table
+// cannot see -- a latched critical fault blocks FAULT -> SAFE, and TELEOP
+// cannot be entered while C2 is reported lost -- in RoverController::
+// requestMode().
+// ---------------------------------------------------------------------------
+
+bool transitionAllowed(uint8_t from, uint8_t to, bool from_autonomy);
+
 // Status-indicator states. The same enum is used for the Jetson's REQUEST
 // (CONTROL) and the controller's REPORT of what is actually displayed
 // (TELEM_STATE), so a mismatch between the two is directly visible.
@@ -206,6 +236,22 @@ enum : uint16_t {
     FAULT_CMD_SOURCE     = 0x0400,
 };
 
+// The faults serious enough to put a MOVING rover into FAULT (v0.7). Policy,
+// not wire format: none of these bits change meaning, this only says which
+// of them stop the rover rather than just being reported.
+//
+//   OVER_CURRENT  something is stalled or shorted; driving on burns hardware.
+//   ESTOP_ACTIVE  never set yet -- there is no e-stop input -- but when it is,
+//                 software must not keep commanding motion underneath it.
+//
+// Deliberately NOT here, because the rover can still finish a task or get
+// home with them, which is what the planned DEGRADED state is for:
+// UNDERVOLTAGE, ENCODER_FAULT, and every link-quality bit (SEQ_GAP,
+// CRC_ERROR, PROTOCOL_ERROR). FIRMWARE_FAULT is not here either: it is set
+// for the whole session after a watchdog reset, so making it critical would
+// leave the rover unable to leave FAULT without another reboot.
+static const uint16_t FAULT_CRITICAL_MASK = FAULT_OVER_CURRENT | FAULT_ESTOP_ACTIVE;
+
 // Link health, reported for each link independently.
 //
 // The Jetson link and the C2 link are SEPARATE and must never be collapsed:
@@ -236,6 +282,12 @@ enum : uint8_t {
 //
 //   NO_COMMAND    no valid CONTROL frame has ever arrived. ack_seq and the
 //                 echoed commands mean nothing yet.
+//   MODE_REFUSED  the last frame asked for a mode the controller is not in,
+//                 because transitionAllowed() said no or FAULT is latched
+//                 (v0.7). Its motion is refused: a sender that disagrees with
+//                 the controller about the mode does not get to drive. The
+//                 mode echo in TELEM_STATE says which mode it IS in. Not
+//                 reported once the watchdog has tripped -- that is STOPPED.
 //   STOPPED       a stop condition zeroed the outputs: the command watchdog,
 //                 the stop flag, a mode that does not permit motion, an
 //                 autonomy abort, or C2 loss in TELEOP. Which one it is, is
@@ -252,6 +304,7 @@ enum : uint8_t {
     CMD_STATUS_STOPPED      = 1,
     CMD_STATUS_WRONG_SOURCE = 2,
     CMD_STATUS_NO_COMMAND   = 3,
+    CMD_STATUS_MODE_REFUSED = 4,
     CMD_STATUS_MAX          = 7,   // 3 bits on the wire
 };
 
@@ -378,9 +431,10 @@ struct TelemetryPower {
 };
 
 struct TelemetryState {
-    uint8_t mode;              // MODE_* the controller believes it is in --
-                               // an ECHO, so the operator can confirm the
-                               // controller agrees with what was commanded
+    uint8_t mode;              // MODE_* the controller is actually in,
+                               // FAULT included (v0.7). Compare it with what
+                               // was commanded: a difference is a refused or
+                               // overridden mode change
     uint8_t jetson_link;       // LINK_*
     uint8_t c2_link;           // LINK_*, from the c2_lost bit the Jetson
                                // forwards; LINK_NOT_REPORTED when that bit is

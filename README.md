@@ -96,11 +96,11 @@ make test-host   # host side only — compiles the C++ core
 
 | Suite | Tests | Answers |
 |---|---:|---|
-| `tests/cpp/test_protocol.cpp` | 41 | Wire format, CRC-8, and every validation predicate |
-| `tests/cpp/test_controller.cpp` | 68 | **Does the rover stop when it should?** And: does it refuse a command from the wrong half of the stack? |
+| `tests/cpp/test_protocol.cpp` | 43 | Wire format, CRC-8, and every validation predicate, including the mode-transition table |
+| `tests/cpp/test_controller.cpp` | 86 | **Does the rover stop when it should — and stay stopped until someone says otherwise?** And: does it refuse a command, or a mode change, from the wrong half of the stack? |
 | `tests/cpp/test_drive.cpp` | 17 | Does a command become the right motor output — and never one it was told not to? |
 | `tests/host/test_config_sync.py` | 14 | Do the C++ and Python configs hold the same constants? |
-| `tests/host/test_golden_vectors.py` | 30 | Do C++ and Python agree byte-for-byte? |
+| `tests/host/test_golden_vectors.py` | 32 | Do C++ and Python agree byte-for-byte? |
 | `tests/host/test_integration.py` | 44 | Do both ends actually talk to each other? |
 | `tests/host/test_autonomy_mission.py` | 10 | Does an autonomy decision reach the drive stage — and would we notice if it stopped? |
 
@@ -132,6 +132,14 @@ implementation, rather than merely assumed to work:
 - `undefined_mode_does_not_permit_motion` — fails against the pre-fix
   `mode == MODE_DISABLED` check (that mode is `MODE_SAFE` now), which permitted full throttle on any
   undefined mode ([issue #4](https://github.com/schradivarius/URC-MCU-Jetson-Comm-Protocol/issues/4))
+- `autonomy_cannot_put_itself_in_charge` and
+  `a_refused_mode_change_does_not_drive_in_the_old_mode` — only the operator
+  may grant a motion mode, and a frame whose mode request was refused may not
+  drive in the mode the rover is actually in
+- `fault_latches_until_safe_is_commanded` and
+  `a_timeout_latches_even_if_nobody_looked_in_between` — a rover that faulted
+  does not drive off again when the link comes back, even if no code looked at
+  it between the trip and the next frame
 - `the_same_command_is_accepted_once_the_mode_matches` — one command, refused
   in `TELEOP` and applied in `AUTONOMOUS`, with nothing else changed: the Task
   4 claim that manual and autonomous commands do not get mixed up

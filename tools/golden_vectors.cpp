@@ -18,6 +18,7 @@
 //   INDICATOR|<value>|<known>
 //   RANGE|<value>|<valid>
 //   AUTHORITY|<from_autonomy>,<mode>|<owns>
+//   TRANSITION|<from>,<to>,<from_autonomy>|<allowed>
 //   CMDSTATUS|<status>,<decode>,<return>|<packed hex>
 //   <NAME>|<args>|<frame hex>            encoded frames
 
@@ -86,10 +87,25 @@ int main() {
         }
     }
 
+    // Mode transitions, exhaustive over every controller state the table
+    // knows plus one undefined value each side, for both sources. The host
+    // copy exists so the Jetson can predict a refusal before it reads one.
+    for (int from = 0; from <= MODE_FAULT + 1; ++from) {
+        for (int to = 0; to <= MODE_MAX + 1; ++to) {
+            for (int src = 0; src <= 1; ++src) {
+                std::printf("TRANSITION|%d,%d,%d|%d\n", from, to, src,
+                            transitionAllowed(static_cast<uint8_t>(from),
+                                              static_cast<uint8_t>(to),
+                                              src != 0) ? 1 : 0);
+            }
+        }
+    }
+
     // The command-status byte. Two 3-bit fields and a flag sharing one byte is
     // exactly the kind of packing that goes wrong on one side only.
     const uint8_t statuses[] = {CMD_STATUS_APPLIED, CMD_STATUS_STOPPED,
-                                CMD_STATUS_WRONG_SOURCE, CMD_STATUS_NO_COMMAND};
+                                CMD_STATUS_WRONG_SOURCE, CMD_STATUS_NO_COMMAND,
+                                CMD_STATUS_MODE_REFUSED};
     const DecodeResult decodes[] = {DECODE_OK, DECODE_BAD_DLC, DECODE_BAD_CRC,
                                     DECODE_BAD_MODE, DECODE_BAD_FLAGS,
                                     DECODE_BAD_INDICATOR, DECODE_BAD_RANGE};

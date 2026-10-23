@@ -6,7 +6,7 @@ drives the real compiled controller through the real Task 3 protocol. This runs
 it headlessly so CI fails if the loop ever stops closing.
 
 It also runs the NEGATIVE CONTROLS. A harness that cannot fail is not evidence,
-and "14 steps passed" is worth nothing until something proves a step would have
+and "18 steps passed" is worth nothing until something proves a step would have
 failed had the firmware misbehaved. Two things are checked for that:
 
   * a step with an impossible expectation really does fail, and stops the run;
@@ -79,13 +79,13 @@ class TestTheMissionRuns(MissionFixture):
             self.assertIn(field, snapshot, "the feedback loop is missing %r" % field)
 
     def test_the_mode_separation_steps_disagree_about_the_same_command(self):
-        # Steps 8 and 9 send an IDENTICAL drive command and differ only in the
+        # Steps 11 and 13 send an IDENTICAL drive command and differ only in the
         # mode. If they ever report the same thing, the demonstration has
         # quietly stopped demonstrating anything.
         report = mission.run_mission(self.link, verbose=False)
         self.assertTrue(report.ok)
-        refused = report.by_name("8. TELEOP refuses an autonomy command")
-        accepted = report.by_name("9. AUTONOMOUS accepts the same command")
+        refused = report.by_name("11. TELEOP refuses an autonomy command")
+        accepted = report.by_name("13. AUTONOMOUS accepts the same command")
         self.assertIsNotNone(refused)
         self.assertIsNotNone(accepted)
         self.assertEqual(refused.snapshot["drive_applied"], 0)

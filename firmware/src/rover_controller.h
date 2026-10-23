@@ -41,20 +41,54 @@ public:
     // that fully validated (right id, right DLC, good CRC, known mode, clean
     // flags, drive/steer within CMD_MIN..CMD_MAX). Anything else is ignored
     // and -- critically -- does NOT refresh the command watchdog.
+    //
+    // A validated frame is a REQUEST for a mode, not an order (v0.7): see
+    // requestMode(). Returning true means "the frame was good", not "the mode
+    // changed" -- modeRefused() answers that.
     bool ingestFrame(uint32_t can_id, const uint8_t* buf, uint8_t len);
+
+    // Hand the controller this cycle's hardware fault bits (FAULT_*) and the
+    // drive stage's CTRL_HEALTH_*. Call it EVERY loop, not only when
+    // telemetry is due: a critical fault in a motion mode latches FAULT here,
+    // and a fault seen once every 50 ms is a rover driving on it for 50 ms.
+    //
+    // The controller still knows nothing about sensors -- it is told, the same
+    // way buildPower() is told -- so this stays testable with no hardware.
+    void updateFaults(uint16_t hardware_faults, uint8_t controller_health);
 
     // --- safety ----------------------------------------------------------
 
     uint16_t cmdAgeMs() const;
     bool watchdogTripped() const;
 
-    // The mode the rover is actually EXECUTING, which is not always the one it
-    // was commanded: MODE_FAULT when a link that mode needs is gone -- the
-    // Jetson (comm timeout, any mode, including before the first frame) or the
-    // operator (C2 lost while in TELEOP). Otherwise the commanded mode.
-    // Recomputed on every call, not latched: once the link is back, the rover
-    // is in whatever mode was last commanded.
+    // The mode the rover is actually EXECUTING. Since v0.7 this is the
+    // controller's own state, which a frame can only change through
+    // transitionAllowed() -- so it is no longer simply the last commanded mode.
+    //
+    // MODE_FAULT once a TELEOP or AUTONOMOUS rover loses a link that mode
+    // needs (the Jetson, in either; C2, in TELEOP) or sees a critical fault
+    // (FAULT_CRITICAL_MASK, or the drive stage reporting CTRL_HEALTH_FAULT).
+    // FAULT LATCHES: getting the link back does not resume driving. The only
+    // way out is a CONTROL frame asking for SAFE, and that is refused while a
+    // critical hardware fault is still present.
+    //
+    // A rover that was already in SAFE does not fault on a silent Jetson --
+    // it is not moving and was not going to -- and that includes boot. The
+    // comm timeout is still reported in the fault word and the link state.
     uint8_t activeMode() const;
+
+    // The last accepted frame asked for a mode the controller is not in: the
+    // transition was refused, or FAULT is latched. That frame's motion is
+    // refused too. False before the first frame and once it has gone stale.
+    bool modeRefused() const;
+
+    // The fault bits that put the rover into FAULT, kept until it leaves. They
+    // are OR-ed into faultWord(), so the reason stays visible after the
+    // condition itself has cleared -- otherwise a rover latched by a comm
+    // timeout would sit in FAULT reporting no fault at all once the link came
+    // back. Zero when not in FAULT, or when the drive stage's health was the
+    // cause (that one is visible in TELEM_STATE.controller_health instead).
+    uint16_t latchedFaults() const { return latched_faults_; }
 
     // THE fail-safe decision. An explicit stop flag, an active mode that does
     // not positively permit motion (which covers SAFE, a comm timeout and a
@@ -83,6 +117,12 @@ public:
     // mode? The autonomy stack owns AUTONOMOUS, the operator owns TELEOP, and
     // SAFE has no owner because nothing may move in it.
     //
+    // Since v0.7 the frame must also AGREE with the controller about which
+    // mode that is: a frame whose mode request was refused has no authority,
+    // whoever sent it. Otherwise an autonomy frame asking for TELEOP while the
+    // rover is AUTONOMOUS would be refused the mode change and then obeyed
+    // anyway, by a controller that is still autonomous.
+    //
     // THIS IS A MUX, AND IT LIVES ON THE MCU ON PURPOSE. The Jetson could
     // just as easily refuse to emit an autonomy command while teleoperated --
     // and it should -- but then a single Jetson-side bug, a stale queue or a
@@ -104,7 +144,8 @@ public:
 
     // CMD_STATUS_*: the single most important reason the drive stage is
     // seeing what it is seeing. See the enum in rover_protocol.h for the
-    // precedence, which is NO_COMMAND, then STOPPED, then WRONG_SOURCE.
+    // precedence, which is NO_COMMAND, then MODE_REFUSED, then STOPPED, then
+    // WRONG_SOURCE.
     uint8_t commandStatus() const;
 
     // The controller is holding a return-to-base request.
@@ -211,9 +252,31 @@ private:
     uint32_t elapsedSinceControl() const;
     bool recentlyDegraded() const;
 
+    // --- the mode state machine (v0.7) -----------------------------------
+
+    // Decide whether the frame just accepted may move mode_ to the mode it
+    // asks for. transitionAllowed() is the table; this adds what a table
+    // cannot see (a critical fault still present, C2 lost).
+    void requestMode(const ControlMsg& msg);
+
+    // The FAULT_* bits that would put a moving rover into FAULT right now.
+    uint16_t faultCauses() const;
+    // A critical hardware fault is present at this moment, whatever the mode.
+    bool hardwareFaultActive() const;
+    // True when mode_ permits motion and something says it must not.
+    bool faultConditionPresent() const;
+    // Make FAULT stick: if faultConditionPresent(), enter MODE_FAULT and
+    // remember why. Called on every event that can change the answer.
+    void latchIfFaulted();
+
     MillisFn now_ms_;
     uint32_t watchdog_timeout_ms_;
     uint32_t telemetry_period_ms_;
+
+    uint8_t    mode_;            // the state; MODE_* -- see activeMode()
+    uint16_t   latched_faults_;  // why we are in FAULT; 0 outside it
+    uint16_t   hw_faults_;       // from updateFaults(), this cycle
+    uint8_t    hw_health_;       // CTRL_HEALTH_*, from updateFaults()
 
     ControlMsg last_control_;
     bool       have_control_;

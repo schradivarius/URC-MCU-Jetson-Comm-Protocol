@@ -219,6 +219,12 @@ def build_mission():
 
     auto = dict(mode=rp.MODE_AUTONOMOUS, c2_lost=False, from_autonomy=True)
     teleop = dict(mode=rp.MODE_TELEOP, c2_lost=False, from_autonomy=False)
+    # The operator granting a mode (v0.7): a stopped frame from the operator
+    # asking for it. Only the operator may put the rover in a motion mode, so
+    # this is how C2's "go autonomous" reaches the controller.
+    grant_auto = dict(drive_cmd=0, steer_cmd=0, stop=True,
+                      mode=rp.MODE_AUTONOMOUS, c2_lost=False, from_autonomy=False)
+    grant_teleop = dict(drive_cmd=0, steer_cmd=0, stop=True, **teleop)
 
     return [
         # --- the autonomous command sequence from the task ------------------
@@ -231,28 +237,44 @@ def build_mission():
                            indicator_state=rp.INDICATOR_OFF),
                     fault_clear(rp.FAULT_CMD_SOURCE, "CMD_SOURCE"))),
 
-        Step("2. receive AUTONOMOUS",
-             dict(drive_cmd=0, steer_cmd=0, **auto),
+        Step("2. autonomy cannot put itself in charge",
+             dict(drive_cmd=CRUISE, steer_cmd=0, **auto),
+             # The spec's "explicit C2 operator command" to enter AUTONOMOUS.
+             # The request is refused and the rover stays in SAFE.
+             expect(mode=rp.MODE_SAFE,
+                    cmd_status=rp.CMD_STATUS_MODE_REFUSED,
+                    drive_applied=0)),
+
+        Step("3. operator grants AUTONOMOUS",
+             grant_auto,
              all_of(expect(mode=rp.MODE_AUTONOMOUS,
-                           cmd_status=rp.CMD_STATUS_APPLIED,
+                           cmd_status=rp.CMD_STATUS_STOPPED,
                            # Red, per rule 1.e.ii, the moment the rover is
                            # autonomous -- not once it starts moving.
                            indicator_state=rp.INDICATOR_AUTONOMOUS),
+                    # The operator's frame in autonomy's mode, but asking for
+                    # nothing to move: not a source mismatch.
+                    fault_clear(rp.FAULT_CMD_SOURCE, "CMD_SOURCE"))),
+
+        Step("4. autonomy takes over",
+             dict(drive_cmd=0, steer_cmd=0, **auto),
+             all_of(expect(mode=rp.MODE_AUTONOMOUS,
+                           cmd_status=rp.CMD_STATUS_APPLIED),
                     remember_enc)),
 
-        Step("3. command forward movement",
+        Step("5. command forward movement",
              dict(drive_cmd=CRUISE, steer_cmd=0, **auto),
              all_of(expect(cmd_status=rp.CMD_STATUS_APPLIED,
                            drive_applied=CRUISE, steer_applied=0),
                     moving(enc_at_launch))),
 
-        Step("4. change steering",
+        Step("6. change steering",
              dict(drive_cmd=CRUISE, steer_cmd=TURN, **auto),
              all_of(expect(cmd_status=rp.CMD_STATUS_APPLIED,
                            drive_applied=CRUISE, steer_applied=TURN),
                     steer_feedback_within(TURN, 25))),
 
-        Step("5. stop",
+        Step("7. stop",
              dict(drive_cmd=CRUISE, steer_cmd=TURN, stop=True, **auto),
              # Full throttle still commanded, and nothing applied. Note the
              # light stays red: a paused autonomous rover is still under
@@ -261,7 +283,7 @@ def build_mission():
                     drive_applied=0, steer_applied=0,
                     indicator_state=rp.INDICATOR_AUTONOMOUS)),
 
-        Step("6. report TARGET_REACHED",
+        Step("8. report TARGET_REACHED",
              dict(drive_cmd=0, steer_cmd=0, stop=True,
                   indicator_request=rp.INDICATOR_ARRIVED, **auto),
              # Flashing green. Rule 1.e.xvii scores a target only on stopping
@@ -271,7 +293,7 @@ def build_mission():
                     cmd_status=rp.CMD_STATUS_STOPPED,
                     drive_applied=0)),
 
-        Step("7. request autonomous return",
+        Step("9. request autonomous return",
              dict(drive_cmd=0, steer_cmd=0, return_request=True,
                   indicator_request=rp.INDICATOR_ARRIVED, **auto),
              # Acknowledged, not obeyed: driving back is route planning, which
@@ -280,7 +302,11 @@ def build_mission():
              expect(return_active=True, mode=rp.MODE_AUTONOMOUS)),
 
         # --- manual and autonomous commands must not get mixed up -----------
-        Step("8. TELEOP refuses an autonomy command",
+        Step("10. operator takes back TELEOP",
+             grant_teleop,
+             expect(mode=rp.MODE_TELEOP, cmd_status=rp.CMD_STATUS_STOPPED)),
+
+        Step("11. TELEOP refuses an autonomy command",
              dict(drive_cmd=FAST, steer_cmd=0, mode=rp.MODE_TELEOP,
                   c2_lost=False, from_autonomy=True),
              all_of(expect(mode=rp.MODE_TELEOP,
@@ -291,24 +317,28 @@ def build_mission():
                     # the stack. Reporting it as a stop would hide the cause.
                     fault_set(rp.FAULT_CMD_SOURCE, "CMD_SOURCE"))),
 
-        Step("9. AUTONOMOUS accepts the same command",
+        Step("12. operator grants AUTONOMOUS again",
+             grant_auto,
+             expect(mode=rp.MODE_AUTONOMOUS, cmd_status=rp.CMD_STATUS_STOPPED)),
+
+        Step("13. AUTONOMOUS accepts the same command",
              dict(drive_cmd=FAST, steer_cmd=0, **auto),
-             # Identical drive_cmd to step 8. Only the mode changed.
+             # Identical drive_cmd to step 11. Only the mode changed.
              all_of(expect(mode=rp.MODE_AUTONOMOUS,
                            cmd_status=rp.CMD_STATUS_APPLIED,
                            drive_applied=FAST),
                     fault_clear(rp.FAULT_CMD_SOURCE, "CMD_SOURCE"))),
 
-        Step("10. AUTONOMOUS refuses a teleop command",
+        Step("14. AUTONOMOUS refuses a teleop command",
              dict(drive_cmd=FAST, steer_cmd=0, mode=rp.MODE_AUTONOMOUS,
                   c2_lost=False, from_autonomy=False),
-             # The mirror of step 8, so the rule is symmetric rather than a
+             # The mirror of step 11, so the rule is symmetric rather than a
              # special case aimed at autonomy.
              all_of(expect(cmd_status=rp.CMD_STATUS_WRONG_SOURCE,
                            drive_applied=0),
                     fault_set(rp.FAULT_CMD_SOURCE, "CMD_SOURCE"))),
 
-        Step("11. an arrival claim needs authority too",
+        Step("15. an arrival claim needs authority too",
              dict(drive_cmd=0, steer_cmd=0, mode=rp.MODE_AUTONOMOUS,
                   c2_lost=False, from_autonomy=False,
                   indicator_request=rp.INDICATOR_ARRIVED),
@@ -317,19 +347,20 @@ def build_mission():
              # it on a rover that has arrived nowhere.
              expect(indicator_state=rp.INDICATOR_AUTONOMOUS)),
 
-        Step("12. stop overrides an authorised command",
+        Step("16. stop overrides an authorised command",
              dict(drive_cmd=FAST, steer_cmd=TURN, stop=True, **auto),
              expect(cmd_status=rp.CMD_STATUS_STOPPED, drive_applied=0)),
 
-        Step("13. abort overrides an authorised command",
+        Step("17. abort overrides an authorised command",
              dict(drive_cmd=FAST, steer_cmd=TURN, autonomy_abort=True, **auto),
              expect(cmd_status=rp.CMD_STATUS_STOPPED, drive_applied=0)),
 
-        Step("14. teleop drives again afterwards",
+        Step("18. teleop drives again afterwards",
              dict(drive_cmd=CRUISE, steer_cmd=0, **teleop),
              # The last word: none of the above left the rover latched into a
              # refusing state. A safety gate that cannot be left is a rover
-             # that has to be power-cycled at a competition.
+             # that has to be power-cycled at a competition. The operator may
+             # go straight from AUTONOMOUS to TELEOP, so no grant is needed.
              all_of(expect(mode=rp.MODE_TELEOP,
                            cmd_status=rp.CMD_STATUS_APPLIED,
                            drive_applied=CRUISE,

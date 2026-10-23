@@ -362,6 +362,11 @@ void loop() {
     const DriveOutputs& out = drive_stage.update(drive, steer, !stopped);
 
     SensorReading s = readSensors(out);
+    // Every loop, not only when telemetry is due: this is where a critical
+    // fault in a moving rover latches FAULT. It takes effect on the next pass
+    // through loop(), which on a Teensy is microseconds away -- readSensors()
+    // needs this pass's drive outputs, so it cannot run any earlier.
+    ctl->updateFaults(s.fault_bits, s.controller_health);
     // Not sensor readings, so they are filled in here rather than inside
     // readSensors(): they are what the controller AUTHORISED, which is what
     // the acknowledgement frame is about.
