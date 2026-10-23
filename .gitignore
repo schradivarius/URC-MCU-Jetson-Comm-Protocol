@@ -23,3 +23,5 @@ htmlcov/
 *.uf2
 .mpy_cache/
 tests/cpp/build/
+/.pio/libdeps/teensy41/FlexCAN_T4
+/.pio

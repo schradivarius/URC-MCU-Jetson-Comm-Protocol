@@ -207,6 +207,14 @@ public:
     // DECODE_OK if it was accepted.
     DecodeResult lastDecodeResult() const { return last_decode_; }
 
+    RoverMode getCurrentMode() const { return current_mode_; }
+    CommandSource getActiveSource() const { return active_source_; }
+    int16_t getCommandedDrive() const { return commanded_drive_; }
+    int16_t getMeasuredDrive() const { return measured_drive_; }
+    int16_t getCommandedSteer() const { return commanded_steering_; } 
+    int16_t getMeasuredSteer() const { return measured_steering_; } 
+    void enforceCommandAuthority(CommandSource source, int16_t drive, int16_t steer);
+
 private:
     uint32_t elapsedSinceControl() const;
     bool recentlyDegraded() const;
@@ -236,6 +244,14 @@ private:
     uint32_t   seq_gaps_seen_;
     uint32_t   crc_errors_seen_;
     uint32_t   frames_lost_estimate_;
+
+    RoverMode current_mode_;
+    CommandSource active_source_;
+
+    int16_t commanded_drive_;
+    int16_t measured_drive_; 
+    int16_t commanded_steering_;
+    int16_t measured_steering_;
 };
 
 }  // namespace rover
