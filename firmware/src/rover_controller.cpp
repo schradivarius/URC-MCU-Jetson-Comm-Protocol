@@ -1,4 +1,5 @@
 #include "rover_controller.h"
+#include <cstdint>
 
 namespace rover {
 
@@ -24,7 +25,13 @@ RoverController::RoverController(MillisFn now_ms,
       frames_ignored_(0),
       seq_gaps_seen_(0),
       crc_errors_seen_(0),
-      frames_lost_estimate_(0) {
+      frames_lost_estimate_(0),
+      current_mode_(RoverMode::SAFE),
+      active_source_(CommandSource::NONE),
+      commanded_drive_(0),
+      measured_drive_(0),
+      commanded_steering_(0),
+      measured_steering_(0) {
     // Boot state is the safest available: stopped, disabled, no command ever
     // received -- so cmdAgeMs() reads CMD_AGE_UNKNOWN, the watchdog is tripped
     // from the first cycle, and the rover cannot move until the Jetson asks.
@@ -101,7 +108,8 @@ bool RoverController::ingestFrame(uint32_t can_id, const uint8_t* buf, uint8_t l
     have_control_    = true;
     last_control_ms_ = now_ms_();
     control_frames_accepted_++;
-    return true;
+    
+     return true;
 }
 
 // Unsigned subtraction, computed modulo 2^32, so this stays correct when
@@ -342,5 +350,53 @@ TelemetryCmdEcho RoverController::buildCmdEcho(int16_t drive_applied,
     m.status  = packCmdStatus(commandStatus(), last_decode_, returnRequestActive());
     return m;
 }
+
+void RoverController::enforceCommandAuthority(CommandSource source, int16_t drive, int16_t steer) {
+    bool authorized = false;
+
+    uint8_t active_m = activeMode();  
+    if (active_m == MODE_SAFE) { 
+        current_mode_ = RoverMode::SAFE; 
+    } else if (active_m == MODE_TELEOP) {
+        current_mode_ = RoverMode::TELEOP;
+    }
+    else if (active_m == MODE_AUTONOMOUS) { 
+        current_mode_ = RoverMode::AUTONOMOUS;
+    } else { 
+        current_mode_ = RoverMode::SAFE;
+    }
+
+    if(effectiveStop()) {
+        commanded_drive_ = 0;
+        commanded_steering_ = 0;
+        active_source_ = CommandSource::EMERGENCY_SOURCE;
+        return;
+    }
+    
+    switch(current_mode_) {
+        case RoverMode::SAFE:
+            authorized = false;
+            break;
+        
+        case RoverMode::TELEOP:
+            if (source == CommandSource::TELEOP_SOURCE) authorized = true;
+            break;
+
+        case RoverMode::AUTONOMOUS:
+            if (source == CommandSource::AUTONOMY_SOURCE) authorized = true;
+            break;
+    }
+
+    if(authorized){
+        commanded_drive_ = drive;
+        commanded_steering_ = steer; 
+        active_source_ = source;
+    } else {
+        commanded_drive_ = 0;
+        commanded_steering_ = 0;
+    }
+
+}
+
 
 }  // namespace rover
