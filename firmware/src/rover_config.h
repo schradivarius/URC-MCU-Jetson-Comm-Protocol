@@ -78,10 +78,10 @@ enum : uint8_t {
 // controller enters FAULT on its own (RoverController::activeMode()) and a
 // CONTROL frame carrying it is rejected.
 enum : uint8_t {
-    MODE_SAFE       = 0,  // stopped on purpose
+    MODE_SAFE       = 0,  // stopped on purpose; the ONLY way out of FAULT
     MODE_TELEOP     = 1,  // an operator is driving
     MODE_AUTONOMOUS = 2,  // the Jetson is driving
-    MODE_FAULT      = 3,  // stopped because a link the mode needs is gone
+    MODE_FAULT      = 3,  // latch stopped
 };
 static const uint8_t MODE_MAX = MODE_AUTONOMOUS;   // highest COMMANDABLE mode
 

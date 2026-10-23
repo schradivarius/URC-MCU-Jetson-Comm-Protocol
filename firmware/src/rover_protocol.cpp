@@ -135,6 +135,18 @@ bool sourceOwnsMode(bool from_autonomy, uint8_t mode) {
     return from_autonomy == (mode == MODE_AUTONOMOUS);
 }
 
+namespace {
+    enum Rule : uint8_t {DENY, ANYONE, OPERATOR};
+
+    const Rule TRANSITIONS[MODE_FAULT + 1][MODE_MAX + 1] = {
+        //             {TO SAFE,  TO TELEOP, TO AUTONOMOUS}
+        /*SAFE*/       {ANYONE,   OPERATOR,  OPERATOR},
+        /*TELEOP*/     {ANYONE,   ANYONE,    OPERATOR},
+        /*AUTONOMOUS*/ {ANYONE,   OPERATOR,  ANYONE},
+        /*FAULT*/      {ANYONE,   DENY,      DENY},
+    };
+} // NAMESPACE
+
 bool isValidCommand(int16_t value) {
     return value >= CMD_MIN && value <= CMD_MAX;
 }
@@ -355,6 +367,7 @@ const char* cmdStatusName(uint8_t status) {
         case CMD_STATUS_STOPPED:      return "STOPPED";
         case CMD_STATUS_WRONG_SOURCE: return "WRONG_SOURCE";
         case CMD_STATUS_NO_COMMAND:   return "NO_COMMAND";
+        case CMD_STATUS_MODE_REFUSED: return "MODE_REFUSED";
     }
     return "UNKNOWN";
 }

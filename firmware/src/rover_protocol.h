@@ -163,6 +163,7 @@ enum : uint8_t {
 // ---------------------------------------------------------------------------
 
 bool sourceOwnsMode(bool from_autonomy, uint8_t mode);
+bool transitionAllowed(uint8_t from, uint8_t to, bool from_autonomy);
 
 // Status-indicator states. The same enum is used for the Jetson's REQUEST
 // (CONTROL) and the controller's REPORT of what is actually displayed
@@ -205,7 +206,7 @@ enum : uint16_t {
     // stack. Self-clearing: the next authorised frame drops it.
     FAULT_CMD_SOURCE     = 0x0400,
 };
-
+static const uint16_t FAULT_CRITICAL_MASK = FAULT_OVER_CURRENT | FAULT_ESTOP_ACTIVE;
 // Link health, reported for each link independently.
 //
 // The Jetson link and the C2 link are SEPARATE and must never be collapsed:
@@ -253,6 +254,7 @@ enum : uint8_t {
     CMD_STATUS_WRONG_SOURCE = 2,
     CMD_STATUS_NO_COMMAND   = 3,
     CMD_STATUS_MAX          = 7,   // 3 bits on the wire
+    CMD_STATUS_MODE_REFUSED = 4,
 };
 
 // Command age. Two distinct reserved values, because "you have never spoken to
