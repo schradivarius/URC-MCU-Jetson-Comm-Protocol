@@ -1,0 +1,9 @@
+//rover_encoder.h
+
+#include <stdint.h>
+#include "rover_protocol.h"
+
+namespace rover {
+
+  //Placeholder
+  static const int32_
