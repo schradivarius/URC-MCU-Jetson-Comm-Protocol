@@ -104,6 +104,8 @@ FAULT_NAMES = [
     (FAULT_CMD_SOURCE, "CMD_SOURCE"),
 ]
 
+FAULT_CRITICAL_MASK = FAULT_OVER_CURRENT | FAULT_ESTOP_ACTIVE
+
 # --- link health. Jetson and C2 are SEPARATE and never collapsed. ---
 LINK_OK           = 0
 LINK_DEGRADED     = 1
@@ -128,11 +130,13 @@ CMD_STATUS_APPLIED      = 0
 CMD_STATUS_STOPPED      = 1
 CMD_STATUS_WRONG_SOURCE = 2
 CMD_STATUS_NO_COMMAND   = 3
+CMD_STATUS_MODE_REFUSED = 4
 CMD_STATUS_MAX          = 7
 CMD_STATUS_NAMES = {CMD_STATUS_APPLIED: "APPLIED",
                     CMD_STATUS_STOPPED: "STOPPED",
                     CMD_STATUS_WRONG_SOURCE: "WRONG_SOURCE",
-                    CMD_STATUS_NO_COMMAND: "NO_COMMAND"}
+                    CMD_STATUS_NO_COMMAND: "NO_COMMAND",
+                    CMD_STATUS_MODE_REFUSED: "MODE_REFUSED"}
 
 # --- TelemetryCmdEcho.status packing ---
 CMD_ECHO_STATUS_MASK   = 0x07
@@ -216,6 +220,22 @@ def source_owns_mode(from_autonomy, mode):
         return True
     return bool(from_autonomy) == (mode == MODE_AUTONOMOUS)
 
+_DENY, _ANYONE, _OPERATOR = range(3)
+_TRANSITIONS = {
+    #                to SAFE   to TELEOP  to AUTONOMOUS
+    MODE_SAFE:       (_ANYONE, _OPERATOR, _OPERATOR),
+    MODE_TELEOP:     (_ANYONE, _ANYONE,   _OPERATOR),
+    MODE_AUTONOMOUS: (_ANYONE, _OPERATOR, _ANYONE),
+    MODE_FAULT:      (_ANYONE, _DENY,     _DENY),
+}
+
+def transition_allowed(from_mode, to_mode, from_autonomy):
+    if from_mode not in _TRANSITIONS or not is_commandable_mode(to_mode):
+        return False
+    rule = _TRANSITIONS[from_mode][to_mode]
+    if rule == _OPERATOR:
+        return not from_autonomy
+    return rule == _ANYONE
 
 def is_valid_command(value):
     """Is this drive/steer value inside CMD_MIN..CMD_MAX (+/-100.0%)?

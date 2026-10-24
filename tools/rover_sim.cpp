@@ -125,6 +125,14 @@ int main(int argc, char** argv) {
         // Fake pack voltage: 24.00 V nominal, sagging a little under load.
         const int16_t voltage_cv = static_cast<int16_t>(2400 - effort_mag / 40);
 
+        // The same thresholds and the same every-cycle call as
+        // rover_firmware.cpp, so a critical fault latches FAULT here exactly
+        // as it would on the rover.
+        uint16_t hw_faults = 0;
+        if (current_ca > OVER_CURRENT_CA) hw_faults |= FAULT_OVER_CURRENT;
+        if (voltage_cv < UNDERVOLTAGE_CV) hw_faults |= FAULT_UNDERVOLTAGE;
+        ctl.updateFaults(hw_faults, drv.health());
+
         if (ctl.telemetryDue()) {
             const uint8_t seq = ctl.telemetrySeq();   // one seq for all four
             uint8_t buf[8];
@@ -135,7 +143,7 @@ int main(int argc, char** argv) {
             TelemetryDriveR dr = ctl.buildDriveR(enc_right);
             emitFrame(CAN_ID_TELEM_DRIVE_R, buf, encodeTelemetryDriveR(dr, seq, buf));
 
-            TelemetryPower pw = ctl.buildPower(current_ca, voltage_cv);
+            TelemetryPower pw = ctl.buildPower(current_ca, voltage_cv, hw_faults);
             emitFrame(CAN_ID_TELEM_POWER, buf, encodeTelemetryPower(pw, seq, buf));
 
             // controller_health now comes from the drive stage, which is the

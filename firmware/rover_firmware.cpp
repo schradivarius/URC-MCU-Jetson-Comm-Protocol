@@ -362,6 +362,7 @@ void loop() {
     const DriveOutputs& out = drive_stage.update(drive, steer, !stopped);
 
     SensorReading s = readSensors(out);
+    ctl->updateFaults(s.fault_bits, s.controller_health);
     // Not sensor readings, so they are filled in here rather than inside
     // readSensors(): they are what the controller AUTHORISED, which is what
     // the acknowledgement frame is about.

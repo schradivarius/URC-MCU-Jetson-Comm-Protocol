@@ -23,7 +23,7 @@ namespace rover {
 // wire yet; DLC and the application-layer CRC are the only runtime mismatch
 // signals. v0.5 is the first revision with the CRC and sequence number; v0.6
 // adds the command-source bit and the TELEM_CMD_ECHO acknowledgement frame.
-static const uint8_t PROTOCOL_VERSION = 6;
+static const uint8_t PROTOCOL_VERSION = 7;
 
 // --- Link ------------------------------------------------------------------
 static const uint32_t CAN_BITRATE_HZ = 500000;   // 500 kbps; every node must match

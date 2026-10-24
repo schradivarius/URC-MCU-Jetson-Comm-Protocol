@@ -83,7 +83,14 @@ def main():
         phase(jl, t0, 0.8, "B: link cut -- Jetson stops sending (800ms > 300ms watchdog)",
               send=False)
 
-        phase(jl, t0, 0.8, "B: link restored",
+        phase(jl, t0, 0.5, "B: link restored -- FAULT is latched, nothing moves",
+              drive_cmd=300, steer_cmd=100, mode=rp.MODE_TELEOP, c2_lost=False,
+              indicator_request=rp.INDICATOR_TELEOP)
+
+        phase(jl, t0, 0.3, "B: operator commands SAFE -- the only way out of FAULT",
+              drive_cmd=0, steer_cmd=0, mode=rp.MODE_SAFE, c2_lost=False)
+
+        phase(jl, t0, 0.5, "B: operator grants TELEOP again",
               drive_cmd=300, steer_cmd=100, mode=rp.MODE_TELEOP, c2_lost=False,
               indicator_request=rp.INDICATOR_TELEOP)
 
@@ -91,23 +98,30 @@ def main():
               drive_cmd=1000, steer_cmd=500, mode=rp.MODE_TELEOP, c2_lost=False,
               stop=True)
 
+        phase(jl, t0, 0.2, "D: operator grants AUTONOMOUS",
+              drive_cmd=0, steer_cmd=0, mode=rp.MODE_AUTONOMOUS, c2_lost=False,
+              stop=True, from_autonomy=False)
+
         phase(jl, t0, 0.5, "D: autonomy abort while AUTONOMOUS",
               drive_cmd=800, steer_cmd=0, mode=rp.MODE_AUTONOMOUS, c2_lost=False,
               autonomy_abort=True, indicator_request=rp.INDICATOR_AUTONOMOUS,
               from_autonomy=True)
 
-        # The two link failures are NOT equivalent, and these two phases are
-        # the demonstration of it. C2 loss with a healthy Jetson is expected on
-        # the autonomy course, where line of sight to the base station drops
-        # while onboard autonomy keeps running.
         phase(jl, t0, 0.5, "D2: C2 lost while AUTONOMOUS -- keeps driving, fault raised",
               drive_cmd=800, steer_cmd=0, mode=rp.MODE_AUTONOMOUS, c2_lost=True,
               indicator_request=rp.INDICATOR_AUTONOMOUS, from_autonomy=True)
 
-        phase(jl, t0, 0.5, "D3: C2 lost while TELEOP -- stops, nobody can reach it",
-              drive_cmd=800, steer_cmd=0, mode=rp.MODE_TELEOP, c2_lost=True,
+        # The two link failures are NOT equivalent, and these two phases are
+        # the demonstration of it. C2 loss with a healthy Jetson is expected on
+        # the autonomy course, where line of sight to the base station drops
+        # while onboard autonomy keeps running.
+        phase(jl, t0, 0.3, "D3: operator takes back TELEOP",
+              drive_cmd=800, steer_cmd=0, mode=rp.MODE_TELEOP, c2_lost=False,
               indicator_request=rp.INDICATOR_TELEOP)
 
+        phase(jl, t0, 0.5, "D3: C2 lost while TELEOP -- latches FAULT, nobody can reach it",
+              drive_cmd=800, steer_cmd=0, mode=rp.MODE_TELEOP, c2_lost=True,
+              indicator_request=rp.INDICATOR_TELEOP)
         # E: corrupt a frame AFTER the CRC is computed. CAN's own CRC would not
         # see this -- it is exactly the software-path corruption the
         # application-layer CRC exists to catch.

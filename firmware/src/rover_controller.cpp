@@ -58,6 +58,7 @@ bool RoverController::ingestFrame(uint32_t can_id, const uint8_t* buf, uint8_t l
 
     ControlMsg msg;
     const DecodeResult r = decodeControl(can_id, buf, len, msg);
+    
     latchIfFaulted();
     last_decode_ = r;
 
