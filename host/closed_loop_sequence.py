@@ -1,12 +1,14 @@
-#!/usr/bin/env python3
 """
 closed_loop_sequence.py
 
 Modified autonomy_sim.py that executes a full closed loop sequence instead of the task 3 control and autonomy state validation
 
-    python3 host/autonomy_sim.py --mock            # against the C++ simulator
-    python3 host/autonomy_sim.py --channel vcan0   # against a virtual CAN bus
-    python3 host/autonomy_sim.py --channel can0    # against the real Teensy
+    python3 host/closed_loop_sequence.py --mock            # against the C++ simulator
+    python3 host/closed_loop_sequence.py --channel vcan0   # against a virtual CAN bus
+    python3 host/closed_loop_sequence.py --channel can0    # against the real Teensy
+
+    Every snapshot the mission reads is written to closed_loop_run.csv
+    (change it with --record FILE).
 
 WHAT THIS IS FOR
     Task 3 proved a Jetson command can reach the controller intact. This
@@ -41,6 +43,7 @@ HOW A STEP IS VERIFIED, AND WHY IT IS NOT JUST A SLEEP
 """
 
 import argparse
+import csv
 import os
 import sys
 import time
@@ -61,7 +64,7 @@ else:
 import can_link  # noqa: E402
 import rover_protocol as rp  # noqa: E402
 from jetson_test import JetsonLink, open_link  # noqa: E402
-from rover_config import CONTROL_RATE_HZ  # noqa: E402
+from rover_config import CONTROL_RATE_HZ, TELEMETRY_PERIOD_MS  # noqa: E402
 
 # Half the sequence space. A snapshot's ack_seq counts as "at or after" the
 # step's first frame when it is within this distance ahead, which is correct
@@ -184,20 +187,202 @@ def steer_feedback_within(target, tolerance):
     return check
 
 
-def moving(previous_enc):
-    """The encoders are advancing past a baseline an earlier step recorded.
+# ---------------------------------------------------------------------------
+# Measured speed. The controller reports encoder COUNTS, not a speed, so the
+# Jetson works the speed out itself: how far the count moved between two
+# snapshots, divided by the time between them. This is the "check what
+# actually happened" half of the closed loop.
+# ---------------------------------------------------------------------------
 
-    The baseline is checked for rather than assumed: an unrecorded one would
-    make `enc_left != None` vacuously true and pass this step without checking
-    anything, which is the failure mode a reordered mission would hit.
-    """
-    def check(s):
-        if previous_enc[0] is None:
-            return "no encoder baseline was recorded by an earlier step"
-        if s["enc_left"] != previous_enc[0]:
+# How close counts as "close enough", and how slow counts as "stopped".
+# PLACEHOLDERS: the right values depend on how noisy the real encoders are.
+SPEED_TOLERANCE = 0.10          # within 10% of the target
+STOPPED_MAX = 200               # counts/sec
+
+# The rover sends one snapshot every TELEMETRY_PERIOD_MS and numbers each one,
+# so the time between two snapshots is (how many numbers apart) x 50 ms -- the
+# ROVER's clock. Timing them by when the Jetson happened to read them does not
+# work: two snapshots can be read 1 ms apart even though they were sent 50 ms
+# apart, and 1200 counts / 0.001 s would read as 1,200,000 counts/sec.
+TELEMETRY_PERIOD_S = TELEMETRY_PERIOD_MS / 1000.0
+
+
+def speed_between(prev, curr):
+    """prev and curr are each a tuple: (encoder_count, time_in_seconds).
+    prev may be None. Return speed in counts/sec, or None if it can't be known."""
+    if prev is None:
+        return None
+    count1, t1 = prev
+    count2, t2 = curr
+    count = count2 - count1
+    dt = t2 - t1
+    if dt <= 0:
+        return None
+    speed = count / dt
+    return speed
+
+
+def speed_problem(measured, target, pct=SPEED_TOLERANCE, stopped_max=STOPPED_MAX):
+    """Return None if `measured` is close enough to `target`,
+    otherwise a string saying what's wrong."""
+    if measured is None:
+        return "Nothing measured yet."
+    if target is None:
+        return "Target not set"
+    if target == 0:
+        if abs(measured) <= stopped_max:
             return None
-        return "enc_left is not advancing (%d)" % s["enc_left"]
+        else:
+            return f"speed {measured:.0f} is not under {stopped_max} (should be stopped)"
+
+    error = measured - target
+    allowed = pct * abs(target)
+    if abs(error) > allowed:
+        return f"speed {measured:.0f} is not within {pct:.0%} of {target:.0f}"
+    else:
+        return None
+
+
+def forward_count(s):
+    """Average of the two encoders. A turn speeds one side up and slows the
+    other down by the same amount, so the average is the rover's forward
+    motion with the turn cancelled out."""
+    return (s["enc_left"] + s["enc_right"]) / 2
+
+
+def speed_meter():
+    """The memory ("backpack") from speed_check, on its own: feed it
+    snapshots, get a speed back. None on the first snapshot, and on a repeat
+    of the last one -- the same postcard twice says nothing new."""
+    prev = None        # (count, time) of the last NEW postcard
+    prev_seq = None    # its sequence number
+    rover_time = 0.0   # seconds on the rover's clock since the first postcard
+
+    def read(s):
+        nonlocal prev, prev_seq, rover_time
+        if s["seq"] == prev_seq:
+            return None
+        if prev_seq is not None:
+            # seq_delta handles the 255 -> 0 wrap.
+            rover_time += rp.seq_delta(prev_seq, s["seq"]) * TELEMETRY_PERIOD_S
+        curr = (forward_count(s), rover_time)
+        speed = speed_between(prev, curr)
+        prev = curr
+        prev_seq = s["seq"]
+        return speed
+    return read
+
+
+def cruise_speed(baseline, pct=SPEED_TOLERANCE, stopped_max=STOPPED_MAX):
+    """Passes once the rover is moving and its speed has settled, and puts
+    that speed in baseline[0] for later steps to compare against.
+
+    "Settled" means two readings in a row agree within pct. With today's
+    simulator that is immediate; once Task 5.1 makes the rover speed up
+    gradually, this waits out the ramp instead of grabbing a half-way speed.
+    """
+    meter = speed_meter()
+    last_speed = None
+
+    def check(s):
+        nonlocal last_speed
+        speed = meter(s)
+        if speed is None:
+            return "Nothing measured yet."
+        if abs(speed) <= stopped_max:
+            last_speed = None
+            return f"not moving yet (speed {speed:.0f})"
+        previous, last_speed = last_speed, speed
+        if previous is None or speed_problem(speed, previous, pct, stopped_max):
+            return f"speed still changing ({speed:.0f})"
+        baseline[0] = speed
+        return None
     return check
+
+
+def speed_follows(baseline, ratio, pct=SPEED_TOLERANCE, stopped_max=STOPPED_MAX):
+    """The measured speed is about `ratio` times the cruise speed an earlier
+    step recorded.
+
+    We command EFFORT, not speed, and don't know how one becomes the other,
+    so the rover is compared against itself: cutting effort from 500 to 400
+    should cut the speed to about 400/500 = 0.8 of what it was. ratio=0 means
+    "stopped", which speed_problem judges with stopped_max instead of a %.
+    """
+    meter = speed_meter()
+
+    def check(s):
+        if baseline[0] is None:
+            return "no cruise speed was recorded by an earlier step"
+        return speed_problem(meter(s), baseline[0] * ratio, pct, stopped_max)
+    return check
+
+
+# ---------------------------------------------------------------------------
+# Recording. Task 5.7: "The Jetson-side test program should record the full
+# sequence."
+# ---------------------------------------------------------------------------
+
+# What the rear status light shows for each INDICATOR_* code (PROTOCOL.md
+# 3.5.1). FAULT's yellow is the team's placeholder, not a URC rule.
+INDICATOR_COLORS = {
+    rp.INDICATOR_OFF: "OFF",
+    rp.INDICATOR_TELEOP: "BLUE",
+    rp.INDICATOR_AUTONOMOUS: "RED",
+    rp.INDICATOR_ARRIVED: "FLASHING GREEN",
+    rp.INDICATOR_FAULT: "YELLOW",
+}
+
+
+class SequenceRecorder:
+    """Writes the run to a CSV file: one row for each new snapshot the
+    mission reads (about 20 a second), tagged with the step that was running.
+    Open it in a spreadsheet and it reads as the mission, in order."""
+
+    COLUMNS = ("t_s", "step", "seq", "mode", "light", "cmd_status",
+               "drive_applied", "steer_applied", "speed_cps",
+               "enc_left", "enc_right", "steer_fb",
+               "cmd_age_ms", "controller_health", "faults")
+
+    def __init__(self, path):
+        self.path = path
+        self.file = open(path, "w", newline="")
+        self.writer = csv.writer(self.file)
+        self.writer.writerow(self.COLUMNS)
+        self.meter = speed_meter()
+        self.started = time.monotonic()
+        self.last_seq = None
+        self.last_speed = None
+        self.rows = 0
+
+    def record(self, step_name, s):
+        if s["seq"] == self.last_seq:
+            return                      # already wrote this snapshot
+        self.last_seq = s["seq"]
+        speed = self.meter(s)
+        if speed is not None:
+            self.last_speed = speed
+        self.writer.writerow((
+            "%.3f" % (time.monotonic() - self.started),
+            step_name,
+            s["seq"],
+            rp.MODE_NAMES.get(s["mode"], "?"),
+            INDICATOR_COLORS.get(s["indicator_state"], "?"),
+            rp.CMD_STATUS_NAMES.get(s["cmd_status"], "?"),
+            s["drive_applied"],
+            s["steer_applied"],
+            "" if speed is None else "%.0f" % speed,
+            s["enc_left"],
+            s["enc_right"],
+            s["steer_fb"],
+            s["cmd_age_ms"],
+            rp.CTRL_HEALTH_NAMES.get(s["controller_health"], "?"),
+            "|".join(rp.fault_names(s["fault_status"])) or "none",
+        ))
+        self.rows += 1
+
+    def close(self):
+        self.file.close()
 
 
 # ---------------------------------------------------------------------------
@@ -205,25 +390,20 @@ def moving(previous_enc):
 # ---------------------------------------------------------------------------
 
 def build_mission():
-    """The Task 4 command sequence, then the mode-separation demonstration.
+    """The Task 5.7 closed-loop sequence.
 
-    c2_lost is False on every step and that is not decoration: a lost C2 link
-    stops a TELEOP rover, which would mask the WRONG_SOURCE verdict the
-    separation steps exist to show with an ordinary STOPPED.
+    c2_lost is False on every step: a lost C2 link stops a TELEOP rover, and
+    nothing here is about C2.
+
+    The speed steps compare the rover against ITSELF. Step 3 records the speed
+    it settles at under FAST; steps 5 and 6 check the speed is the right
+    fraction of that. See speed_follows() for why.
     """
-    # Captured by the `moving` check so a later step can compare against an
-    # earlier reading rather than a constant.
-    enc_at_launch = [None]
-
-    def remember_enc(s):
-        enc_at_launch[0] = s["enc_left"]
-        return None
+    # One-slot box: step 3 puts the cruise speed in, steps 5 and 6 read it.
+    cruise = [None]
 
     auto = dict(mode=rp.MODE_AUTONOMOUS, c2_lost=False, from_autonomy=True)
-    teleop = dict(mode=rp.MODE_TELEOP, c2_lost=False, from_autonomy=False)
     return [
-        # --- the autonomous command sequence from the task ------------------
-      
         Step("1. start in SAFE",
              dict(drive_cmd=0, steer_cmd=0, mode=rp.MODE_SAFE,
                   c2_lost=False, from_autonomy=False),
@@ -235,18 +415,17 @@ def build_mission():
 
         Step("2. receive AUTONOMOUS",
              dict(drive_cmd=0, steer_cmd=0, **auto),
-             all_of(expect(mode=rp.MODE_AUTONOMOUS,
-                           cmd_status=rp.CMD_STATUS_APPLIED,
-                           # Red, per rule 1.e.ii, the moment the rover is
-                           # autonomous -- not once it starts moving.
-                           indicator_state=rp.INDICATOR_AUTONOMOUS),
-                    remember_enc)),
+             expect(mode=rp.MODE_AUTONOMOUS,
+                    cmd_status=rp.CMD_STATUS_APPLIED,
+                    # Red, per rule 1.e.ii, the moment the rover is
+                    # autonomous -- not once it starts moving.
+                    indicator_state=rp.INDICATOR_AUTONOMOUS)),
 
-        Step("3. command forward movement",
+        Step("3. forward: speed rises, settles",
              dict(drive_cmd=FAST, steer_cmd=0, **auto),
              all_of(expect(cmd_status=rp.CMD_STATUS_APPLIED,
                            drive_applied=FAST, steer_applied=0),
-                    moving(enc_at_launch))),
+                    cruise_speed(cruise))),
 
         Step("4. change steering",
              dict(drive_cmd=FAST, steer_cmd=TURN, **auto),
@@ -254,26 +433,24 @@ def build_mission():
                            drive_applied=FAST, steer_applied=TURN),
                     steer_feedback_within(TURN, 25))),
 
-        Step("5. stop",
-             dict(drive_cmd=FAST, steer_cmd=TURN, stop=True, **auto),
-             # Full throttle still commanded, and nothing applied. Note the
-             # light stays red: a paused autonomous rover is still under
-             # autonomous operation.
-             expect(cmd_status=rp.CMD_STATUS_STOPPED,
-                    drive_applied=0, steer_applied=0,
-                    indicator_state=rp.INDICATOR_AUTONOMOUS)),
-      
-        Step("6. forward at half throttle",
-             dict(drive_cmd=CRUISE, steer_cmd=0, stop=False, **auto),
+        Step("5. slow to CRUISE: speed follows",
+             dict(drive_cmd=CRUISE, steer_cmd=TURN, **auto),
              all_of(expect(cmd_status=rp.CMD_STATUS_APPLIED,
-                           drive_applied=CRUISE, steer_applied=0),
-                    moving(enc_at_launch))),
+                           drive_applied=CRUISE, steer_applied=TURN),
+                    speed_follows(cruise, CRUISE / FAST))),
 
-        Step("7. stop byte overrides command",
-             dict(drive_cmd=FAST, steer_cmd=TURN, stop=True, **auto),
-             expect(cmd_status=rp.CMD_STATUS_STOPPED, drive_applied=0)),
-      
-        Step("8. report TARGET_REACHED",
+        Step("6. STOP: speed returns to zero",
+             # Still commanding CRUISE: STOP has to override an active
+             # movement command, not just a zero one.
+             dict(drive_cmd=CRUISE, steer_cmd=TURN, stop=True, **auto),
+             # The light stays red: a paused autonomous rover is still under
+             # autonomous operation.
+             all_of(expect(cmd_status=rp.CMD_STATUS_STOPPED,
+                           drive_applied=0, steer_applied=0,
+                           indicator_state=rp.INDICATOR_AUTONOMOUS),
+                    speed_follows(cruise, 0))),
+
+        Step("7. report TARGET_REACHED",
              dict(drive_cmd=0, steer_cmd=0, stop=True,
                   indicator_request=rp.INDICATOR_ARRIVED, **auto),
              # Flashing green. Rule 1.e.xvii scores a target only on stopping
@@ -282,8 +459,8 @@ def build_mission():
              expect(indicator_state=rp.INDICATOR_ARRIVED,
                     cmd_status=rp.CMD_STATUS_STOPPED,
                     drive_applied=0)),
-      
-      Step("9. stop in SAFE",
+
+        Step("8. return to SAFE",
              dict(drive_cmd=0, steer_cmd=0, mode=rp.MODE_SAFE,
                   c2_lost=False, from_autonomy=False),
              all_of(expect(mode=rp.MODE_SAFE,
@@ -291,7 +468,6 @@ def build_mission():
                            drive_applied=0, steer_applied=0,
                            indicator_state=rp.INDICATOR_OFF),
                     fault_clear(rp.FAULT_CMD_SOURCE, "CMD_SOURCE"))),
-        
     ]
 
 
@@ -303,14 +479,19 @@ FEEDBACK_FIELDS = (
     "controller_health",  # controller-health state   (TELEM_STATE)
     "cmd_age_ms",         # command age               (TELEM_DRIVE_R)
     "fault_status",       # fault state               (TELEM_POWER)
+    "enc_left",           # measured drive            (TELEM_DRIVE_L)
+    "enc_right",          # measured drive            (TELEM_DRIVE_R)
+    "indicator_state",    # rear status light         (TELEM_STATE)
 )
 
 
-def run_mission(link, steps=None, verbose=True, settle_s=0.4):
+def run_mission(link, steps=None, verbose=True, settle_s=0.4, recorder=None):
     """Drive `steps` to completion against `link`. Returns a MissionReport.
 
     Stops at the first failure: once a step's precondition never arrived, the
     ones after it would be testing something other than what they claim.
+
+    `recorder`, if given, is handed every snapshot (see SequenceRecorder).
     """
     jl = JetsonLink(link)
     report = MissionReport()
@@ -343,6 +524,8 @@ def run_mission(link, steps=None, verbose=True, settle_s=0.4):
             snapshot = jl.snapshot
             if snapshot is not None:
                 report.snapshots_seen = jl.tele.complete_count
+                if recorder is not None:
+                    recorder.record(step.name, snapshot)
                 # Only a snapshot acknowledging a frame from THIS step can say
                 # anything about this step. Anything older is the previous
                 # command still echoing back.
@@ -360,6 +543,11 @@ def run_mission(link, steps=None, verbose=True, settle_s=0.4):
                                          time.monotonic() - started, snapshot))
         if verbose:
             print(report.results[-1])
+            if snapshot is not None:
+                speed = recorder.last_speed if recorder is not None else None
+                print("       light=%-14s speed=%s" % (
+                    INDICATOR_COLORS.get(snapshot["indicator_state"], "?"),
+                    "?" if speed is None else "%.0f counts/s" % speed))
         if not ok:
             break
 
@@ -373,6 +561,8 @@ def main():
                     help="run against the compiled C++ simulator (no hardware)")
     ap.add_argument("--channel", help="CAN interface, e.g. can0 or vcan0")
     ap.add_argument("--bitrate", type=int, default=500000)
+    ap.add_argument("--record", default="closed_loop_run.csv",
+                    help="CSV file to record every telemetry snapshot to")
     args = ap.parse_args()
 
     if not args.mock and not args.channel:
@@ -386,10 +576,12 @@ def main():
     print("=" * 78)
 
     link = open_link(args)
+    recorder = SequenceRecorder(args.record)
     try:
-        report = run_mission(link)
+        report = run_mission(link, recorder=recorder)
     finally:
         link.close()
+        recorder.close()
 
     print()
     last = report.results[-1].snapshot if report.results else None
@@ -397,13 +589,15 @@ def main():
         missing = [f for f in FEEDBACK_FIELDS if f not in last]
         print("feedback loop: %s" % ("every required field reached the Jetson"
                                      if not missing else "MISSING %s" % missing))
-        print("  mode=%s  applied=(%+d,%+d)  health=%s  age=%sms  faults=%s"
-              % (rp.MODE_NAMES.get(last["mode"], "?"), last["drive_applied"],
-                 last["steer_applied"],
+        print("  mode=%s  light=%s  applied=(%+d,%+d)  health=%s  age=%sms  faults=%s"
+              % (rp.MODE_NAMES.get(last["mode"], "?"),
+                 INDICATOR_COLORS.get(last["indicator_state"], "?"),
+                 last["drive_applied"], last["steer_applied"],
                  rp.CTRL_HEALTH_NAMES.get(last["controller_health"], "?"),
                  last["cmd_age_ms"],
                  ",".join(rp.fault_names(last["fault_status"])) or "none"))
     print("snapshots assembled: %d" % report.snapshots_seen)
+    print("recorded %d snapshots to %s" % (recorder.rows, recorder.path))
     print()
 
     if report.ok:
