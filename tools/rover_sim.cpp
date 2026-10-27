@@ -113,8 +113,7 @@ int main(int argc, char** argv) {
         // Fake plant, driven by the DRIVE MODULE's output rather than by the
         // raw command, so the mix is part of what the host tests observe. The
         // fail-safe has already been applied twice over, so there is no third
-        // copy of the stop rule here.
-        // Measured velocity lags the command; encoders follow the measured value.
+        // copy of the stop rule here. Encoders come from the lagging measured speed.
         feedback.update(out.left_effort, out.right_effort, out.energized, realMillis());
         const int32_t enc_left  = feedback.left().encoder_ticks;
         const int32_t enc_right = feedback.right().encoder_ticks;

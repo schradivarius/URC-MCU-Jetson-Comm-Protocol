@@ -7,13 +7,14 @@ using namespace rover;
 
 static const int16_t HALF = 500;   // 0.50 m/s with SIM_MAX_SPEED_MPS = 1.0
 
-// Runs `ms` of 1 ms updates starting at `t`, returns the new time.
+// Runs `ms` updates 1 ms apart starting after `t`; returns the new time.
 static uint32_t run(DriveSim& sim, uint32_t t, uint32_t ms, int16_t l, int16_t r,
                     bool energized = true) {
     for (uint32_t i = 0; i < ms; ++i) sim.update(l, r, energized, ++t);
     return t;
 }
 
+// True if a and b differ by at most tol.
 static bool near(float a, float b, float tol) {
     return (a > b ? a - b : b - a) <= tol;
 }
@@ -53,7 +54,6 @@ static void encoders_follow_measured_not_commanded() {
     DriveSim sim;
     uint32_t t = run(sim, 0, 1, 0, 0);
     run(sim, t, 1000, HALF, HALF);
-    // 1 s at 0.50 m/s commanded would be 500 ticks; the ramp costs some.
     CHECK(sim.left().encoder_ticks > 300);
     CHECK(sim.left().encoder_ticks < 500);
     CHECK(near(sim.left().ticks_per_s, sim.left().measured_mps * SIM_TICKS_PER_M, 0.01f));

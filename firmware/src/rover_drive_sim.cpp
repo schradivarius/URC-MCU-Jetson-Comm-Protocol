@@ -5,7 +5,7 @@
 namespace rover {
 
 DriveSim::DriveSim(uint32_t seed)
-    : rng_(seed ? seed : 1),   // xorshift never leaves 0
+    : rng_(seed ? seed : 1),
       started_(false),
       last_ms_(0),
       last_dt_ms_(0),
@@ -15,12 +15,12 @@ DriveSim::DriveSim(uint32_t seed)
     right_ = {0.0f, 0.0f, 0, 0.0f};
 }
 
-// xorshift32: same sequence on the Teensy and a laptop, unlike rand().
+// xorshift32, so the Teensy and a laptop give the same numbers.
 float DriveSim::random01() {
     rng_ ^= rng_ << 13;
     rng_ ^= rng_ >> 17;
     rng_ ^= rng_ << 5;
-    return static_cast<float>(rng_ >> 8) / 16777216.0f;   // [0, 1)
+    return static_cast<float>(rng_ >> 8) / 16777216.0f;
 }
 
 void DriveSim::update(int16_t left_effort, int16_t right_effort, bool energized,
@@ -30,12 +30,12 @@ void DriveSim::update(int16_t left_effort, int16_t right_effort, bool energized,
         last_ms_ = now_ms;
         return;
     }
-    const uint32_t dt = now_ms - last_ms_;   // unsigned: correct across millis() wrap
+    const uint32_t dt = now_ms - last_ms_;
     if (dt == 0) return;
     last_ms_ = now_ms;
     last_dt_ms_ = dt;
 
-    // One random factor for both wheels, so equal commands stay equal.
+    // Shared by both wheels so equal commands stay equal.
     const float jitter = 1.0f + (2.0f * random01() - 1.0f) * SIM_STEP_JITTER;
     stepWheel(left_,  frac_left_,  left_effort,  energized, static_cast<float>(dt), jitter);
     stepWheel(right_, frac_right_, right_effort, energized, static_cast<float>(dt), jitter);
