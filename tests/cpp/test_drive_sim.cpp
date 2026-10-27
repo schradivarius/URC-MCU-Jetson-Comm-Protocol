@@ -99,6 +99,16 @@ static void update_time_is_tracked_across_millis_wraparound() {
     CHECK(sim.left().measured_mps > 0.0f);
 }
 
+static void a_long_gap_does_not_overflow_the_encoder() {
+    DriveSim sim;
+    sim.update(1000, 1000, true, 0);
+    sim.update(1000, 1000, true, 1);
+    sim.update(1000, 1000, true, 0xFFFFFFF0u);
+    CHECK_EQ(sim.lastDtMs(), 0xFFFFFFEFu);
+    CHECK(sim.left().encoder_ticks > 0);
+    CHECK(sim.left().encoder_ticks <= static_cast<int32_t>(SIM_TICKS_PER_M));
+}
+
 int main() {
     std::printf("test_drive_sim\n");
     RUN_TEST(measured_does_not_jump_to_the_command);
@@ -109,5 +119,6 @@ int main() {
     RUN_TEST(equal_commands_give_equal_wheels);
     RUN_TEST(same_seed_repeats_and_different_seed_differs);
     RUN_TEST(update_time_is_tracked_across_millis_wraparound);
+    RUN_TEST(a_long_gap_does_not_overflow_the_encoder);
     return testing::summary("test_drive_sim");
 }

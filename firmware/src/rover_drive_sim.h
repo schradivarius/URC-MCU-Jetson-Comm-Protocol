@@ -13,6 +13,7 @@ static const float SIM_RESPONSE_MS    = 100.0f;  // how fast measured follows co
 static const float SIM_BRAKE_MS       = 30.0f;   // how fast it slows when stopped
 static const float SIM_STEP_JITTER    = 0.3f;    // random +/-30% on each step
 static const float SIM_STOPPED_MPS    = 0.005f;  // snap to 0 below this when stopping
+static const uint32_t SIM_MAX_STEP_MS = 1000;    // longest gap simulated in one update
 
 struct WheelFeedback {
     float   commanded_mps;
