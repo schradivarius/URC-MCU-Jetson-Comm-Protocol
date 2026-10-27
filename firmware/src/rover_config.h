@@ -32,7 +32,8 @@ static const uint32_t CAN_BITRATE_HZ = 500000;   // 500 kbps; every node must ma
 static const uint32_t DEFAULT_WATCHDOG_TIMEOUT_MS = 300;   // no valid CONTROL -> stop
 static const uint32_t DEFAULT_TELEMETRY_PERIOD_MS = 50;    // 20 Hz
 static const uint32_t HW_WATCHDOG_MS              = 1000;  // Teensy resets if the loop stalls
-
+static const uint32_t ENCODER_STALE_MS            = 300;   // how long before an encoder reading is considered stale
+static const uint32_t STEER_STALE_MS            = 300;     // same thing as encoder_stale_ms but w steering feedback
 // How long a link-quality complaint (a sequence gap or a CRC error) keeps the
 // Jetson link reported as DEGRADED after the last occurrence. Long enough that
 // an operator actually sees it on a dashboard refreshing at 20 Hz.
