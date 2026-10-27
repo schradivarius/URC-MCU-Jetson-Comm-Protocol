@@ -22,6 +22,7 @@ class FeedbackAge {
         uint32_t last_sample_ms_ = 0;
         bool have_sample_ = false;
 };
-}
+
+} // namespace rover
 
 #endif  // ROVER_FEEDBACK_H

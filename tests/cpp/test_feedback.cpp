@@ -75,6 +75,7 @@ static void not_stale_1_ms_before_the_threshold() {
     FeedbackAge age = freshTracker();
     age.noteSample();
     advance(299);
+    CHECK_EQ(age.ageMs(), 299);
     CHECK(!age.isStale());
 }
 

@@ -82,6 +82,11 @@
 
 namespace rover {
 
+// Injected clock. On the Teensy this is `millis`. In tests it is a counter the
+// test advances by hand, so timeouts (watchdog, feedback age) are checked
+// deterministically instead of with sleeps.
+typedef uint32_t (*MillisFn)();
+
 // SNAPSHOT TEARING, on the four telemetry ids in rover_config.h: every frame
 // of one control cycle carries the SAME sequence number. The Jetson can
 // therefore tell whether the four frames it holds came from one cycle or
@@ -455,8 +460,6 @@ enum : uint8_t {
     CMD_ECHO_RETURN_ACTIVE = 0x40,  // bit 6
     CMD_ECHO_RESERVED_MASK = 0x80,  // bit 7, must be zero
 };
-
-typedef uint32_t (*MillisFn)();
 
 uint8_t      packCmdStatus(uint8_t status, DecodeResult decode, bool return_active);
 uint8_t      cmdStatusOf(uint8_t packed);

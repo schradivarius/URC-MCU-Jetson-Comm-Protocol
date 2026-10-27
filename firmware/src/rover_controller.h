@@ -23,10 +23,6 @@
 
 namespace rover {
 
-// Injected clock. On the Teensy this is `millis`. In tests it is a counter the
-// test advances by hand, so watchdog behaviour is checked deterministically
-// instead of with sleeps.
-
 // DEFAULT_WATCHDOG_TIMEOUT_MS, DEFAULT_TELEMETRY_PERIOD_MS and
 // LINK_DEGRADED_HOLD_MS come from rover_config.h (via rover_protocol.h).
 
