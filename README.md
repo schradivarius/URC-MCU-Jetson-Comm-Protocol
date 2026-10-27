@@ -16,10 +16,11 @@ autonomy and teleop commands are refused in each other's modes.
 
 | | |
 |---|---|
-| Protocol, safety logic, firmware | Implemented, **280 tests** passing |
+| Protocol, safety logic, firmware | Implemented, **300 tests** passing |
 | Cross-language codec | Pinned byte-for-byte, plus every validation predicate |
 | Autonomy → drive-stage loop (Task 4) | Closed and verified end to end (`make autonomy`) |
 | USB-serial (UART) link to a laptop | Implemented, framing pinned both languages |
+| Teensy 4.1 cross-compile | Both builds link against the real core and libraries (by hand, not CI) |
 | **Validated on real hardware** | **Not yet — see [Known gaps](#known-gaps)** |
 
 ---
@@ -34,7 +35,7 @@ than mocking them, so there is no dependency to manage.
 git clone https://github.com/schradivarius/URC-MCU-Jetson-Comm-Protocol.git
 cd URC-MCU-Jetson-Comm-Protocol
 
-make test      # 160 C++ tests + 120 host tests
+make test      # 160 C++ tests + 140 host tests
 make demo      # no-hardware message-exchange demonstration (Task 3)
 make autonomy  # mock autonomy stack driving the firmware (Task 4)
 ```
@@ -74,8 +75,9 @@ tools/
   golden_vectors.cpp           emits vectors for cross-language pinning
 
 tests/cpp/                   160 tests — firmware core
-tests/host/                  120 tests — config sync, golden vectors, framing,
-                                         integration, the autonomy mission
+tests/host/                  140 tests — config sync, golden vectors, framing,
+                                         the UART script, integration, the
+                                         autonomy mission
 ```
 
 The files under `firmware/src/` have **no Arduino dependency and no hardware
@@ -108,6 +110,7 @@ make test-host   # host side only — compiles the C++ core
 | `tests/cpp/test_serial.cpp` | 17 | Does a frame survive the UART link — and does noise, a reset mid-frame or a truncated frame cost exactly one? |
 | `tests/host/test_config_sync.py` | 14 | Do the C++ and Python configs hold the same constants? |
 | `tests/host/test_serial_framing.py` | 22 | Do the two UART framers agree byte-for-byte, and does framing compose with the CRC? |
+| `tests/host/test_uart_drive.py` | 20 | Does the laptop script move the real controller, stop it on the way out, and refuse to say "OK" about a command it cannot prove arrived? |
 | `tests/host/test_golden_vectors.py` | 30 | Do C++ and Python agree byte-for-byte? |
 | `tests/host/test_integration.py` | 44 | Do both ends actually talk to each other? |
 | `tests/host/test_autonomy_mission.py` | 10 | Does an autonomy decision reach the drive stage — and would we notice if it stopped? |
@@ -182,7 +185,7 @@ macOS and Linux and needs only pyserial:
 ```bash
 python -m pip install pyserial
 python host/uart_drive.py --list-ports                        # find the port
-python host/uart_drive.py --port COM5                         # watch only
+python host/uart_drive.py --port COM5                         # zero command
 python host/uart_drive.py --port COM5 --drive 300 --seconds 3  # move
 python host/uart_drive.py --port COM5 --drive 300 --steer -200 --seconds 5
 python host/uart_drive.py --port COM5 --stop
@@ -201,7 +204,14 @@ run   mode=TELEOP cmd_age=4ms  applied= +300/   +0 status=APPLIED ...
 
 `APPLIED` with a non-zero value is the thing to look for: the MCU received the
 frame, validated it, decided it was allowed to act on it, and drove the output
-stage. It exits non-zero and says which if that never happened.
+stage. The script only counts an acknowledgement that names a frame *this run*
+sent and describes a fresh command, so a board still reporting an earlier
+session cannot pass for one that heard this one. It exits non-zero and says
+which if that never happened, or if the stop on the way out was never
+confirmed.
+
+**Close the script before uploading.** A program holding the COM port open can
+stop PlatformIO from putting the Teensy into its bootloader.
 
 **It sends continuously, on purpose.** The firmware stops the drives if no
 valid command arrives within 300 ms, so a one-shot "move" command is not on
@@ -259,6 +269,10 @@ constant if it is an ESC.
 > - First flash with the drive pins **disconnected**. The LED blink and
 >   `uart_drive.py` reporting `APPLIED` prove the whole chain with nothing able
 >   to move. Then wire one channel, wheels off the ground.
+> - On a skid-steer, the two sides are mirror images, so `--drive 300` will
+>   spin one side's wheels backwards until that motor's leads are swapped. Swap
+>   the leads (or the DIR sense in `applyChannel()`); don't chase it in the
+>   host.
 > - There is **no brake-before-reverse delay**. A command reversal flips the
 >   direction pin in the same cycle the duty changes. A sign-magnitude driver
 >   handles that; check yours, and keep early commands small.
@@ -325,24 +339,27 @@ crashed — see `PROTOCOL.md` §5.2.
 
 Stated plainly, so nobody builds on an unchecked assumption:
 
-- **Never run on a real Teensy, a real CAN bus or a real serial port.** Every
-  library call was verified against the `FlexCAN_T4` and `WDT_T4` headers, and
-  the whole firmware — `rover_firmware.cpp` plus everything in `src/` —
-  compiles *and links* under both g++ and clang at `-Wall -Wextra -Werror`
-  against stub `Arduino.h`, `FlexCAN_T4.h` and `Watchdog_t4.h`, in **both** the
-  `ROVER_LINK_CAN=0` and `=1` configurations. What that does not cover is the
-  real `arm-none-eabi` build against the actual Teensyduino and library
-  headers, which has never run, and the board, which has never been flashed.
-  Bench validation is owed.
-- **The UART link has never carried a byte between two machines.** Both framers
-  are pinned to the same literal wire bytes
-  (`tests/cpp/test_serial.cpp` and `tests/host/test_serial_framing.py`) and
-  each is tested against noise, truncation and corruption, but no test runs
-  `host/serial_link.py` against the firmware over a port. The firmware side of
-  `linkPoll()`/`linkSend()` is exercised only by compiling and linking.
-- **`SRC_SRSR` watchdog bit mask is unverified.** It fails safe — an
-  unrecognised reset cause reports nothing — but confirm it by deliberately
-  hanging the loop once on the bench.
+- **Never flashed onto a real Teensy, never run on a real CAN bus.** The
+  firmware has been **cross-compiled and linked for the Teensy 4.1** by hand
+  (2026-10-27): `arm-none-eabi-gcc` 13.2 with the Teensyduino compile flags,
+  against the real `PaulStoffregen/cores` (`teensy4`, commit `9476e4a`),
+  `FlexCAN_T4` and `WDT_T4`, our code at `-Wall -Wextra -Werror`, in **both**
+  `ROVER_LINK_CAN=0` and `=1`, producing a linked `.elf` and `.hex` each time.
+  That is not in CI, and it is not PlatformIO's own build: Teensyduino ships
+  gcc 11.3, and PlatformIO picks its own library revisions. The first
+  `pio run` on a real machine is still the first time *that* build runs.
+- **The UART link has never carried a byte between two machines.**
+  `host/uart_drive.py` and `host/serial_link.py` have run end to end over a
+  real tty (`pyserial` on a Linux pty) against the real controller, and
+  `tests/host/test_uart_drive.py` runs the script's logic against the real
+  controller on every `make test`. Both framers are pinned to the same literal
+  wire bytes. What has not run is the *firmware's* side of the port —
+  `linkPoll()`/`linkSend()` on a Teensy.
+- **`SRC_SRSR` watchdog reset bits match the hardware definitions** —
+  `(1 << 4) | (1 << 7)` is `SRC_SRSR_WDOG_RST_B | SRC_SRSR_WDOG3_RST_B` in the
+  Teensy core's `imxrt.h`, and the core itself never touches the register.
+  Whether anything before `setup()` clears it is still a bench question:
+  confirm by deliberately hanging the loop once.
 - **Sensor I/O is stubbed** behind `readSensors()`, so every telemetry reading
   except the command echo is synthetic: encoder counts, current and voltage are
   a model, not a measurement. Treat `APPLIED` in `uart_drive.py` as the real

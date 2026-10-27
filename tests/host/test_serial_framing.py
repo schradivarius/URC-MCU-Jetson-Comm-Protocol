@@ -66,9 +66,7 @@ class TestFramingMatchesTheFirmware(unittest.TestCase):
         self.assertEqual(sl.SERIAL_ENCODED_MAX, 2 + 2 * sl.SERIAL_BODY_MAX)
 
     def test_the_escape_codes_are_distinct_from_the_bytes_they_escape(self):
-        # If an escape code ever equalled END or ESC the framing would be
-        # unparseable, and the symptom would be a link that works until a
-        # payload happens to contain one byte.
+        """Otherwise a link works until a payload happens to hold one byte."""
         self.assertEqual(len({sl.SLIP_END, sl.SLIP_ESC, sl.SLIP_ESC_END,
                               sl.SLIP_ESC_ESC}), 4)
 

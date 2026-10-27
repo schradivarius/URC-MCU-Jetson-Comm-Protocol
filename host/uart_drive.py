@@ -8,7 +8,7 @@ command, decides whether it is allowed to act on it, and acts. Works on
 Windows, macOS and Linux; the only dependency is pyserial.
 
     python host/uart_drive.py --list-ports
-    python host/uart_drive.py --port COM5                       # watch only
+    python host/uart_drive.py --port COM5                       # zero command
     python host/uart_drive.py --port COM5 --drive 300 --seconds 3
     python host/uart_drive.py --port COM5 --drive 300 --steer -200 --seconds 5
     python host/uart_drive.py --port COM5 --stop
@@ -24,13 +24,28 @@ WHY IT SENDS CONTINUOUSLY
 
 EVERY EXIT PATH STOPS THE ROVER
   Normal finish, Ctrl-C, a decode error, an unplugged cable: the stop frames in
-  the `finally` block are sent either way. If the link is already gone they
-  cannot arrive, which is exactly what the firmware's own watchdog is for.
+  the `finally` block are sent either way, as a continuation of the same
+  sequence numbers, so the firmware sees one unbroken session. If the link is
+  already gone they cannot arrive, which is exactly what the firmware's own
+  watchdog is for.
+
+TELEOP AND SAFE ONLY
+  AUTONOMOUS is deliberately not offered. The firmware refuses an operator
+  command in AUTONOMOUS, and the only way round that is for this script to
+  claim its commands came from the autonomy stack -- which is the one lie the
+  command-authority check exists to catch.
+
+HOW IT DECIDES THE MCU ANSWERED
+  Every TELEM_CMD_ECHO frame names the CONTROL sequence number it is
+  acknowledging. An echo only counts if it acknowledges a frame THIS run sent
+  and the command it describes is fresh, so a board still reporting a previous
+  session's command is never mistaken for one that heard this one.
 
 EXIT STATUS
-  0  commands were acknowledged (and acted on, if motion was commanded)
+  0  this run's commands were acknowledged, acted on if motion was asked for,
+     and the stop on the way out was confirmed
   1  nothing decodable came back -- wrong port, wrong firmware, or no power
-  2  telemetry arrived but the MCU never reported the command as APPLIED
+  2  telemetry arrived but never acknowledged this run's commands as wanted
 """
 
 import argparse
@@ -42,27 +57,26 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import rover_protocol as rp  # noqa: E402
 import serial_link  # noqa: E402
-from rover_config import (CMD_MAX, CMD_MIN, CONTROL_RATE_HZ, MODE_AUTONOMOUS,  # noqa: E402
-                          MODE_SAFE, MODE_TELEOP, SERIAL_BAUD_HZ,
-                          WATCHDOG_TIMEOUT_MS)
+from rover_config import (CMD_MAX, CMD_MIN, CONTROL_RATE_HZ, MODE_SAFE,  # noqa: E402
+                          MODE_TELEOP, SERIAL_BAUD_HZ, WATCHDOG_TIMEOUT_MS)
 
-MODE_BY_NAME = {"safe": MODE_SAFE, "teleop": MODE_TELEOP,
-                "autonomous": MODE_AUTONOMOUS}
+MODE_BY_NAME = {"safe": MODE_SAFE, "teleop": MODE_TELEOP}
 
 STOP_FRAMES = 10
 STATUS_PERIOD_S = 0.25
 
 
 class Telemetry:
-    """The latest value of every telemetry field, plus link counters."""
-
+    """The latest value of every telemetry field, plus what this run proved."""
 
     def __init__(self):
         self.fields = {}
         self.frames = 0
         self.decode_errors = 0
-        self.ever_applied = False
-        self.ever_moved = False
+        self.sent_seqs = set()
+        self.acknowledged = False
+        self.moved = False
+        self.stopped = False
 
     def ingest(self, can_id, payload):
         decoder = rp.DECODERS.get(can_id)
@@ -75,10 +89,20 @@ class Telemetry:
         self.frames += 1
         self.fields.update(msg)
         if can_id == rp.CAN_ID_TELEM_CMD_ECHO:
-            if msg["cmd_status"] == rp.CMD_STATUS_APPLIED:
-                self.ever_applied = True
-                if msg["drive_applied"] or msg["steer_applied"]:
-                    self.ever_moved = True
+            self._echo(msg)
+
+    def _echo(self, msg):
+        age = self.fields.get("cmd_age_ms", rp.CMD_AGE_UNKNOWN)
+        fresh = age != rp.CMD_AGE_UNKNOWN and age < WATCHDOG_TIMEOUT_MS
+        if not fresh or msg["ack_seq"] not in self.sent_seqs:
+            return
+        self.acknowledged = True
+        status = msg["cmd_status"]
+        if status == rp.CMD_STATUS_APPLIED and (msg["drive_applied"]
+                                                or msg["steer_applied"]):
+            self.moved = True
+        if status == rp.CMD_STATUS_STOPPED:
+            self.stopped = True
 
     def line(self):
         f = self.fields
@@ -86,9 +110,10 @@ class Telemetry:
             return "waiting for telemetry..."
         faults = rp.fault_names(f.get("fault_status", 0)) or ["none"]
         age = f.get("cmd_age_ms", rp.CMD_AGE_UNKNOWN)
-        return ("mode=%-6s cmd_age=%-5s applied=%+5d/%+5d status=%-13s "
-                "enc=%+8d/%+8d %5.2fV %5.2fA health=%-12s faults=%s"
+        return ("mode=%-6s link=%-8s cmd_age=%-6s applied=%+5d/%+5d "
+                "status=%-12s enc=%+8d/%+8d %5.2fV %5.2fA health=%-8s faults=%s"
                 % (rp.MODE_NAMES.get(f.get("mode"), "?"),
+                   rp.LINK_NAMES.get(f.get("jetson_link"), "?"),
                    "n/a" if age == rp.CMD_AGE_UNKNOWN else "%dms" % age,
                    f.get("drive_applied", 0), f.get("steer_applied", 0),
                    rp.CMD_STATUS_NAMES.get(f.get("cmd_status"), "?"),
@@ -96,6 +121,52 @@ class Telemetry:
                    f.get("voltage_v", 0.0), f.get("current_a", 0.0),
                    rp.CTRL_HEALTH_NAMES.get(f.get("controller_health"), "?"),
                    ",".join(faults)))
+
+
+class Sender:
+    """Owns the CONTROL sequence number for the whole run.
+
+    One counter across every phase, so the stop frames on the way out are the
+    next frames of the same session rather than a restart at zero, which the
+    firmware would rightly report as a sequence gap.
+    """
+
+    def __init__(self, link, telemetry, rate_hz, quiet):
+        self.link = link
+        self.telemetry = telemetry
+        self.period = 1.0 / rate_hz
+        self.quiet = quiet
+        self.seq = 0
+        self.sent = 0
+
+    def run(self, drive, steer, mode, stop, seconds, label):
+        """Send one command continuously for `seconds`, draining telemetry.
+
+        The send clock resynchronises rather than catching up: a slow console
+        or a stalled write must not turn into a burst of backdated frames.
+        """
+        deadline = time.monotonic() + seconds
+        next_send = time.monotonic()
+        next_status = 0.0
+        while time.monotonic() < deadline:
+            now = time.monotonic()
+            if now >= next_send:
+                self.telemetry.sent_seqs.add(self.seq)
+                self.link.send(rp.CAN_ID_CONTROL,
+                               rp.encode_control(drive, steer, mode,
+                                                 c2_lost=False, stop=stop,
+                                                 seq=self.seq))
+                self.seq = (self.seq + 1) & 0xFF
+                self.sent += 1
+                next_send += self.period
+                if next_send < now:
+                    next_send = now + self.period
+            for can_id, payload in self.link.recv():
+                self.telemetry.ingest(can_id, payload)
+            if not self.quiet and now >= next_status:
+                print("%-5s %s" % (label, self.telemetry.line()))
+                next_status = now + STATUS_PERIOD_S
+            time.sleep(0.002)
 
 
 def command_range(value):
@@ -120,34 +191,38 @@ def show_ports():
     return 0
 
 
-def send_run(link, args, telemetry, drive, steer, mode, stop, seconds, label):
-    """Send one command continuously for `seconds`, draining telemetry.
-
-    The send clock resynchronises rather than catching up: a slow console or a
-    stalled write must not turn into a burst of backdated frames.
-    """
-    period = 1.0 / args.rate
-    deadline = time.monotonic() + seconds
-    next_send = time.monotonic()
-    next_status = 0.0
-    sent = 0
-    while time.monotonic() < deadline:
-        now = time.monotonic()
-        if now >= next_send:
-            link.send(rp.CAN_ID_CONTROL,
-                      rp.encode_control(drive, steer, mode, c2_lost=False,
-                                        stop=stop, seq=sent & 0xFF))
-            sent += 1
-            next_send += period
-            if next_send < now:
-                next_send = now + period
-        for can_id, payload in link.recv():
-            telemetry.ingest(can_id, payload)
-        if not args.quiet and now >= next_status:
-            print("%-5s %s" % (label, telemetry.line()))
-            next_status = now + STATUS_PERIOD_S
-        time.sleep(0.002)
-    return sent
+def verdict(telemetry, moving, stopping):
+    if telemetry.frames == 0:
+        print("\nFAIL: nothing came back. Check --port, that the firmware was "
+              "built for the serial link (pio run -e teensy41), and power.")
+        return 1
+    if not telemetry.acknowledged:
+        print("\nFAIL: the MCU is sending telemetry but never acknowledged a "
+              "command from this run. Its last status is above.")
+        return 2
+    if moving and not telemetry.moved:
+        print("\nFAIL: the MCU acknowledged this run's commands but never "
+              "applied a non-zero output. STOPPED means a stop or a mode that "
+              "forbids motion; WRONG_SOURCE means a command-authority "
+              "mismatch.")
+        return 2
+    if moving and not telemetry.stopped:
+        print("\nFAIL: the MCU applied the command but never confirmed the "
+              "stop sent on exit. Check the motors are not still running; the "
+              "firmware watchdog should have stopped them within %d ms."
+              % WATCHDOG_TIMEOUT_MS)
+        return 2
+    if stopping and not telemetry.stopped:
+        print("\nFAIL: the MCU acknowledged this run's commands but never "
+              "reported itself STOPPED.")
+        return 2
+    if moving:
+        print("\nOK: the MCU received the commands and acted on them.")
+    elif stopping:
+        print("\nOK: the MCU received the stop and is holding the drives at zero.")
+    else:
+        print("\nOK: the MCU received the commands.")
+    return 0
 
 
 def main():
@@ -189,9 +264,12 @@ def main():
         parser.error("--seconds must be positive")
 
     mode = MODE_BY_NAME[args.mode]
-    moving = bool(args.drive or args.steer) and not args.stop
-    if moving and mode == MODE_SAFE:
+    if args.stop and (args.drive or args.steer):
+        parser.error("--stop cannot be combined with --drive or --steer")
+    if (args.drive or args.steer) and mode == MODE_SAFE:
         parser.error("--mode safe cannot move; SAFE means stopped on purpose")
+    moving = bool(args.drive or args.steer)
+    stopping = args.stop or mode == MODE_SAFE
 
     try:
         link = serial_link.SerialLink(args.port, baud=args.baud)
@@ -204,23 +282,20 @@ def main():
         return 1
 
     telemetry = Telemetry()
-    sent = 0
+    sender = Sender(link, telemetry, args.rate, args.quiet)
     try:
         if args.stop:
             print("sending STOP on %s" % args.port)
-            sent = send_run(link, args, telemetry, 0, 0, MODE_SAFE, True,
-                            args.seconds, "stop")
+            sender.run(0, 0, MODE_SAFE, True, args.seconds, "stop")
         else:
             print("sending drive=%+d steer=%+d mode=%s for %.1fs on %s"
                   % (args.drive, args.steer, args.mode, args.seconds, args.port))
-            sent = send_run(link, args, telemetry, args.drive, args.steer, mode,
-                            False, args.seconds, "run")
+            sender.run(args.drive, args.steer, mode, False, args.seconds, "run")
     except KeyboardInterrupt:
         print("\ninterrupted")
     finally:
         try:
-            send_run(link, args, telemetry, 0, 0, MODE_SAFE, True,
-                     STOP_FRAMES / args.rate, "stop")
+            sender.run(0, 0, MODE_SAFE, True, STOP_FRAMES / args.rate, "stop")
         except Exception as exc:
             print("could not send the stop frames: %s" % exc, file=sys.stderr)
         link.close()
@@ -228,24 +303,9 @@ def main():
     print("\n%s" % telemetry.line())
     print("sent %d command frames, decoded %d telemetry frames "
           "(%d undecodable, %d dropped by framing)"
-          % (sent, telemetry.frames, telemetry.decode_errors,
+          % (sender.sent, telemetry.frames, telemetry.decode_errors,
              link.frames_dropped))
-
-    if telemetry.frames == 0:
-        print("\nFAIL: nothing came back. Check --port, that the firmware was "
-              "built for the serial link (pio run -e teensy41), and power.")
-        return 1
-    if moving and not telemetry.ever_moved:
-        print("\nFAIL: the MCU answered but never reported the command "
-              "APPLIED with a non-zero output. Last status above says why; "
-              "STOPPED means a stop or a mode that forbids motion, "
-              "WRONG_SOURCE means a command-authority mismatch.")
-        return 2
-    if not moving and not telemetry.ever_applied:
-        print("\nlink is up, but no command was acknowledged as APPLIED")
-        return 2
-    print("\nOK: the MCU received the commands and acted on them.")
-    return 0
+    return verdict(telemetry, moving, stopping)
 
 
 if __name__ == "__main__":
