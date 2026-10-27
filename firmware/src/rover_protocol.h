@@ -456,6 +456,8 @@ enum : uint8_t {
     CMD_ECHO_RESERVED_MASK = 0x80,  // bit 7, must be zero
 };
 
+typedef uint32_t (*MillisFn)();
+
 uint8_t      packCmdStatus(uint8_t status, DecodeResult decode, bool return_active);
 uint8_t      cmdStatusOf(uint8_t packed);
 DecodeResult decodeResultOf(uint8_t packed);
