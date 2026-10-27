@@ -22,6 +22,12 @@ PROTOCOL_VERSION = 6
 # --- link ---
 CAN_BITRATE_HZ = 500000       # 500 kbps; every node must match
 
+# USB serial / UART link to the MCU. The Teensy's native USB ignores the baud
+# rate and always runs at USB speed, but pyserial still has to be given one,
+# and a hardware UART behind a USB-TTL adapter really does need this to match
+# firmware/src/rover_config.h.
+SERIAL_BAUD_HZ = 115200
+
 # --- timing ---
 WATCHDOG_TIMEOUT_MS = 300     # controller stops after this long without CONTROL
 TELEMETRY_PERIOD_MS = 50      # 20 Hz

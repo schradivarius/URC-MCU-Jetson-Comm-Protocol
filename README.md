@@ -16,9 +16,10 @@ autonomy and teleop commands are refused in each other's modes.
 
 | | |
 |---|---|
-| Protocol, safety logic, firmware | Implemented, **224 tests** passing |
+| Protocol, safety logic, firmware | Implemented, **280 tests** passing |
 | Cross-language codec | Pinned byte-for-byte, plus every validation predicate |
 | Autonomy → drive-stage loop (Task 4) | Closed and verified end to end (`make autonomy`) |
+| USB-serial (UART) link to a laptop | Implemented, framing pinned both languages |
 | **Validated on real hardware** | **Not yet — see [Known gaps](#known-gaps)** |
 
 ---
@@ -33,7 +34,7 @@ than mocking them, so there is no dependency to manage.
 git clone https://github.com/schradivarius/URC-MCU-Jetson-Comm-Protocol.git
 cd URC-MCU-Jetson-Comm-Protocol
 
-make test      # 126 C++ tests + 98 host tests
+make test      # 160 C++ tests + 120 host tests
 make demo      # no-hardware message-exchange demonstration (Task 3)
 make autonomy  # mock autonomy stack driving the firmware (Task 4)
 ```
@@ -48,17 +49,21 @@ Two languages, because the two ends of the link are different machines:
 
 ```
 firmware/                    C++ — runs on the Teensy 4.1
-  rover_firmware.cpp           hardware wiring ONLY (CAN, watchdog, pins)
+  rover_firmware.cpp           hardware wiring ONLY (link, watchdog, pins)
   src/rover_config.h           every protocol + timing constant ─┐
-  src/rover_protocol.*         message definitions + codec      ─┤ pure C++,
+  src/rover_protocol.*         message definitions + codec       │ pure C++,
   src/rover_controller.*       command/safety state machine      │ no Arduino
-  src/rover_drive.*            drive/steering output stage      ─┘
+  src/rover_drive.*            drive/steering output stage       │
+  src/rover_serial.*           SLIP framing for the UART link    │
+  src/rover_motor.*            effort -> PWM duty / direction   ─┘
 
 host/                        Python — runs on the Jetson
   rover_config.py              constants (pinned to rover_config.h)
   rover_protocol.py            codec (pinned to the C++ one)
   protocol_root.py             which checkout firmware/src comes from
   can_link.py                  sim + python-can backends
+  serial_link.py               USB-serial/UART backend (pinned to rover_serial.*)
+  uart_drive.py                send a move/stop over USB serial and watch it
   c2_link.py                   C2 (base-station) link-loss detection
   jetson_test.py               live harness
   demo.py                      the Task 3 demonstration
@@ -68,9 +73,9 @@ tools/
   rover_sim.cpp                simulator: REAL controller + drive stage, fake plant
   golden_vectors.cpp           emits vectors for cross-language pinning
 
-tests/cpp/                   126 tests — firmware core
-tests/host/                  98 tests — config sync, golden vectors, integration,
-                                        the autonomy mission
+tests/cpp/                   160 tests — firmware core
+tests/host/                  120 tests — config sync, golden vectors, framing,
+                                         integration, the autonomy mission
 ```
 
 The files under `firmware/src/` have **no Arduino dependency and no hardware
@@ -99,7 +104,10 @@ make test-host   # host side only — compiles the C++ core
 | `tests/cpp/test_protocol.cpp` | 41 | Wire format, CRC-8, and every validation predicate |
 | `tests/cpp/test_controller.cpp` | 68 | **Does the rover stop when it should?** And: does it refuse a command from the wrong half of the stack? |
 | `tests/cpp/test_drive.cpp` | 17 | Does a command become the right motor output — and never one it was told not to? |
+| `tests/cpp/test_motor.cpp` | 17 | Does an effort become the right PWM duty and direction, and does a stop reach both output modes? |
+| `tests/cpp/test_serial.cpp` | 17 | Does a frame survive the UART link — and does noise, a reset mid-frame or a truncated frame cost exactly one? |
 | `tests/host/test_config_sync.py` | 14 | Do the C++ and Python configs hold the same constants? |
+| `tests/host/test_serial_framing.py` | 22 | Do the two UART framers agree byte-for-byte, and does framing compose with the CRC? |
 | `tests/host/test_golden_vectors.py` | 30 | Do C++ and Python agree byte-for-byte? |
 | `tests/host/test_integration.py` | 44 | Do both ends actually talk to each other? |
 | `tests/host/test_autonomy_mission.py` | 10 | Does an autonomy decision reach the drive stage — and would we notice if it stopped? |
@@ -149,6 +157,112 @@ would be undefined behaviour rather than a wrap.
 
 ## Running against hardware
 
+### The Teensy over USB serial — the bring-up path
+
+The default build carries the protocol over the Teensy's **native USB serial
+port**, so a laptop and a USB cable are the whole setup. No CAN transceiver, no
+USB-CAN adapter, no Linux. This is what to use to prove the MCU receives a
+command and acts on it.
+
+**1. Flash it.** In VS Code with the PlatformIO extension, the status bar along
+the bottom has ✓ (Build), → (Upload) and the plug (Serial Monitor); the
+PlatformIO sidebar has the same under *Project Tasks → teensy41 → General*. On
+the command line it is:
+
+```bash
+pio run              # compile the USB-serial build (the default environment)
+pio run -t upload     # compile and flash, board plugged in over USB
+```
+
+The Teensy loader may ask you to press the button on the board the first time.
+
+**2. Drive it.** `host/uart_drive.py` is the laptop end. It works on Windows,
+macOS and Linux and needs only pyserial:
+
+```bash
+python -m pip install pyserial
+python host/uart_drive.py --list-ports                        # find the port
+python host/uart_drive.py --port COM5                         # watch only
+python host/uart_drive.py --port COM5 --drive 300 --seconds 3  # move
+python host/uart_drive.py --port COM5 --drive 300 --steer -200 --seconds 5
+python host/uart_drive.py --port COM5 --stop
+```
+
+`--drive` and `--steer` are tenths of a percent, `-1000..1000`. On Linux or
+macOS the port looks like `/dev/ttyACM0` or `/dev/cu.usbmodem101`.
+
+The script prints the MCU's own account of what it did with each command —
+mode, command age, the drive and steer values it actually applied, and why if
+it applied none:
+
+```
+run   mode=TELEOP cmd_age=4ms  applied= +300/   +0 status=APPLIED ...
+```
+
+`APPLIED` with a non-zero value is the thing to look for: the MCU received the
+frame, validated it, decided it was allowed to act on it, and drove the output
+stage. It exits non-zero and says which if that never happened.
+
+**It sends continuously, on purpose.** The firmware stops the drives if no
+valid command arrives within 300 ms, so a one-shot "move" command is not on
+offer — that would be a rover that keeps driving after the laptop is
+unplugged. Every exit path, Ctrl-C included, sends stop frames on the way out.
+
+**The USB port is a binary channel in this build.** There is no boot banner,
+because text mixed into framed binary is how a bring-up loses an afternoon.
+`pio device monitor` will show gibberish, which is itself proof of life. The
+pin 13 LED toggles once per telemetry period whether or not a host is
+listening.
+
+> **This is USB serial, not a hardware UART.** The Teensy's native USB port is
+> what `--port` opens. If you instead want pins 0/1 (`Serial1`) behind a
+> USB-TTL adapter, that is a two-line change in `linkBegin()`/`linkPoll()`/
+> `linkSend()` plus a 3.3 V adapter — ask, don't improvise, because a 5 V
+> adapter on those pins destroys the board.
+
+### Wiring motors
+
+The drive pins and the output mode are the top of
+`firmware/rover_firmware.cpp`, deliberately together and deliberately short:
+
+| Constant | Default | What it is |
+|---|---|---|
+| `MOTOR_HBRIDGE` | `true` | `true` = PWM + direction pin (brushed H-bridge). `false` = servo/ESC pulse, 1500 µs neutral. |
+| `PIN_DRIVE_L_PWM` / `_DIR` | 2 / 5 | left channel |
+| `PIN_DRIVE_R_PWM` / `_DIR` | 3 / 6 | right channel |
+| `PIN_STEER_PWM` / `_DIR` | 4 / 7 | steering actuator |
+
+**One direction pin per channel**, which suits a BTS7960, a Cytron MD-series or
+anything else with a `PWM` + `DIR` input pair. An **L298N** is different: it
+wants `ENA` plus *two* logic pins (`IN1`, `IN2`) per motor, so it needs a second
+pin per channel driven as the inverse. That is a three-line change in
+`applyChannel()` — say so before wiring one rather than hoping one pin is
+enough.
+
+Frequencies, resolution and the deadband are in `firmware/src/rover_config.h`
+(`MOTOR_PWM_FREQUENCY_HZ` 10 kHz, `SERVO_PWM_FREQUENCY_HZ` 50 Hz,
+`PWM_RESOLUTION_BITS` 12, `MOTOR_DEADBAND_EFFORT` 20).
+
+**`MOTOR_HBRIDGE` defaults to `true` because that is the direction in which a
+wrong guess is harmless.** An H-bridge is what a brushed motor on a driver
+board (L298N, BTS7960, Cytron MD-series) wants: duty 0 at rest, so a wrong
+guess leaves the motor still. The servo/ESC mode idles at a 1500 µs pulse,
+which an H-bridge would read as 7.5% duty and *turn the motor*. Check which
+your driver expects before connecting anything that moves, and flip the one
+constant if it is an ESC.
+
+> **Before powering anything.**
+> - Teensy 4.1 is **3.3 V and NOT 5 V tolerant.** A 5 V sensor or a 5 V logic
+>   output on a pin destroys the board. Level-shift everything.
+> - **Never** power motors from the Teensy. Separate supply, common ground,
+>   and nothing back-feeding the 3.3 V rail.
+> - First flash with the drive pins **disconnected**. The LED blink and
+>   `uart_drive.py` reporting `APPLIED` prove the whole chain with nothing able
+>   to move. Then wire one channel, wheels off the ground.
+> - There is **no brake-before-reverse delay**. A command reversal flips the
+>   direction pin in the same cycle the duty changes. A sign-magnitude driver
+>   handles that; check yours, and keep early commands small.
+
 ### A virtual CAN bus (no hardware, real CAN stack)
 
 ```bash
@@ -158,15 +272,15 @@ pip install python-can
 python3 host/jetson_test.py --channel vcan0
 ```
 
-### The real Teensy
+### The real Teensy over CAN
 
-**PlatformIO.** `platformio.ini` is in the repo root and names the board and
-both libraries, so there is nothing to install by hand:
+The CAN build is the same firmware with the transport swapped, kept so the
+UART work is not a fork:
 
 ```bash
-pio run              # compile for the Teensy 4.1
-pio run -t upload    # compile and flash
-pio device monitor   # the boot banner, 115200
+pio run -e teensy41_can
+pio run -e teensy41_can -t upload
+pio device monitor   # the boot banner, 115200 — this build does print one
 ```
 
 Then, from the Jetson side:
@@ -174,6 +288,11 @@ Then, from the Jetson side:
 ```bash
 python3 host/jetson_test.py --channel can0 --bitrate 500000
 ```
+
+Everything above the transport — framing, the CRC, sequence numbers, the
+command watchdog, authority, the drive stage — is byte-identical between the
+two environments. Only `linkBegin()`, `linkPoll()`, `linkReady()` and
+`linkSend()` differ, under `ROVER_LINK_CAN`.
 
 > **Why not the Arduino IDE.** The entry point is `firmware/rover_firmware.cpp`,
 > a plain translation unit rather than an Arduino `.ino` sketch. The IDE needs a
@@ -185,19 +304,13 @@ python3 host/jetson_test.py --channel can0 --bitrate 500000
 > `#include "rover_firmware.cpp"` — but then keep both toolchains honest, because
 > only one of them is exercised here.
 
-First flash is worth doing with **nothing connected to the drive pins or the
-CAN bus** — the boot banner alone exercises the build, the boot-fault check and
-the watchdog arming, with nothing able to move.
-
-> **Before powering anything.**
-> - Teensy 4.1 is **3.3 V and NOT 5 V tolerant.** A 5 V sensor on a pin
->   destroys the board. Level-shift everything.
+> **Before powering a CAN bus.**
 > - Each CAN bus needs a **transceiver** — the MCU cannot drive a differential
 >   bus directly.
 > - The bus needs **120 Ω termination at both physical ends.** Exactly one
 >   resistor, or three, is the single most common CAN bring-up failure.
 
-The firmware prints a banner over USB serial on boot:
+The CAN build prints a banner over USB serial on boot:
 
 ```
 rover firmware up: CAN3 @ 500000 bps, hw watchdog 1000 ms
@@ -212,23 +325,34 @@ crashed — see `PROTOCOL.md` §5.2.
 
 Stated plainly, so nobody builds on an unchecked assumption:
 
-- **Never run on a real Teensy or a real CAN bus.** Every library call was
-  verified against the `FlexCAN_T4` and `WDT_T4` headers, and the whole
-  firmware — `rover_firmware.cpp` plus everything in `src/` — compiles *and
-  links* under a host compiler at `-Wall -Wextra -Werror` against stub
-  `Arduino.h`, `FlexCAN_T4.h` and `Watchdog_t4.h`. What that does not cover is
-  the real `arm-none-eabi` build against the actual Teensyduino and library
+- **Never run on a real Teensy, a real CAN bus or a real serial port.** Every
+  library call was verified against the `FlexCAN_T4` and `WDT_T4` headers, and
+  the whole firmware — `rover_firmware.cpp` plus everything in `src/` —
+  compiles *and links* under both g++ and clang at `-Wall -Wextra -Werror`
+  against stub `Arduino.h`, `FlexCAN_T4.h` and `Watchdog_t4.h`, in **both** the
+  `ROVER_LINK_CAN=0` and `=1` configurations. What that does not cover is the
+  real `arm-none-eabi` build against the actual Teensyduino and library
   headers, which has never run, and the board, which has never been flashed.
   Bench validation is owed.
+- **The UART link has never carried a byte between two machines.** Both framers
+  are pinned to the same literal wire bytes
+  (`tests/cpp/test_serial.cpp` and `tests/host/test_serial_framing.py`) and
+  each is tested against noise, truncation and corruption, but no test runs
+  `host/serial_link.py` against the firmware over a port. The firmware side of
+  `linkPoll()`/`linkSend()` is exercised only by compiling and linking.
 - **`SRC_SRSR` watchdog bit mask is unverified.** It fails safe — an
   unrecognised reset cause reports nothing — but confirm it by deliberately
   hanging the loop once on the bench.
-- **Sensor I/O is stubbed** behind `readSensors()`. The drive stage is real and
-  unit-tested (`rover_drive.*`), but its output pins are placeholders and the
-  PWM mode is unverified: `analogWrite()` suits a brushed H-bridge or a
-  PWM-input ESC, while a hobby servo or a PPM-input ESC wants a 1–2 ms pulse in
-  a 20 ms frame. **Establish which the hardware expects before connecting
-  anything that moves.**
+- **Sensor I/O is stubbed** behind `readSensors()`, so every telemetry reading
+  except the command echo is synthetic: encoder counts, current and voltage are
+  a model, not a measurement. Treat `APPLIED` in `uart_drive.py` as the real
+  signal and the encoder counts as decoration until encoders are wired.
+- **The drive pins and the output mode are placeholders.** The drive stage
+  itself is real and unit-tested (`rover_drive.*`, `rover_motor.*`), but pins
+  2–7 are a guess and `MOTOR_HBRIDGE` is a guess at the hardware. It defaults
+  to the H-bridge mode because that is the direction in which a wrong guess
+  leaves the motor still; see *Wiring motors* above. **Establish which the
+  hardware expects before connecting anything that moves.**
 - **`return_request` is acknowledged, not acted on.** The controller reports
   that it arrived; whether it should *do* anything is an open team decision in
   `PROTOCOL.md` §9, because it changes `effectiveStop()`.

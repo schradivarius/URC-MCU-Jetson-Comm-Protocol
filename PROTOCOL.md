@@ -71,6 +71,7 @@
 | Parameter | Value |
 |---|---|
 | Physical layer | CAN 2.0B, differential twisted pair, **120 Ω termination at both ends** |
+| Alternative | USB serial / UART — see §2.0, same messages, same safety |
 | Bit rate | 500 kbps (placeholder; 1 Mbps is fine at these frame sizes) |
 | Bus | Teensy 4.1 **CAN3** (FD-capable) — CAN1/CAN2 work unchanged |
 | Frame format | Standard, 11-bit identifiers, **every frame DLC 8** |
@@ -82,6 +83,52 @@ At 500 kbps an 8-byte frame is roughly 220 µs of airtime. Six frames per cycle
 is ~1.3 ms of a 50 ms period — about **3% bus utilisation**. Throughput is
 nowhere near the constraint; CAN was chosen for determinism and noise immunity,
 not speed. Say so plainly when anyone asks.
+
+### 2.0 Two transports, one message set
+
+The table above describes the CAN transport, which is the design target. There
+is a second transport: **USB serial / UART**, selected by `ROVER_LINK_CAN=0` in
+`platformio.ini` and the default build. It exists because a laptop can reach it
+with a cable and nothing else, which is what a bring-up needs.
+
+| Parameter | Value |
+|---|---|
+| Physical layer | Teensy 4.1 native USB serial (a hardware UART is a three-function change) |
+| Bit rate | `SERIAL_BAUD_HZ` = 115200, ignored by native USB, honoured by a UART |
+| Framing | SLIP (RFC 1055): `0xC0` END, `0xDB` ESC, `0xDC`/`0xDD` escape codes |
+| Frame body | `id_low`, `id_high`, then the 8 protocol bytes unchanged |
+| Rates | identical to CAN: 20 Hz in, 5 frames at 20 Hz out |
+
+**Nothing above the transport changes.** The 8 payload bytes, the sequence
+number, the CRC-8, every validation predicate, the command watchdog, command
+authority and the drive stage are the same code, compiled the same way. The
+identifier keeps its CAN value and its meaning; what it loses is its second
+job, because a serial line has no arbitration, so on this transport an id is a
+name and not a priority. At 20 Hz that costs nothing — the ordering in §2.1 is
+why, not a constraint this transport has to meet.
+
+SLIP rather than a length-prefixed header, because it **resynchronises on its
+own**. A board reset mid-frame, a half-written buffer, noise on a UART, or
+anything else already in the port when a host attaches costs exactly one
+frame, not the rest of the session. A length field would instead mis-frame
+every byte after the first bad one. The cost is one escape byte per `0xC0` or
+`0xDB` in the payload, so a worst-case frame is 22 bytes rather than 12 —
+irrelevant at 120 frames/s.
+
+The framing carries **no checksum of its own**. The protocol's CRC-8 already
+covers the id and the payload (§4), and a second one over the same bytes would
+only add a way for the two to disagree. A body that survives framing is
+validated by exactly the code a CAN frame is.
+
+Framing is implemented twice, in `firmware/src/rover_serial.*` and
+`host/serial_link.py`, and pinned against the same literal wire bytes in
+`tests/cpp/test_serial.cpp` and `tests/host/test_serial_framing.py` — the same
+bargain as the codec in §8.
+
+A body shorter than three bytes, longer than ten, carrying an identifier wider
+than 11 bits, or holding an undefined escape code is discarded and counted. An
+*empty* body is not an error: both encoders emit a leading END precisely so
+that whatever preceded a frame is flushed.
 
 ### 2.1 Identifiers *are* priorities
 

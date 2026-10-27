@@ -34,6 +34,7 @@ HEADER_PATH = protocol_root.firmware_src("rover_config.h")
 SHARED = {
     "PROTOCOL_VERSION":      "PROTOCOL_VERSION",
     "CAN_BITRATE_HZ":        "CAN_BITRATE_HZ",
+    "SERIAL_BAUD_HZ":        "SERIAL_BAUD_HZ",
     "WATCHDOG_TIMEOUT_MS":   "DEFAULT_WATCHDOG_TIMEOUT_MS",
     "TELEMETRY_PERIOD_MS":   "DEFAULT_TELEMETRY_PERIOD_MS",
     "LINK_DEGRADED_HOLD_MS": "LINK_DEGRADED_HOLD_MS",
@@ -60,7 +61,9 @@ FRAME_GEOMETRY = ("FRAME_DLC", "FRAME_PAYLOAD", "FRAME_SEQ_OFFSET",
 
 # No Python counterpart, so the comparison above cannot catch these drifting
 # back out into rover_firmware.cpp.
-FIRMWARE_ONLY = ("HW_WATCHDOG_MS", "OVER_CURRENT_CA", "UNDERVOLTAGE_CV")
+FIRMWARE_ONLY = ("HW_WATCHDOG_MS", "OVER_CURRENT_CA", "UNDERVOLTAGE_CV",
+                 "SERVO_PWM_FREQUENCY_HZ", "MOTOR_PWM_FREQUENCY_HZ",
+                 "PWM_RESOLUTION_BITS", "MOTOR_DEADBAND_EFFORT")
 
 
 def cpp_constants():

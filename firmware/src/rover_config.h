@@ -28,6 +28,11 @@ static const uint8_t PROTOCOL_VERSION = 6;
 // --- Link ------------------------------------------------------------------
 static const uint32_t CAN_BITRATE_HZ = 500000;   // 500 kbps; every node must match
 
+// USB serial / UART link. The Teensy 4.1's native USB ignores this figure and
+// always runs at USB speed; it matters only for a hardware UART behind a
+// USB-TTL adapter, and for the host, which must ask for the same number.
+static const uint32_t SERIAL_BAUD_HZ = 115200;
+
 // --- Timing ----------------------------------------------------------------
 static const uint32_t DEFAULT_WATCHDOG_TIMEOUT_MS = 300;   // no valid CONTROL -> stop
 static const uint32_t DEFAULT_TELEMETRY_PERIOD_MS = 50;    // 20 Hz
@@ -100,6 +105,19 @@ static const int16_t UNDERVOLTAGE_CV = 2000;   // 20.00 V
 // controller, a DAC) changes these and nothing above them.
 static const uint16_t PWM_NEUTRAL_US = 1500;
 static const uint16_t PWM_SPAN_US    = 500;   // full scale either side of neutral
+
+// Output-stage electrical configuration. SERVO_PWM_FREQUENCY_HZ is the frame
+// rate a servo or PPM-input ESC expects; MOTOR_PWM_FREQUENCY_HZ is the chopping
+// frequency for a brushed H-bridge (L298N, BTS7960, Cytron MD-series all
+// tolerate 10 kHz). PWM_RESOLUTION_BITS must satisfy
+// 2^bits <= F_BUS_ACTUAL / frequency, which 12 bits does for both.
+static const uint32_t SERVO_PWM_FREQUENCY_HZ = 50;
+static const uint32_t MOTOR_PWM_FREQUENCY_HZ = 10000;
+static const uint8_t  PWM_RESOLUTION_BITS    = 12;
+
+// Efforts at or below this magnitude are output as zero. Below roughly this
+// much duty a brushed motor stalls and buzzes instead of turning.
+static const int16_t MOTOR_DEADBAND_EFFORT = 20;
 
 // --- Valid command ranges --------------------------------------------------
 // drive_cmd and steer_cmd are tenths of a percent, so +/-1000 is full scale.

@@ -9,7 +9,12 @@
 #     python3 host/jetson_test.py --channel can0
 python-can>=4.0
 
-# The firmware has no pip dependencies. It needs two Arduino libraries,
-# installed through the Arduino IDE Library Manager:
+# pyserial is needed ONLY to talk to the MCU over USB serial / UART:
+#     python host/uart_drive.py --port COM5 --drive 300 --seconds 3
+# Install just this one if CAN is not in play:  python -m pip install pyserial
+pyserial>=3.5
+
+# The firmware has no pip dependencies. It needs two Arduino libraries, which
+# PlatformIO installs itself from the lib_deps in platformio.ini:
 #     FlexCAN_T4   https://github.com/tonton81/FlexCAN_T4
 #     WDT_T4       https://github.com/tonton81/WDT_T4

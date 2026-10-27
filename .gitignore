@@ -23,3 +23,6 @@ htmlcov/
 *.uf2
 .mpy_cache/
 tests/cpp/build/
+
+# PlatformIO build output
+.pio/
