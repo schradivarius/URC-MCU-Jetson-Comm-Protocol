@@ -82,6 +82,20 @@
 
 namespace rover {
 
+//Rover mode enumeration
+enum class RoverMode : uint8_t {
+    SAFE = 0,
+    TELEOP = 1,
+    AUTONOMOUS = 2
+};
+
+enum class CommandSource : uint8_t {
+    NONE = 0,
+    TELEOP_SOURCE = 1,
+    AUTONOMY_SOURCE = 2, 
+    EMERGENCY_SOURCE = 3
+};
+
 // SNAPSHOT TEARING, on the four telemetry ids in rover_config.h: every frame
 // of one control cycle carries the SAME sequence number. The Jetson can
 // therefore tell whether the four frames it holds came from one cycle or
