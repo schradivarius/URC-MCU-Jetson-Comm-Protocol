@@ -60,6 +60,7 @@
 
 #include "src/rover_controller.h"
 #include "src/rover_drive.h"
+#include "src/rover_feedback.h"
 #include "src/rover_protocol.h"
 
 using namespace rover;
@@ -123,6 +124,14 @@ static RoverController* ctl = nullptr;
 static DriveModule drive_stage;
 static uint16_t g_boot_faults = 0;
 
+// How long since each sensor last produced a SAMPLE -- a new reading, whether
+// or not its value changed. Fed by noteSample() in loop() and nowhere else,
+// so there is exactly one place to gate if a test wants to fake a sensor that
+// stops updating. A stale tracker is REPORTED (fault bits + TELEM_FEEDBACK
+// ages) and never stops the rover; acting on it is Task 6.
+static FeedbackAge g_enc_age(millis, ENCODER_STALE_MS);
+static FeedbackAge g_steer_age(millis, STEER_STALE_MS);
+
 // ---------------------------------------------------------------------------
 // Sensor / motor I/O -- placeholder implementations.
 //
@@ -149,6 +158,8 @@ struct SensorReading {
     uint8_t  controller_health;  // CTRL_HEALTH_*
     int16_t  drive_applied;      // what the drive stage was handed this cycle
     int16_t  steer_applied;
+    bool     enc_fresh;          // a new encoder reading arrived this loop
+    bool     steer_fresh;        // a new steering reading arrived this loop
 };
 
 // Takes the DRIVE STAGE's output rather than the raw command, so the
@@ -165,10 +176,16 @@ static SensorReading readSensors(const DriveOutputs& out) {
         //   fault_bits  : FAULT_OVER_CURRENT / FAULT_ENCODER_FAULT / etc.
         //   controller_health : CTRL_HEALTH_* from motor-driver telemetry,
         //                 which on a CAN bus arrives as its own messages
+        //   enc_fresh / steer_fresh : true only when the read above produced
+        //                 a NEW reading (a new quadrature count, a new CAN
+        //                 message, a completed ADC conversion)
         r.enc_left = 0; r.enc_right = 0; r.steer_fb = 0;
         r.current_ca = 0; r.voltage_cv = 0; r.fault_bits = 0;
         r.controller_health = drive_stage.health();
         r.drive_applied = 0; r.steer_applied = 0;   // filled in by loop()
+        // Nothing is read yet, so nothing is fresh: both ages stay UNKNOWN
+        // and both stale bits stay set -- honest, not a false "all fine".
+        r.enc_fresh = false; r.steer_fresh = false;
         return r;
     }
 
@@ -201,6 +218,9 @@ static SensorReading readSensors(const DriveOutputs& out) {
     r.controller_health = drive_stage.health();
     r.drive_applied = 0;                        // filled in by loop()
     r.steer_applied = 0;
+    // The simulated plant produces a new reading of both every loop.
+    r.enc_fresh   = true;
+    r.steer_fresh = true;
     return r;
 }
 
@@ -254,8 +274,8 @@ static uint16_t detectBootFault() {
 // Telemetry
 // ---------------------------------------------------------------------------
 
-// Four frames per cycle, because each must fit Classic CAN's 8 bytes once the
-// per-frame sequence number and CRC are accounted for. All four carry the SAME
+// Six frames per cycle, because each must fit Classic CAN's 8 bytes once the
+// per-frame sequence number and CRC are accounted for. All six carry the SAME
 // sequence number, which is how the Jetson tells a coherent snapshot from one
 // torn across two cycles. See rover_protocol.h for why not one CAN FD frame.
 static void sendTelemetry(const SensorReading& s) {
@@ -294,6 +314,13 @@ static void sendTelemetry(const SensorReading& s) {
     TelemetryCmdEcho ce = ctl->buildCmdEcho(s.drive_applied, s.steer_applied);
     frame.id  = CAN_ID_TELEM_CMD_ECHO;
     frame.len = encodeTelemetryCmdEcho(ce, seq, frame.buf);
+    Can.write(frame);
+
+    // Feedback freshness, plus the command flags no other frame echoes. Same
+    // seq as the five above, or the Jetson cannot put it in the snapshot.
+    TelemetryFeedback fb = ctl->buildFeedback(g_enc_age.ageMs(), g_steer_age.ageMs());
+    frame.id  = CAN_ID_TELEM_FEEDBACK;
+    frame.len = encodeTelemetryFeedback(fb, seq, frame.buf);
     Can.write(frame);
 }
 
@@ -367,6 +394,11 @@ void loop() {
     // the acknowledgement frame is about.
     s.drive_applied = drive;
     s.steer_applied = steer;
+    // The one place samples are noted. Then the stale bits ride along with
+    // the other sensor faults into faultWord(), via buildPower().
+    if (s.enc_fresh)   g_enc_age.noteSample();
+    if (s.steer_fresh) g_steer_age.noteSample();
+    s.fault_bits |= staleFaultBits(g_enc_age, g_steer_age);
     setMotorOutputs(out);
 
     if (ctl->telemetryDue()) {

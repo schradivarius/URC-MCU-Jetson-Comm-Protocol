@@ -106,6 +106,19 @@ static void age_saturates_at_max_instead_of_wrapping() {
     CHECK(age.isStale());
 }
 
+static void stale_fault_bits_name_each_stale_sensor() {
+    FeedbackAge enc = freshTracker();
+    FeedbackAge steer(fakeMillis, 300);
+    CHECK_EQ(staleFaultBits(enc, steer), FAULT_ENCODER_STALE | FAULT_STEER_STALE);
+    enc.noteSample();
+    CHECK_EQ(staleFaultBits(enc, steer), FAULT_STEER_STALE);
+    steer.noteSample();
+    CHECK_EQ(staleFaultBits(enc, steer), 0);
+    advance(300);
+    steer.noteSample();
+    CHECK_EQ(staleFaultBits(enc, steer), FAULT_ENCODER_STALE);
+}
+
 int main() {
     RUN_TEST(age_is_unknown_before_the_first_sample);
     RUN_TEST(stale_before_the_first_sample);
@@ -118,6 +131,7 @@ int main() {
     RUN_TEST(not_stale_1_ms_before_the_threshold);
     RUN_TEST(age_is_correct_across_millis_wrap);
     RUN_TEST(age_saturates_at_max_instead_of_wrapping);
+    RUN_TEST(stale_fault_bits_name_each_stale_sensor);
 
 
     return testing::summary("test_feedback");

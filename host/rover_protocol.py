@@ -32,12 +32,14 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from rover_config import (  # noqa: E402,F401
     CAN_ID_CONTROL, CAN_ID_TELEM_DRIVE_L, CAN_ID_TELEM_DRIVE_R,
     CAN_ID_TELEM_POWER, CAN_ID_TELEM_STATE, CAN_ID_TELEM_CMD_ECHO,
+    CAN_ID_TELEM_FEEDBACK, ENCODER_STALE_MS, STEER_STALE_MS,
     MODE_SAFE, MODE_TELEOP, MODE_AUTONOMOUS, MODE_FAULT, MODE_MAX,
     CMD_MIN, CMD_MAX, PROTOCOL_VERSION, PWM_NEUTRAL_US, PWM_SPAN_US,
 )
 
 TELEM_IDS = (CAN_ID_TELEM_DRIVE_L, CAN_ID_TELEM_DRIVE_R,
-             CAN_ID_TELEM_POWER, CAN_ID_TELEM_STATE, CAN_ID_TELEM_CMD_ECHO)
+             CAN_ID_TELEM_POWER, CAN_ID_TELEM_STATE, CAN_ID_TELEM_CMD_ECHO,
+             CAN_ID_TELEM_FEEDBACK)
 
 # --- operating modes (values in rover_config.py) ---
 MODE_NAMES = {MODE_SAFE: "SAFE", MODE_TELEOP: "TELEOP",
@@ -89,6 +91,8 @@ FAULT_C2_LINK_LOST   = 0x0080
 FAULT_SEQ_GAP        = 0x0100
 FAULT_CRC_ERROR      = 0x0200
 FAULT_CMD_SOURCE     = 0x0400
+FAULT_ENCODER_STALE  = 0x0800   # no encoder sample within ENCODER_STALE_MS
+FAULT_STEER_STALE    = 0x1000   # no steering sample within STEER_STALE_MS
 
 FAULT_NAMES = [
     (FAULT_COMM_TIMEOUT, "COMM_TIMEOUT"),
@@ -102,6 +106,8 @@ FAULT_NAMES = [
     (FAULT_SEQ_GAP, "SEQ_GAP"),
     (FAULT_CRC_ERROR, "CRC_ERROR"),
     (FAULT_CMD_SOURCE, "CMD_SOURCE"),
+    (FAULT_ENCODER_STALE, "ENCODER_STALE"),
+    (FAULT_STEER_STALE, "STEER_STALE"),
 ]
 
 # --- link health. Jetson and C2 are SEPARATE and never collapsed. ---
@@ -141,6 +147,28 @@ CMD_ECHO_DECODE_SHIFT  = 3
 CMD_ECHO_RETURN_ACTIVE = 0x40   # bit 6
 CMD_ECHO_RESERVED_MASK = 0x80   # bit 7, must be zero
 
+# --- TelemetryFeedback.flags packing ---
+# NOT the CONTROL bit positions: stop and autonomy_abort sit one bit higher
+# here, so never reuse CTRL_FLAG_* on this byte.
+FEEDBACK_RESERVED_MASK       = 0x01   # bit 0, must be zero
+FEEDBACK_FLAG_STOP           = 0x02   # bit 1
+FEEDBACK_FLAG_AUTONOMY_ABORT = 0x04   # bit 2
+FEEDBACK_INDICATOR_MASK      = 0x38   # bits 3-5: indicator REQUESTED
+FEEDBACK_INDICATOR_SHIFT     = 3
+FEEDBACK_ACTIVE_MODE_MASK    = 0xC0   # bits 6-7: activeMode(), can read FAULT
+FEEDBACK_ACTIVE_MODE_SHIFT   = 6
+
+# --- TelemetryFeedback.active_source (byte 5) ---
+# Who sent the last valid CONTROL frame. NONE before the first one.
+# EMERGENCY is reserved for Task 5.4's source tracking; nothing sends it yet.
+ACTIVE_SOURCE_NONE      = 0
+ACTIVE_SOURCE_TELEOP    = 1
+ACTIVE_SOURCE_AUTONOMY  = 2
+ACTIVE_SOURCE_EMERGENCY = 3
+ACTIVE_SOURCE_NAMES = {ACTIVE_SOURCE_NONE: "NONE", ACTIVE_SOURCE_TELEOP: "TELEOP",
+                       ACTIVE_SOURCE_AUTONOMY: "AUTONOMY",
+                       ACTIVE_SOURCE_EMERGENCY: "EMERGENCY"}
+
 # --- command age sentinels ---
 CMD_AGE_UNKNOWN = 0xFFFF
 CMD_AGE_MAX     = 0xFFFE
@@ -161,6 +189,7 @@ DRIVE_R_FMT = "<iH"     # enc_right, cmd_age_ms
 POWER_FMT   = "<hhH"    # current_ca, voltage_cv, fault_status
 STATE_FMT   = "<6B"     # mode, jetson_link, c2_link, ctrl_health, indicator, rsvd
 ECHO_FMT    = "<hhBB"   # drive_applied, steer_applied, ack_seq, status
+FEEDBACK_FMT = "<HHBB"  # enc_age_ms, steer_age_ms, flags, active_source
 
 INT32_MIN = -(2 ** 31)
 INT32_MAX = 2 ** 31 - 1
@@ -266,6 +295,33 @@ def decode_result_of(packed):
 
 def return_active_of(packed):
     return bool(packed & CMD_ECHO_RETURN_ACTIVE)
+
+
+def pack_feedback_flags(stop=False, autonomy_abort=False,
+                        indicator_request=INDICATOR_OFF, active_mode=MODE_SAFE):
+    """Build a TelemetryFeedback.flags byte; mirrors packFeedbackFlags()."""
+    packed = 0
+    if stop:            packed |= FEEDBACK_FLAG_STOP
+    if autonomy_abort:  packed |= FEEDBACK_FLAG_AUTONOMY_ABORT
+    packed |= (indicator_request << FEEDBACK_INDICATOR_SHIFT) & FEEDBACK_INDICATOR_MASK
+    packed |= (active_mode << FEEDBACK_ACTIVE_MODE_SHIFT) & FEEDBACK_ACTIVE_MODE_MASK
+    return packed
+
+
+def feedback_stop_of(packed):
+    return bool(packed & FEEDBACK_FLAG_STOP)
+
+
+def feedback_abort_of(packed):
+    return bool(packed & FEEDBACK_FLAG_AUTONOMY_ABORT)
+
+
+def feedback_indicator_of(packed):
+    return (packed & FEEDBACK_INDICATOR_MASK) >> FEEDBACK_INDICATOR_SHIFT
+
+
+def feedback_active_mode_of(packed):
+    return (packed & FEEDBACK_ACTIVE_MODE_MASK) >> FEEDBACK_ACTIVE_MODE_SHIFT
 
 
 def seq_delta(previous, current):
@@ -483,10 +539,38 @@ def decode_telemetry_cmd_echo(frame, can_id=CAN_ID_TELEM_CMD_ECHO):
     }
 
 
+def encode_telemetry_feedback(enc_age_ms, steer_age_ms, flags, active_source,
+                              seq=0):
+    return _seal(CAN_ID_TELEM_FEEDBACK,
+                 struct.pack(FEEDBACK_FMT, enc_age_ms, steer_age_ms,
+                             flags, active_source), seq)
+
+
+def decode_telemetry_feedback(frame, can_id=CAN_ID_TELEM_FEEDBACK):
+    """No value checks, like the other telemetry decoders: an age is an age,
+    and judging whether a reading is plausible is not this frame's job."""
+    result, payload, seq = _open(can_id, frame)
+    if result != DECODE_OK:
+        return result, None
+    enc_age, steer_age, flags, source = struct.unpack(FEEDBACK_FMT, payload)
+    return DECODE_OK, {
+        "enc_age_ms": enc_age, "steer_age_ms": steer_age,
+        "feedback_flags_raw": flags,
+        # Unpacked, like the CMD_ECHO status byte.
+        "stop": feedback_stop_of(flags),
+        "autonomy_abort": feedback_abort_of(flags),
+        "indicator_request": feedback_indicator_of(flags),
+        "active_mode": feedback_active_mode_of(flags),
+        "active_source": source,
+        "seq": seq,
+    }
+
+
 DECODERS = {
     CAN_ID_TELEM_DRIVE_L: decode_telemetry_drive_l,
     CAN_ID_TELEM_DRIVE_R: decode_telemetry_drive_r,
     CAN_ID_TELEM_POWER:   decode_telemetry_power,
     CAN_ID_TELEM_STATE:   decode_telemetry_state,
     CAN_ID_TELEM_CMD_ECHO: decode_telemetry_cmd_echo,
+    CAN_ID_TELEM_FEEDBACK: decode_telemetry_feedback,
 }

@@ -33,6 +33,7 @@ SIM_SOURCES = [
     protocol_root.tools("rover_sim.cpp"),
     protocol_root.firmware_src("rover_controller.cpp"),
     protocol_root.firmware_src("rover_protocol.cpp"),
+    protocol_root.firmware_src("rover_feedback.cpp"),
     protocol_root.firmware_src("rover_drive.cpp"),
 ]
 # Headers count too: a constant changed only in rover_config.h must still
@@ -40,7 +41,7 @@ SIM_SOURCES = [
 SIM_HEADERS = [
     protocol_root.firmware_src(name)
     for name in ("rover_config.h", "rover_protocol.h", "rover_controller.h",
-                 "rover_drive.h")
+                 "rover_drive.h", "rover_feedback.h")
 ]
 SIM_BINARY = os.path.join(protocol_root.build_dir(), "rover_sim")
 

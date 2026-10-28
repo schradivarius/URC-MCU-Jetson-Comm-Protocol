@@ -6,6 +6,7 @@
 // safety test.
 
 #include "../../firmware/src/rover_controller.h"
+#include "../../firmware/src/rover_feedback.h"
 #include "test_framework.h"
 
 using namespace rover;
@@ -650,7 +651,7 @@ static void telemetry_paces_at_the_configured_period() {
 }
 
 static void the_telemetry_sequence_advances_once_per_cycle() {
-    // All four frames of a cycle must share one sequence number -- that is how
+    // All six frames of a cycle must share one sequence number -- that is how
     // the Jetson tells a coherent snapshot from one torn across two cycles.
     RoverController ctl = freshController();
     CHECK(ctl.telemetryDue());
@@ -1018,6 +1019,127 @@ static void a_refused_command_is_not_a_stop() {
     CHECK_EQ(d, 700); CHECK_EQ(s, 300);
 }
 
+// --- TELEM_FEEDBACK (0x205) and stale feedback -------------------------------
+
+static void the_feedback_frame_carries_the_ages_it_is_given() {
+    // The controller cannot see the sensors, so it passes the ages through
+    // untouched -- including the two special values.
+    RoverController ctl = freshController();
+    TelemetryFeedback fb = ctl.buildFeedback(42, CMD_AGE_UNKNOWN);
+    CHECK_EQ(fb.enc_age_ms, 42);
+    CHECK_EQ(fb.steer_age_ms, CMD_AGE_UNKNOWN);
+    fb = ctl.buildFeedback(CMD_AGE_MAX, 0);
+    CHECK_EQ(fb.enc_age_ms, CMD_AGE_MAX);
+    CHECK_EQ(fb.steer_age_ms, 0);
+}
+
+static void the_feedback_frame_echoes_stop_abort_and_indicator_request() {
+    RoverController ctl = freshController();
+    sendControl(ctl, 0, 0, MODE_AUTONOMOUS, /*stop=*/true, /*abort=*/true,
+                false, INDICATOR_ARRIVED);
+    uint8_t f = ctl.buildFeedback(0, 0).flags;
+    CHECK(feedbackStopOf(f));
+    CHECK(feedbackAbortOf(f));
+    CHECK_EQ(feedbackIndicatorOf(f), INDICATOR_ARRIVED);
+    CHECK_EQ(f & FEEDBACK_RESERVED_MASK, 0);
+
+    // And each one clears again: an echo, not a latch.
+    sendControl(ctl, 0, 0, MODE_AUTONOMOUS, false, false, false,
+                INDICATOR_AUTONOMOUS);
+    f = ctl.buildFeedback(0, 0).flags;
+    CHECK(!feedbackStopOf(f));
+    CHECK(!feedbackAbortOf(f));
+    CHECK_EQ(feedbackIndicatorOf(f), INDICATOR_AUTONOMOUS);
+}
+
+static void the_feedback_frame_echoes_the_request_not_what_is_shown() {
+    // A teleoperated rover never shows ARRIVED, but the frame must still say
+    // that ARRIVED was asked for -- that is the whole point of echoing it.
+    RoverController ctl = freshController();
+    sendControl(ctl, 0, 0, MODE_TELEOP, false, false, false, INDICATOR_ARRIVED);
+    CHECK_EQ(ctl.indicatorState(), INDICATOR_TELEOP);
+    CHECK_EQ(feedbackIndicatorOf(ctl.buildFeedback(0, 0).flags), INDICATOR_ARRIVED);
+}
+
+static void the_feedback_frame_reports_the_mode_actually_executed() {
+    RoverController ctl = freshController();
+    sendControl(ctl, 0, 0, MODE_TELEOP, false);
+    CHECK_EQ(feedbackActiveModeOf(ctl.buildFeedback(0, 0).flags), MODE_TELEOP);
+    sendControl(ctl, 0, 0, MODE_AUTONOMOUS, false);
+    CHECK_EQ(feedbackActiveModeOf(ctl.buildFeedback(0, 0).flags), MODE_AUTONOMOUS);
+
+    // Commanded AUTONOMOUS, but the Jetson has gone silent: TELEM_STATE.mode
+    // still echoes AUTONOMOUS, and this frame is where FAULT shows.
+    advance(300);
+    CHECK_EQ(ctl.lastControl().mode, MODE_AUTONOMOUS);
+    CHECK_EQ(feedbackActiveModeOf(ctl.buildFeedback(0, 0).flags), MODE_FAULT);
+}
+
+static void the_feedback_source_is_none_before_the_first_frame() {
+    // The constructor's from_autonomy = false must not read as "the operator
+    // is driving" before anybody has said anything.
+    RoverController ctl = freshController();
+    CHECK_EQ(ctl.buildFeedback(0, 0).active_source, 0);
+}
+
+static void the_feedback_source_follows_the_last_frame() {
+    RoverController ctl = freshController();
+    sendControl(ctl, 0, 0, MODE_AUTONOMOUS, false);
+    CHECK_EQ(ctl.buildFeedback(0, 0).active_source, 2);     // AUTONOMY
+    sendControl(ctl, 0, 0, MODE_TELEOP, false);
+    CHECK_EQ(ctl.buildFeedback(0, 0).active_source, 1);     // TELEOP
+    // It reports who SENT the frame, even when that source does not own the
+    // mode; the refusal itself is CMD_STATUS_WRONG_SOURCE's job.
+    sendControl(ctl, 0, 0, MODE_AUTONOMOUS, false, false, false,
+                INDICATOR_OFF, false, SRC_TELEOP);
+    CHECK_EQ(ctl.buildFeedback(0, 0).active_source, 1);
+}
+
+static void stale_bits_appear_in_the_fault_word_and_clear_again() {
+    RoverController ctl = freshController();
+    FeedbackAge enc(fakeMillis, 300), steer(fakeMillis, 300);
+    sendControl(ctl, 0, 0, MODE_TELEOP, false);
+
+    // Never sampled: both stale.
+    uint16_t faults = ctl.faultWord(staleFaultBits(enc, steer));
+    CHECK(faults & FAULT_ENCODER_STALE);
+    CHECK(faults & FAULT_STEER_STALE);
+
+    enc.noteSample(); steer.noteSample();
+    faults = ctl.faultWord(staleFaultBits(enc, steer));
+    CHECK(!(faults & FAULT_ENCODER_STALE));
+    CHECK(!(faults & FAULT_STEER_STALE));
+
+    // The steering stops updating; the encoder keeps going. Commands keep
+    // arriving so the watchdog stays out of it.
+    for (int i = 0; i < 6; ++i) {
+        advance(50);
+        sendControl(ctl, 0, 0, MODE_TELEOP, false);
+        enc.noteSample();
+    }
+    faults = ctl.faultWord(staleFaultBits(enc, steer));
+    CHECK(!(faults & FAULT_ENCODER_STALE));
+    CHECK(faults & FAULT_STEER_STALE);
+    CHECK(!(faults & FAULT_COMM_TIMEOUT));
+
+    steer.noteSample();
+    CHECK(!(ctl.faultWord(staleFaultBits(enc, steer)) & FAULT_STEER_STALE));
+}
+
+static void stale_feedback_is_reported_but_does_not_stop_the_rover() {
+    // Reported, not acted on: the safe-state response is Task 6.
+    RoverController ctl = freshController();
+    FeedbackAge enc(fakeMillis, 300), steer(fakeMillis, 300);   // never sampled
+    sendControl(ctl, 500, 100, MODE_TELEOP, false);
+    const uint16_t stale = staleFaultBits(enc, steer);
+    CHECK(ctl.buildPower(0, 2400, stale).fault_status & FAULT_ENCODER_STALE);
+    CHECK(!ctl.effectiveStop());
+    CHECK_EQ(ctl.commandStatus(), CMD_STATUS_APPLIED);
+    CHECK_EQ(ctl.activeMode(), MODE_TELEOP);
+    int16_t d, s; ctl.commandedOutputs(d, s);
+    CHECK_EQ(d, 500); CHECK_EQ(s, 100);
+}
+
 int main() {
     std::printf("test_controller\n");
     RUN_TEST(boots_stopped_and_safe);
@@ -1088,5 +1210,13 @@ int main() {
     RUN_TEST(the_echo_reports_an_active_return_request);
     RUN_TEST(outputs_are_nonzero_only_when_permitted_and_authorised);
     RUN_TEST(a_refused_command_is_not_a_stop);
+    RUN_TEST(the_feedback_frame_carries_the_ages_it_is_given);
+    RUN_TEST(the_feedback_frame_echoes_stop_abort_and_indicator_request);
+    RUN_TEST(the_feedback_frame_echoes_the_request_not_what_is_shown);
+    RUN_TEST(the_feedback_frame_reports_the_mode_actually_executed);
+    RUN_TEST(the_feedback_source_is_none_before_the_first_frame);
+    RUN_TEST(the_feedback_source_follows_the_last_frame);
+    RUN_TEST(stale_bits_appear_in_the_fault_word_and_clear_again);
+    RUN_TEST(stale_feedback_is_reported_but_does_not_stop_the_rover);
     return testing::summary("test_controller");
 }

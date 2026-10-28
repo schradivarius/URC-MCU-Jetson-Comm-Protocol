@@ -21,7 +21,7 @@ namespace rover {
 // --- Protocol version ------------------------------------------------------
 // Bump whenever a message's layout or meaning changes. Not carried on the
 // wire yet; DLC and the application-layer CRC are the only runtime mismatch
-// signals. v0. is the first revision with the CRC and sequence number; v0.6
+// signals. v0.5 is the first revision with the CRC and sequence number; v0.6
 // adds the command-source bit and the TELEM_CMD_ECHO acknowledgement frame;
 // v0.7 adds the TELEM_FEEDBACK frame (0x205) with feedback ages and the echoed
 // command flags/source, and the ENCODER_STALE / STEER_STALE fault bits.
@@ -57,7 +57,7 @@ enum : uint32_t {
     CAN_ID_TELEM_POWER    = 0x202,  // current, voltage, fault word
     CAN_ID_TELEM_STATE    = 0x203,  // mode, link health, controller health
     CAN_ID_TELEM_CMD_ECHO = 0x204,  // what the controller accepted and is acting on
-    CAN_ID_TELEM_FEEDBACK = 0x205,  // what the controller accepted and is doing
+    CAN_ID_TELEM_FEEDBACK = 0x205,  // feedback ages, echoed command flags + source
 };
 
 // Bus load, so nobody has to recompute it when adding another frame: one

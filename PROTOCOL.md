@@ -1,4 +1,4 @@
-# Rover Onboard Computer ↔ Embedded Controller Protocol (v0.6)
+# Rover Onboard Computer ↔ Embedded Controller Protocol (v0.7)
 
 **Scope:** Onboard computer (Jetson Orin Nano, candidate) ↔ embedded controller
 (**Teensy 4.1**, NXP i.MX RT1062, C++ / Teensyduino), over **CAN**.
@@ -49,6 +49,26 @@
 > `controller_health` is no longer a constant `NOT_REPORTED`: the new drive
 > stage reports its own state (§3.5).
 >
+> **v0.7 — feedback age, and the command fields nothing echoed.** Task 5.5 asks
+> the controller to report how *old* its feedback is, not just what it reads,
+> and to send back four things about the command that no frame carried. v0.7
+> adds one frame and two fault bits for that, and changes nothing that was
+> already on the wire:
+>
+> * **`TELEM_FEEDBACK` (`0x205`)** carries the encoder and steering feedback
+>   ages, the echoed `stop`, `autonomy_abort` and indicator *request*, the mode
+>   the controller is actually executing (`activeMode()`, which can read
+>   `FAULT`), and the active command source (§3.7). Telemetry is therefore
+>   **six frames** per cycle.
+> * **`FAULT_ENCODER_STALE` (`0x0800`) and `FAULT_STEER_STALE` (`0x1000`)**
+>   are raised when a sensor has produced no new sample for 300 ms, or none
+>   ever (§3.4, §6.1).
+>
+> Stale feedback is **reported, never acted on**: it does not stop the rover,
+> change the mode or change `cmd_status`. Deciding what the rover should do
+> about it is Task 6, and making feedback go stale on purpose is Task 5.6
+> (§9).
+>
 > Full field tables with types, units, ranges, meanings and update rates are in
 > section 3.
 
@@ -98,6 +118,7 @@ This table is a priority ordering, not just a set of names.
 | **`0x202`** | `TELEM_POWER` | controller → Jetson | 8 | 20 Hz |
 | **`0x203`** | `TELEM_STATE` | controller → Jetson | 8 | 20 Hz |
 | **`0x204`** | `TELEM_CMD_ECHO` | controller → Jetson | 8 | 20 Hz |
+| **`0x205`** | `TELEM_FEEDBACK` | controller → Jetson | 8 | 20 Hz |
 
 Commands outrank telemetry because a late command can hurt the rover and late
 telemetry only annoys an operator.
@@ -118,14 +139,14 @@ Every frame, both directions, has the same shape:
 | `seq` | uint8 | frames | 0–255, **wraps** | Increments once per transmitted cycle. Receiver uses the delta: 1 healthy, 0 duplicate, >1 frames lost. |
 | `crc8` | uint8 | — | 0–255 | CRC-8/SAE-J1850 over the CAN id then bytes 0–6. See section 4. |
 
-**Why five telemetry frames and not one CAN FD frame.** 6 payload bytes × 5
-frames = 30 bytes, which is what the field list needs. One 64-byte FD frame
+**Why six telemetry frames and not one CAN FD frame.** 6 payload bytes × 6
+frames = 36 bytes, which is what the field list needs. One 64-byte FD frame
 would hold it all atomically, but would require FD-capable transceivers on
 every node of the bus including Classic-only motor controllers. The field
 definitions would not change if you later move telemetry to FD.
 
-**Snapshot tearing.** All five telemetry frames of one cycle carry the **same
-`seq`**. The Jetson therefore knows whether the five frames it holds came from
+**Snapshot tearing.** All six telemetry frames of one cycle carry the **same
+`seq`**. The Jetson therefore knows whether the six frames it holds came from
 one cycle or straddle two, and can discard or flag a torn snapshot instead of
 silently mixing a fresh encoder reading with a stale fault word.
 `host/jetson_test.py` counts torn snapshots; a clean link produces zero.
@@ -140,7 +161,8 @@ up *is* the version diagnostic.
 
 ### 3.0 Requirement coverage
 
-Every field the Task 3 and Task 4 briefs enumerate, and where it lives.
+Every field the Task 3, Task 4 and Task 5.5 briefs enumerate, and where it
+lives.
 Nothing in either direction is "to be added later".
 
 **Jetson → MCU command packet** — one structured message, `CONTROL` (§3.1):
@@ -158,12 +180,12 @@ Nothing in either direction is "to be added later".
 | command source (Task 4) | `flags` bit 7 | bool |
 | checksum / CRC | `CONTROL` byte 7 | uint8 CRC-8 |
 
-**MCU → Jetson telemetry packet** — one logical packet, sent as five frames of
-a shared cycle (§2.2, §3.2–3.6):
+**MCU → Jetson telemetry packet** — one logical packet, sent as six frames of
+a shared cycle (§2.2, §3.2–3.7):
 
 | Required field | Where | Type |
 |---|---|---|
-| sequence number | byte 6 of all five frames | uint8 |
+| sequence number | byte 6 of all six frames | uint8 |
 | encoder values | `TELEM_DRIVE_L` / `_R` bytes 0–3 | int32 ×2 |
 | steering feedback | `TELEM_DRIVE_L` bytes 4–5 | int16 |
 | current status | `TELEM_POWER` bytes 0–1 | int16 |
@@ -179,7 +201,13 @@ a shared cycle (§2.2, §3.2–3.6):
 | accepted steering command (Task 4) | `TELEM_CMD_ECHO` bytes 2–3 | int16 |
 | acknowledged sequence number (Task 4) | `TELEM_CMD_ECHO` byte 4 | uint8 |
 | command verdict (Task 4) | `TELEM_CMD_ECHO` byte 5, bits 0–2 | uint8 enum |
-| checksum / CRC | byte 7 of all five frames | uint8 CRC-8 |
+| encoder feedback age (Task 5.5) | `TELEM_FEEDBACK` bytes 0–1 | uint16 |
+| steering feedback age (Task 5.5) | `TELEM_FEEDBACK` bytes 2–3 | uint16 |
+| echoed stop / abort (Task 5.5) | `TELEM_FEEDBACK` byte 4, bits 1–2 | bool ×2 |
+| requested indicator state (Task 5.5) | `TELEM_FEEDBACK` byte 4, bits 3–5 | uint8 enum |
+| mode actually executed (Task 5.5) | `TELEM_FEEDBACK` byte 4, bits 6–7 | uint8 enum |
+| active command source (Task 5.5) | `TELEM_FEEDBACK` byte 5 | uint8 enum |
+| checksum / CRC | byte 7 of all six frames | uint8 CRC-8 |
 
 Task 4's feedback loop asks for six fields by name. Five were already here —
 current mode, controller health, command age and fault state, plus the
@@ -188,6 +216,25 @@ sequence number that ties a cycle together. The two that were not are the
 encoders and steering feedback say what the rover *did*, which an autonomy
 stack cannot use to tell "my command got through" from "the rover happens to
 be moving". `TELEM_CMD_ECHO` answers the second question.
+
+Task 5.5 asks the controller to send thirteen fields. This is where each one
+lives; only the last four rows needed v0.7:
+
+| Task 5.5 field | Where |
+|---|---|
+| commanded drive value | `TELEM_CMD_ECHO.drive_applied` |
+| measured drive / encoder value | `TELEM_DRIVE_L.enc_left`, `TELEM_DRIVE_R.enc_right` |
+| commanded steering value | `TELEM_CMD_ECHO.steer_applied` |
+| measured steering value | `TELEM_DRIVE_L.steer_fb` |
+| command age | `TELEM_DRIVE_R.cmd_age_ms` |
+| controller-health state | `TELEM_STATE.controller_health` |
+| current operating mode | `TELEM_STATE.mode` (commanded) and `TELEM_FEEDBACK` active mode (executed) |
+| fault / stale-data state | `TELEM_POWER.fault_status`, including `ENCODER_STALE` / `STEER_STALE` |
+| STOP / abort state | `TELEM_FEEDBACK` flags; `TELEM_CMD_ECHO.cmd_status` says whether it stopped the rover |
+| requested rear-indicator state | `TELEM_FEEDBACK` flags (shown state is `TELEM_STATE.indicator_state`) |
+| active command source | `TELEM_FEEDBACK.active_source` |
+| encoder feedback age | `TELEM_FEEDBACK.enc_age_ms` |
+| steering feedback age | `TELEM_FEEDBACK.steer_age_ms` |
 
 **Every field in both directions updates at 20 Hz**, the rate of its frame. The
 rate is per frame, not per field: there is no slow-changing field sent less
@@ -450,7 +497,9 @@ left. Bits `0x0001`–`0x0040` keep their v0.3 values.
 | `0x0100` | `SEQ_GAP` | CONTROL frames were lost, duplicated or reordered |
 | `0x0200` | `CRC_ERROR` | Application-layer CRC mismatch on our id |
 | `0x0400` | `CMD_SOURCE` | A command arrived from the producer that does not own the current mode: an autonomy frame in `TELEOP`, or an operator frame in `AUTONOMOUS`. Drive and steering are refused; see §3.1.5 |
-| `0x0800`–`0x8000` | *reserved* | |
+| `0x0800` | `ENCODER_STALE` | No new encoder sample for `ENCODER_STALE_MS` (300 ms) or more, or none since boot. **Reported only** — see §3.7 |
+| `0x1000` | `STEER_STALE` | No new steering sample for `STEER_STALE_MS` (300 ms) or more, or none since boot. **Reported only** — see §3.7 |
+| `0x2000`–`0x8000` | *reserved* | |
 
 `PROTOCOL_ERROR`, `CRC_ERROR` and `SEQ_GAP` all self-clear when a valid,
 contiguous frame arrives, so fixing the sender clears the fault rather than
@@ -555,7 +604,7 @@ field:
    alone. If the controller hears the base station and the Jetson does not, the
    *Jetson's* radio or software is broken, not the link. If the Jetson hears it
    and the controller does not, the controller's receiver is. Either is worth a
-   fault bit from the reserved `0x0800`–`0x8000` range. **Do not pick the
+   fault bit from the reserved `0x2000`–`0x8000` range. **Do not pick the
    number until someone is building it** — v0.4 reserved `0x0080` for work that
    had not started, and reconciling that reservation is most of what v0.5 was.
 3. **What is the debounce?** This is the one that will bite. Today the stop
@@ -731,6 +780,67 @@ slew limiter is ever added, this field must keep reporting what was *accepted*:
 the question it answers is whether the command survived validation, mode and
 authority, and a ramp would blur that with how fast the drivetrain can respond.
 The ramp would belong in `TELEM_DRIVE_L`'s feedback, beside `steer_fb`.
+
+### 3.7 `TELEM_FEEDBACK` — `0x205`, DLC 8, 20 Hz
+
+Feedback freshness, plus the command fields no other frame echoes. Added in
+v0.7 for Task 5.5.
+
+| Byte | Field | Type | Units | Valid range | Meaning |
+|---|---|---|---|---|---|
+| 0–1 | `enc_age_ms` | uint16 | ms | 0 … 65534, `0xFFFF` | Time since the encoders last produced a sample. `0xFFFF` (`CMD_AGE_UNKNOWN`) = no sample since boot; saturates at `0xFFFE` (`CMD_AGE_MAX`) rather than wrapping. |
+| 2–3 | `steer_age_ms` | uint16 | ms | as above | Time since steering feedback last produced a sample. Same special values. |
+| 4 | `flags` | uint8 | bitfield | see below | Echoed command flags and the executed mode. |
+| 5 | `active_source` | uint8 | enum | 0–3 | Who sent the last valid `CONTROL` frame: `0` NONE, `1` TELEOP, `2` AUTONOMY, `3` EMERGENCY. |
+| 6 | `seq` | uint8 | frames | 0–255 wraps | The telemetry cycle's sequence number, shared with the other five frames. See 2.2. |
+| 7 | `crc8` | uint8 | — | 0–255 | See 4. |
+
+Multi-byte fields are little-endian, like everywhere else.
+
+**`flags` byte (byte 4)** — **not** the `CONTROL` bit positions: `stop` and
+`autonomy_abort` sit one bit higher here, so `CTRL_FLAG_*` masks must never be
+used on this byte. The `FEEDBACK_*` masks in `rover_protocol.h` are the ones.
+
+| Bits | Mask | Field | Meaning |
+|---|---|---|---|
+| 0 | `0x01` | *reserved* | Sent as **0**. |
+| 1 | `0x02` | `stop` | The `stop` flag of the last accepted `CONTROL` frame. |
+| 2 | `0x04` | `autonomy_abort` | The `autonomy_abort` flag of the last accepted frame. |
+| 3–5 | `0x38` | `indicator_request` | The indicator the Jetson **asked for**. What is actually shown is `TELEM_STATE.indicator_state` (§3.5.1); the two differ whenever the controller overrides a request. |
+| 6–7 | `0xC0` | `active_mode` | `activeMode()`: the mode the controller is **executing**. Unlike `TELEM_STATE.mode`, which echoes the commanded mode, this reads `FAULT` (3) after a comm timeout or C2 loss in `TELEOP`. |
+
+**What counts as a sample.** A *new reading arriving*, whether or not its value
+changed. A parked rover's encoder is fresh; a frozen one still showing a
+plausible number is stale. So age is a question about **time**, not
+correctness: judging whether a value is impossible is a separate job (Task
+5.6, which would use `FAULT_ENCODER_FAULT`).
+
+**Stale.** A sensor is stale when its age is `>= 300 ms` (`ENCODER_STALE_MS`,
+`STEER_STALE_MS`), or it has never produced a sample. That raises
+`FAULT_ENCODER_STALE` / `FAULT_STEER_STALE` in `fault_status` (§3.4). 300 ms
+matches the command watchdog: six telemetry periods, so a single late sample
+does not trip it. The `>=` matches `watchdogTripped()`.
+
+**Reported, never acted on.** A stale bit does not stop the rover, change the
+mode, or change `cmd_status` — a rover with stale steering feedback and a
+valid command still reads `APPLIED`. What the rover should *do* about stale
+feedback is Task 6's decision (§9).
+
+**Where the ages come from.** `FeedbackAge` in `firmware/src/rover_feedback.*`
+tracks one sensor each. `rover_firmware.cpp` calls `noteSample()` in exactly
+one place in `loop()`, when `readSensors()` reports a new reading; with
+`SIMULATE_SENSORS` that is every loop, and with real sensors not yet wired it
+is never, so both ages honestly read `0xFFFF` and both stale bits stay set.
+`tools/rover_sim.cpp` does the same with the same class, and
+`staleFaultBits()` turns the two trackers into fault bits for both.
+
+**`active_source` today.** Filled from the last frame's `from_autonomy` bit:
+`AUTONOMY` if set, `TELEOP` if not, and `NONE` before the first valid frame.
+It reports who **sent** the frame, even when that source does not own the
+current mode — the refusal itself is `cmd_status = WRONG_SOURCE`.
+`EMERGENCY` is defined so the byte matches the `CommandSource` enum Task 5.4
+is adding; nothing sends it yet, and once that work is merged and wired in,
+`active_source` should come from it instead.
 
 ## 4. Integrity: two CRCs, covering different things
 
@@ -931,11 +1041,13 @@ in `rover_protocol.h` beside the structs they describe.
 | Constant | Value | Notes |
 |---|---|---|
 | `CONTROL` rate | 20 Hz | 1 frame per cycle (`CONTROL_RATE_HZ`, Jetson side) |
-| `TELEMETRY` rate | 20 Hz | 5 frames per cycle |
+| `TELEMETRY` rate | 20 Hz | 6 frames per cycle |
 | `WATCHDOG_TIMEOUT_MS` | 300 | 6× the control period. `DEFAULT_WATCHDOG_TIMEOUT_MS` in C++ |
 | `TELEMETRY_PERIOD_MS` | 50 | `DEFAULT_TELEMETRY_PERIOD_MS` in C++ |
 | `LINK_DEGRADED_HOLD_MS` | 1000 | How long a gap or CRC error keeps the link `DEGRADED` |
 | `HW_WATCHDOG_MS` | 1000 | Teensy reset if the loop stalls (C++ only) |
+| `ENCODER_STALE_MS` | 300 | No encoder sample for this long raises `ENCODER_STALE` (§3.7). Same as the command watchdog |
+| `STEER_STALE_MS` | 300 | No steering sample for this long raises `STEER_STALE` (§3.7) |
 | `LINK_TIMEOUT_S` (Jetson) | 0.5 | Informational only (Python only) |
 | `C2_TIMEOUT_S` (Jetson, `C2Monitor`) | 1.0 | No base-station heartbeat for this long sets `c2_lost`. Longer than the 300 ms CAN watchdog because a radio drops packets far more often than a CAN bus. Tunable, and the base-station heartbeat rate is not yet defined (Python only) |
 
@@ -945,14 +1057,15 @@ between them are load-bearing rather than incidental, and are therefore
 asserted in `test_config_sync.py`: the watchdog must tolerate a missed frame,
 and `C2_TIMEOUT_S` must stay longer than the command watchdog — if those two
 converged, a single radio hiccup would start stopping the rover in `TELEOP`.
+The stale thresholds are likewise asserted to outlast a telemetry period.
 
 ### 6.2 Everything else
 
 | Constant | Value | Notes |
 |---|---|---|
-| `PROTOCOL_VERSION` | 6 | Bump when a message's layout or meaning changes. Not sent on the wire; DLC and the CRC are the runtime mismatch signals, plus *which ids arrive* (§2.2) |
+| `PROTOCOL_VERSION` | 7 | Bump when a message's layout or meaning changes. Not sent on the wire; DLC and the CRC are the runtime mismatch signals, plus *which ids arrive* (§2.2) |
 | `CAN_BITRATE_HZ` | 500000 | Every node on the bus must match |
-| `CAN_ID_*` | `0x100`, `0x200`–`0x204` | §2.1 |
+| `CAN_ID_*` | `0x100`, `0x200`–`0x205` | §2.1 |
 | `FRAME_DLC`, `FRAME_PAYLOAD` | 8, 6 | Plus `FRAME_SEQ_OFFSET` 6 and `FRAME_CRC_OFFSET` 7 |
 | `MODE_*`, `MODE_MAX` | 0, 1, 2 | §3.1.1 |
 | `CMD_MIN`, `CMD_MAX` | −1000, 1000 | Valid `drive_cmd`/`steer_cmd` range (§3.1.4) |
@@ -964,9 +1077,10 @@ converged, a single radio hiccup would start stopping the rover in `TELEOP`.
 ## 7. Demonstration and tests — no hardware required
 
 ```
-make test      # 126 C++ tests + 98 host tests
+make test      # 154 C++ tests + 109 host tests
 make demo      # the Task 3 message-exchange demonstration
 make autonomy  # the Task 4 mock-autonomy mission
+python3 host/autonomy_sim.py --mock --log run.csv   # plus one CSV row per snapshot
 ```
 
 `make autonomy` runs `host/autonomy_sim.py`: a fake autonomy stack driving the
@@ -985,8 +1099,15 @@ PASS 6. report TARGET_REACHED             PASS 13. abort overrides an authorised
 PASS 7. request autonomous return         PASS 14. teleop drives again afterwards
 
 feedback loop: every required field reached the Jetson
-  mode=TELEOP  applied=(+400,+0)  health=OK  age=38ms  faults=none
+  mode=TELEOP (executing TELEOP)  source=TELEOP  stop=False  abort=False
+  drive: applied=+400  enc=(+4970,+3470)   steer: applied=+0  fb=+0
+  ages: cmd=43ms  enc=0ms  steer=0ms
+  health=OK  indicator: requested=OFF shown=TELEOP  faults=none
 ```
+
+`--log FILE` writes every complete snapshot, not one per step, as a CSV row
+with the columns in `SNAPSHOT_COLUMNS` (`host/jetson_test.py`), so any program
+that logs snapshots can share the same columns through `snapshot_row()`.
 
 Steps 8 and 9 send an **identical** drive command and differ only in the mode;
 step 14 is there because a safety gate that cannot be left is a rover that has
@@ -1153,8 +1274,18 @@ Verified to fail on an injected endianness change.
   or a dedicated e-stop receiver — the latter is a third link, not this field.
   **Note the reserved fault range has moved**: v0.6 took `0x0400` for
   `FAULT_CMD_SOURCE` under the same rule — someone was actually building the
-  thing that needed it — so the free bits are now `0x0800`–`0x8000` and a
-  C2-observer disagreement takes `0x0800`.
+  thing that needed it — and v0.7 took `0x0800` and `0x1000` for the two
+  stale-feedback bits, so the free bits are now `0x2000`–`0x8000`. Task 5.6
+  (invalid and delayed feedback) has first call on them; a C2-observer
+  disagreement takes the next one free when someone builds it.
+- **Stale feedback is reported, not acted on** (§3.7). The two stale bits and
+  the ages reach the Jetson, and nothing else changes: `effectiveStop()` is
+  untouched and `cmd_status` stays `APPLIED`. What the rover should do when
+  its feedback goes stale is Task 6. Nothing in this repository can make
+  feedback go stale on purpose yet either; failure injection (a sensor that
+  stops updating, delayed or impossible values) is Task 5.6, which can gate
+  the single `noteSample()` call site in each of `rover_firmware.cpp` and
+  `tools/rover_sim.cpp`.
 - **Not yet used:** CAN FD, the second and third CAN buses, and a dedicated
   high-priority e-stop frame in the reserved `0x000`–`0x0FF` block.
 - **The authority gate compares two fields of one frame**, so a Jetson that
@@ -1162,7 +1293,10 @@ Verified to fail on an injected endianness change.
   it (§3.1.5). The mode echo in `TELEM_STATE` is what catches that, one layer
   up. Nothing inside a single trusted sender can close the window entirely;
   this narrows it.
-- **`TELEM_STATE.mode` still echoes the *commanded* mode.**
+- **`TELEM_STATE.mode` still echoes the *commanded* mode**, and v0.7 left it
+  that way: `activeMode()` now goes out separately, in `TELEM_FEEDBACK`'s
+  flags (§3.7), so the Jetson can see both without changing an existing
+  field. The history:
   [PR #18](https://github.com/schradivarius/URC-MCU-Jetson-Comm-Protocol/pull/18)
   (merged via #24) renamed the modes to `SAFE`/`TELEOP`/`AUTONOMOUS`, added a
   non-commandable `MODE_FAULT = 3` and introduced `activeMode()`. Echoing
@@ -1180,6 +1314,7 @@ Verified to fail on an injected endianness change.
 | `firmware/src/rover_protocol.*` | **Both** | Message definitions, CRC, codec |
 | `firmware/src/rover_controller.*` | **Both** | Command/safety state machine |
 | `firmware/src/rover_drive.*` | **Both** | Drive/steering output stage (§5.4) |
+| `firmware/src/rover_feedback.*` | **Both** | Feedback age and stale detection (§3.7) |
 | `host/rover_protocol.py` | Jetson | Python codec (pinned to the C++ one) |
 | `host/protocol_root.py` | Jetson | Resolves which checkout `firmware/src` and `tools/` come from — the one place that decides |
 | `host/can_link.py` | Jetson | Sim and python-can backends |
@@ -1189,7 +1324,7 @@ Verified to fail on an injected endianness change.
 | `host/autonomy_sim.py` | Jetson | Mock autonomy stack: the Task 4 mission (§7) |
 | `tools/rover_sim.cpp` | dev machine | Simulator: real controller, fake plant |
 | `tools/golden_vectors.cpp` | dev machine | Emits vectors for cross-language pinning |
-| `tests/cpp/`, `tests/host/` | dev machine | 224 tests total |
+| `tests/cpp/`, `tests/host/` | dev machine | 263 tests total |
 
 ### 10.1 Flashing the Teensy 4.1
 

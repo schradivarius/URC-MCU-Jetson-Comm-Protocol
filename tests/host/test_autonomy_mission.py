@@ -94,6 +94,53 @@ class TestTheMissionRuns(MissionFixture):
                             accepted.snapshot["cmd_status"])
 
 
+    def test_feedback_stays_fresh_through_the_whole_mission(self):
+        # Detection only: nothing in the mission makes feedback go stale.
+        report = mission.run_mission(self.link, verbose=False)
+        self.assertTrue(report.ok)
+        for r in report.results:
+            s = r.snapshot
+            self.assertFalse(s["fault_status"] & rp.FAULT_ENCODER_STALE, r.name)
+            self.assertFalse(s["fault_status"] & rp.FAULT_STEER_STALE, r.name)
+            self.assertLess(s["enc_age_ms"], rp.ENCODER_STALE_MS, r.name)
+            self.assertLess(s["steer_age_ms"], rp.STEER_STALE_MS, r.name)
+
+
+class TestTheSnapshotLog(MissionFixture):
+    class Rows:
+        def __init__(self):
+            self.rows = []
+
+        def writerow(self, row):
+            self.rows.append(list(row))
+
+    def test_the_log_has_one_row_per_snapshot_with_every_column(self):
+        log = self.Rows()
+        report = mission.run_mission(self.link, verbose=False, log=log)
+        self.assertTrue(report.ok)
+        header, rows = log.rows[0], log.rows[1:]
+        self.assertEqual(header, list(mission.SNAPSHOT_COLUMNS))
+        self.assertEqual(len(rows), report.snapshots_seen,
+                         "the log skipped or duplicated snapshots")
+        for row in rows:
+            self.assertEqual(len(row), len(header))
+        # Every snapshot, not one per step.
+        self.assertGreater(len(rows), len(report.results))
+        seqs = [row[header.index("seq")] for row in rows]
+        self.assertTrue(all(b != a for a, b in zip(seqs, seqs[1:])),
+                        "the same snapshot was logged twice in a row")
+
+    def test_the_log_covers_every_feedback_field(self):
+        for field in mission.FEEDBACK_FIELDS:
+            self.assertIn(field, mission.SNAPSHOT_COLUMNS,
+                          "%r is in the feedback loop but not in the log" % field)
+
+    def test_logging_does_not_change_the_mission(self):
+        report = mission.run_mission(self.link, verbose=False, log=self.Rows())
+        self.assertTrue(report.ok)
+        self.assertEqual(len(report.results), len(mission.build_mission()))
+
+
 class TestTheMissionCanFail(MissionFixture):
     """Negative controls. Without these, the passes above prove nothing."""
 

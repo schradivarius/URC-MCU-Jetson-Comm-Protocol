@@ -14,7 +14,7 @@ jetson_test.py -- Jetson-side test harness for the rover CAN link.
     python3 host/jetson_test.py --channel can0 --bitrate 500000
 
 Sends CONTROL at 20 Hz with an incrementing sequence number, and reassembles
-the four telemetry frames into coherent snapshots.
+the six telemetry frames into coherent snapshots.
 
 Declares the LINK down if no telemetry has arrived within LINK_TIMEOUT_S --
 separate from, and no substitute for, the controller's own command-age
@@ -36,11 +36,61 @@ from rover_config import (  # noqa: E402
 )
 
 
+# One row per snapshot, the same columns for every program that logs one, so
+# a log from this file, autonomy_sim.py or the closed-loop sequence can be
+# compared column for column. Covers every field Task 5.5 asks the MCU to
+# send, plus the snapshot seq and the ack_seq that ties it to a command.
+SNAPSHOT_COLUMNS = (
+    "t_s", "seq", "ack_seq",
+    "mode", "active_mode", "active_source",       # what was commanded vs done
+    "drive_applied", "steer_applied",             # commanded drive / steering
+    "enc_left", "enc_right", "steer_fb",          # measured drive / steering
+    "stop", "autonomy_abort", "cmd_status",       # stop / abort state
+    "cmd_age_ms", "enc_age_ms", "steer_age_ms",   # how old each value is
+    "controller_health", "fault_status", "faults",
+    "indicator_request", "indicator_state",
+)
+
+
+def snapshot_row(snapshot, t_s):
+    """`snapshot` as a list in SNAPSHOT_COLUMNS order, ready for csv.writer.
+
+    Codes are written as names where a name exists (TELEOP rather than 1),
+    because a log is read by people. fault_status stays a number so it can
+    still be masked; `faults` carries the same bits as names.
+    """
+    s = snapshot
+    return [
+        "%.3f" % t_s, s["seq"], s["ack_seq"],
+        rp.MODE_NAMES.get(s["mode"], s["mode"]),
+        rp.MODE_NAMES.get(s["active_mode"], s["active_mode"]),
+        rp.ACTIVE_SOURCE_NAMES.get(s["active_source"], s["active_source"]),
+        s["drive_applied"], s["steer_applied"],
+        s["enc_left"], s["enc_right"], s["steer_fb"],
+        int(s["stop"]), int(s["autonomy_abort"]),
+        rp.CMD_STATUS_NAMES.get(s["cmd_status"], s["cmd_status"]),
+        s["cmd_age_ms"], s["enc_age_ms"], s["steer_age_ms"],
+        rp.CTRL_HEALTH_NAMES.get(s["controller_health"], s["controller_health"]),
+        s["fault_status"], "|".join(rp.fault_names(s["fault_status"])),
+        rp.INDICATOR_NAMES.get(s["indicator_request"], s["indicator_request"]),
+        rp.INDICATOR_NAMES.get(s["indicator_state"], s["indicator_state"]),
+    ]
+
+
+def format_age(age_ms, stale=False):
+    """An age field as text: `never`, `>65534ms` (saturated) or `NNms`, with
+    ` STALE` appended when the matching stale fault bit is set."""
+    text = ("never" if age_ms == rp.CMD_AGE_UNKNOWN
+            else ">%dms" % rp.CMD_AGE_MAX if age_ms == rp.CMD_AGE_MAX
+            else "%dms" % age_ms)
+    return text + " STALE" if stale else text
+
+
 
 class TelemetryAssembler:
-    """Collects the five telemetry frames of one cycle into one snapshot.
+    """Collects the six telemetry frames of one cycle into one snapshot.
 
-    All five frames of a cycle carry the SAME sequence number, which is how a
+    All six frames of a cycle carry the SAME sequence number, which is how a
     coherent snapshot is told from one torn across two cycles. A torn snapshot
     is counted rather than silently published, because mixing a fresh encoder
     reading with a stale fault word is exactly the kind of quiet wrongness
@@ -56,6 +106,10 @@ class TelemetryAssembler:
         self.torn_count = 0
         self.frames_by_id = {cid: 0 for cid in rp.TELEM_IDS}
         self.decode_errors = {}    # DecodeResult -> count
+        # Called with every complete snapshot as it is assembled. One poll()
+        # can complete more than one, and `snapshot` only keeps the last, so
+        # a logger that wants every row hooks in here.
+        self.on_snapshot = None
 
     def missing_ids(self):
         """Telemetry ids nothing has ever arrived on.
@@ -94,6 +148,8 @@ class TelemetryAssembler:
             self.snapshot = merged
             self.snapshot_seq = seq
             self.complete_count += 1
+            if self.on_snapshot is not None:
+                self.on_snapshot(merged)
         return True
 
 
@@ -162,24 +218,31 @@ class JetsonLink:
                         % (elapsed, ", ".join("0x%03x" % c for c in missing)))
             return "[t=%5.1fs] waiting for a complete telemetry snapshot..." % elapsed
         faults = ",".join(rp.fault_names(s["fault_status"])) or "none"
-        age = s["cmd_age_ms"]
-        age_txt = ("never" if age == rp.CMD_AGE_UNKNOWN
-                   else ">%dms" % rp.CMD_AGE_MAX if age == rp.CMD_AGE_MAX
-                   else "%dms" % age)
+        age_txt = format_age(s["cmd_age_ms"])
+        enc_age_txt = format_age(s["enc_age_ms"],
+                                 bool(s["fault_status"] & rp.FAULT_ENCODER_STALE))
+        steer_age_txt = format_age(s["steer_age_ms"],
+                                   bool(s["fault_status"] & rp.FAULT_STEER_STALE))
+        flags = "".join(("S" if s["stop"] else "-",
+                         "A" if s["autonomy_abort"] else "-"))
         return ("[t=%5.1fs] link=%-4s seq=%3d sent=%4d snap=%4d torn=%2d "
                 "enc=(%+9d,%+9d) steer=%+5d %+7.2fA %6.2fV mode=%-10s "
-                "jet=%-12s c2=%-12s ctrl=%-12s ind=%-10s age=%-8s "
-                "cmd=%-12s ack=%3d applied=(%+5d,%+5d) faults=%s"
+                "active=%-10s src=%-9s jet=%-12s c2=%-12s ctrl=%-12s "
+                "ind=%-10s req=%-10s age=%-8s enc_age=%-14s steer_age=%-14s "
+                "stop/abort=%s cmd=%-12s ack=%3d applied=(%+5d,%+5d) faults=%s"
                 % (elapsed, "UP" if self.link_up else "DOWN", s["seq"],
                    self.frames_sent, self.tele.complete_count,
                    self.tele.torn_count, s["enc_left"], s["enc_right"],
                    s["steer_fb"], s["current_a"], s["voltage_v"],
                    rp.MODE_NAMES.get(s["mode"], "?%d" % s["mode"]),
+                   rp.MODE_NAMES.get(s["active_mode"], "?"),
+                   rp.ACTIVE_SOURCE_NAMES.get(s["active_source"], "?"),
                    rp.LINK_NAMES.get(s["jetson_link"], "?"),
                    rp.LINK_NAMES.get(s["c2_link"], "?"),
                    rp.CTRL_HEALTH_NAMES.get(s["controller_health"], "?"),
                    rp.INDICATOR_NAMES.get(s["indicator_state"], "?"),
-                   age_txt,
+                   rp.INDICATOR_NAMES.get(s["indicator_request"], "?"),
+                   age_txt, enc_age_txt, steer_age_txt, flags,
                    rp.CMD_STATUS_NAMES.get(s["cmd_status"], "?"), s["ack_seq"],
                    s["drive_applied"], s["steer_applied"], faults))
 

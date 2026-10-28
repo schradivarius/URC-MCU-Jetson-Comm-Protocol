@@ -23,6 +23,12 @@ class FeedbackAge {
         bool have_sample_ = false;
 };
 
+// The stale fault bits for one encoder tracker and one steering tracker,
+// ready to pass to faultWord() as part of sensor_faults. One function so the
+// firmware and tools/rover_sim.cpp cannot disagree about which bit is which.
+// REPORTED only: nothing here stops the rover (that is Task 6).
+uint16_t staleFaultBits(const FeedbackAge& encoder, const FeedbackAge& steering);
+
 } // namespace rover
 
 #endif  // ROVER_FEEDBACK_H

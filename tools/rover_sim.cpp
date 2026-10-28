@@ -31,6 +31,7 @@
 
 #include "../firmware/src/rover_controller.h"
 #include "../firmware/src/rover_drive.h"
+#include "../firmware/src/rover_feedback.h"
 
 using namespace rover;
 
@@ -67,6 +68,13 @@ int main(int argc, char** argv) {
     int16_t steer_fb = 0;
     std::string pending;
     char chunk[512];
+
+    // Feedback age, the same trackers and the same fault-bit helper the
+    // firmware uses. The fake plant below produces a new encoder and steering
+    // reading every loop, so both are noted every loop; this simulator has no
+    // way to make them stop (failure injection is Task 5.6's).
+    FeedbackAge enc_age(realMillis, ENCODER_STALE_MS);
+    FeedbackAge steer_age(realMillis, STEER_STALE_MS);
 
     for (;;) {
         // Non-blocking stdin so the telemetry timer keeps running while the
@@ -125,8 +133,12 @@ int main(int argc, char** argv) {
         // Fake pack voltage: 24.00 V nominal, sagging a little under load.
         const int16_t voltage_cv = static_cast<int16_t>(2400 - effort_mag / 40);
 
+        // The encoders and steer_fb above are this loop's samples.
+        enc_age.noteSample();
+        steer_age.noteSample();
+
         if (ctl.telemetryDue()) {
-            const uint8_t seq = ctl.telemetrySeq();   // one seq for all four
+            const uint8_t seq = ctl.telemetrySeq();   // one seq for all six
             uint8_t buf[8];
 
             TelemetryDriveL dl = ctl.buildDriveL(enc_left, steer_fb);
@@ -135,7 +147,8 @@ int main(int argc, char** argv) {
             TelemetryDriveR dr = ctl.buildDriveR(enc_right);
             emitFrame(CAN_ID_TELEM_DRIVE_R, buf, encodeTelemetryDriveR(dr, seq, buf));
 
-            TelemetryPower pw = ctl.buildPower(current_ca, voltage_cv);
+            TelemetryPower pw = ctl.buildPower(current_ca, voltage_cv,
+                                               staleFaultBits(enc_age, steer_age));
             emitFrame(CAN_ID_TELEM_POWER, buf, encodeTelemetryPower(pw, seq, buf));
 
             // controller_health now comes from the drive stage, which is the
@@ -150,6 +163,9 @@ int main(int argc, char** argv) {
             // from, and why it is or is not being acted on.
             TelemetryCmdEcho ce = ctl.buildCmdEcho(drive, steer);
             emitFrame(CAN_ID_TELEM_CMD_ECHO, buf, encodeTelemetryCmdEcho(ce, seq, buf));
+
+            TelemetryFeedback fb = ctl.buildFeedback(enc_age.ageMs(), steer_age.ageMs());
+            emitFrame(CAN_ID_TELEM_FEEDBACK, buf, encodeTelemetryFeedback(fb, seq, buf));
 
             if (verbose) {
                 // Printed drive output, on stderr because stdout is the bus.

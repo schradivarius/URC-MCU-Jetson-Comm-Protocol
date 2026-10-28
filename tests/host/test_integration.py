@@ -78,9 +78,9 @@ class RoverFixture(unittest.TestCase):
 
 
 class TestSnapshotAssembly(RoverFixture):
-    """The five telemetry frames must reassemble into coherent snapshots."""
+    """The six telemetry frames must reassemble into coherent snapshots."""
 
-    def test_all_five_frames_arrive_and_assemble(self):
+    def test_all_six_frames_arrive_and_assemble(self):
         self.drive(0.6)
         self.assertGreater(self.jl.tele.complete_count, 5)
         for can_id in rp.TELEM_IDS:
@@ -90,7 +90,7 @@ class TestSnapshotAssembly(RoverFixture):
         self.assertEqual(self.jl.unknown_frames, 0)
 
     def test_snapshots_are_not_torn(self):
-        # All five frames of a cycle share one sequence number. Over a clean
+        # All six frames of a cycle share one sequence number. Over a clean
         # link every snapshot should be coherent.
         self.drive(1.0)
         self.assertEqual(self.jl.tele.torn_count, 0,
@@ -115,8 +115,83 @@ class TestSnapshotAssembly(RoverFixture):
                       # commands are what let the Jetson tell "my command got
                       # through" from "the rover happens to be moving".
                       "drive_applied", "steer_applied", "ack_seq",
-                      "cmd_status", "last_decode", "return_active"):
+                      "cmd_status", "last_decode", "return_active",
+                      # Task 5.5: feedback ages, and the command fields no
+                      # other frame echoes (TELEM_FEEDBACK, 0x205).
+                      "enc_age_ms", "steer_age_ms", "active_source",
+                      "active_mode", "stop", "autonomy_abort",
+                      "indicator_request"):
             self.assertIn(field, s, "telemetry is missing %r" % field)
+
+
+    def test_a_missing_feedback_frame_tears_the_snapshot(self):
+        # Proves 0x205 is really part of the snapshot, not decoded on the
+        # side: lose it for one cycle and that cycle must be counted torn,
+        # never published with the previous cycle's ages mixed in.
+        real_recv = self.link.recv
+        dropped = []
+
+        def recv_dropping_one_feedback_frame():
+            for can_id, frame in real_recv():
+                if can_id == rp.CAN_ID_TELEM_FEEDBACK and not dropped:
+                    dropped.append(frame)
+                    continue
+                yield can_id, frame
+
+        self.drive(0.4)
+        torn_before = self.jl.tele.torn_count
+        self.link.recv = recv_dropping_one_feedback_frame
+        self.drive(0.4)
+        self.assertEqual(len(dropped), 1, "the feedback frame was never seen")
+        self.assertEqual(self.jl.tele.torn_count, torn_before + 1)
+        dropped_seq = dropped[0][rp.FRAME_SEQ_OFFSET]
+        self.assertNotEqual(self.snap()["seq"], dropped_seq)
+
+
+class TestFeedbackAge(RoverFixture):
+    """Task 5.5. DETECTION ONLY: the simulator samples its encoders and
+    steering every loop, so here the feedback is always fresh. Making it go
+    stale is failure injection, which is Task 5.6's."""
+
+    def test_feedback_ages_are_known_and_small_in_normal_operation(self):
+        self.drive(0.6)
+        s = self.snap()
+        for key, threshold in (("enc_age_ms", rp.ENCODER_STALE_MS),
+                               ("steer_age_ms", rp.STEER_STALE_MS)):
+            self.assertNotEqual(s[key], rp.CMD_AGE_UNKNOWN,
+                                "%s never got a sample" % key)
+            self.assertLess(s[key], threshold, "%s is stale" % key)
+        self.assertFalse(s["fault_status"] & rp.FAULT_ENCODER_STALE)
+        self.assertFalse(s["fault_status"] & rp.FAULT_STEER_STALE)
+
+    def test_the_feedback_frame_echoes_the_command(self):
+        self.drive(0.4, mode=rp.MODE_AUTONOMOUS, stop=True,
+                   indicator_request=rp.INDICATOR_ARRIVED)
+        s = self.snap()
+        self.assertTrue(s["stop"])
+        self.assertFalse(s["autonomy_abort"])
+        self.assertEqual(s["indicator_request"], rp.INDICATOR_ARRIVED)
+        self.assertEqual(s["active_mode"], rp.MODE_AUTONOMOUS)
+        self.assertEqual(s["active_source"], rp.ACTIVE_SOURCE_AUTONOMY)
+
+        self.drive(0.4, mode=rp.MODE_TELEOP)
+        s = self.snap()
+        self.assertFalse(s["stop"])
+        self.assertEqual(s["active_mode"], rp.MODE_TELEOP)
+        self.assertEqual(s["active_source"], rp.ACTIVE_SOURCE_TELEOP)
+
+    def test_the_source_is_none_before_any_command(self):
+        self.drive(0.4, send=False)
+        self.assertEqual(self.snap()["active_source"], rp.ACTIVE_SOURCE_NONE)
+
+    def test_a_silent_jetson_shows_as_fault_in_the_executed_mode(self):
+        # TELEM_STATE.mode keeps echoing the commanded mode; this field is
+        # where the controller's own FAULT becomes visible.
+        self.drive(0.4, mode=rp.MODE_AUTONOMOUS)
+        self.drive(0.7, send=False)
+        s = self.snap()
+        self.assertEqual(s["mode"], rp.MODE_AUTONOMOUS)
+        self.assertEqual(s["active_mode"], rp.MODE_FAULT)
 
 
 class TestEndToEnd(RoverFixture):

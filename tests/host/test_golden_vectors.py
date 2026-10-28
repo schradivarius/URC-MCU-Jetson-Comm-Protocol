@@ -191,9 +191,15 @@ class TestFrameAgreement(GoldenBase):
             return p.encode_telemetry_cmd_echo(
                 n[0], n[1], n[2],
                 p.pack_cmd_status(n[3], n[4], bool(n[5])), seq=n[6])
+        if kind == "FEEDBACK":
+            return p.encode_telemetry_feedback(
+                n[0], n[1],
+                p.pack_feedback_flags(bool(n[2]), bool(n[3]), n[4], n[5]),
+                n[6], seq=n[7])
         self.fail("unknown vector kind %r" % kind)
 
-    FRAME_KINDS = ("CONTROL", "DRIVE_L", "DRIVE_R", "POWER", "STATE", "CMD_ECHO")
+    FRAME_KINDS = ("CONTROL", "DRIVE_L", "DRIVE_R", "POWER", "STATE", "CMD_ECHO",
+                   "FEEDBACK")
 
     def test_every_frame_encodes_identically(self):
         checked = 0
@@ -216,6 +222,7 @@ class TestFrameAgreement(GoldenBase):
             "POWER":   lambda f: p.decode_telemetry_power(f),
             "STATE":   lambda f: p.decode_telemetry_state(f),
             "CMD_ECHO": lambda f: p.decode_telemetry_cmd_echo(f),
+            "FEEDBACK": lambda f: p.decode_telemetry_feedback(f),
         }
         for kind in self.FRAME_KINDS:
             for _, args, frame_hex in self.rowsOf(kind):
@@ -252,6 +259,24 @@ class TestFrameAgreement(GoldenBase):
             self.assertEqual(decoded["cmd_status"], n[3])
             self.assertEqual(decoded["last_decode"], n[4])
             self.assertEqual(decoded["return_active"], bool(n[5]))
+
+    def test_the_feedback_frame_unpacks_to_what_cpp_packed(self):
+        sources = set()
+        for _, args, frame_hex in self.rowsOf("FEEDBACK"):
+            n = [int(a) for a in args.split(",")]
+            _, decoded = p.decode_telemetry_feedback(bytes.fromhex(frame_hex))
+            self.assertEqual(decoded["enc_age_ms"], n[0])
+            self.assertEqual(decoded["steer_age_ms"], n[1])
+            self.assertEqual(decoded["stop"], bool(n[2]))
+            self.assertEqual(decoded["autonomy_abort"], bool(n[3]))
+            self.assertEqual(decoded["indicator_request"], n[4])
+            self.assertEqual(decoded["active_mode"], n[5])
+            self.assertEqual(decoded["active_source"], n[6])
+            self.assertEqual(decoded["feedback_flags_raw"]
+                             & p.FEEDBACK_RESERVED_MASK, 0)
+            sources.add(n[6])
+        self.assertEqual(sources, {0, 1, 2, 3},
+                         "the vectors never exercise every active_source")
 
     def test_every_frame_is_exactly_eight_bytes(self):
         # 8 bytes is Classic CAN's limit. Exceeding it would force CAN FD

@@ -6,7 +6,7 @@ Runs against tools/rover_sim: the REAL C++ rover_controller.cpp compiled
 natively, with only the plant and the transport simulated. So what you see
 below is the actual safety logic that gets flashed to the Teensy.
 
-A: normal 20 Hz operation, four telemetry frames reassembled per cycle.
+A: normal 20 Hz operation, six telemetry frames reassembled per cycle.
 B: a deliberate 800 ms silence (well past the 300 ms command watchdog).
 C: the explicit stop flag at full throttle.
 D: autonomy abort while in AUTONOMOUS.
@@ -142,7 +142,7 @@ def main():
         assert jl.tele.complete_count > 10, "too few complete snapshots"
         assert jl.unknown_frames == 0, "unexpected CAN id seen"
         print()
-        print("PASS: snapshots reassembled from five frames throughout; the")
+        print("PASS: snapshots reassembled from six frames throughout; the")
         print("watchdog, stop flag and autonomy abort each forced a stop; C2")
         print("loss stopped a teleoperated rover but not an autonomous one; the")
         print("application-layer CRC rejected a corrupted frame; and a")

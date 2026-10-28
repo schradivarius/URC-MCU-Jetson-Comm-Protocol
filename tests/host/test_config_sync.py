@@ -37,12 +37,15 @@ SHARED = {
     "WATCHDOG_TIMEOUT_MS":   "DEFAULT_WATCHDOG_TIMEOUT_MS",
     "TELEMETRY_PERIOD_MS":   "DEFAULT_TELEMETRY_PERIOD_MS",
     "LINK_DEGRADED_HOLD_MS": "LINK_DEGRADED_HOLD_MS",
+    "ENCODER_STALE_MS":      "ENCODER_STALE_MS",
+    "STEER_STALE_MS":        "STEER_STALE_MS",
     "CAN_ID_CONTROL":        "CAN_ID_CONTROL",
     "CAN_ID_TELEM_DRIVE_L":  "CAN_ID_TELEM_DRIVE_L",
     "CAN_ID_TELEM_DRIVE_R":  "CAN_ID_TELEM_DRIVE_R",
     "CAN_ID_TELEM_POWER":    "CAN_ID_TELEM_POWER",
     "CAN_ID_TELEM_STATE":    "CAN_ID_TELEM_STATE",
     "CAN_ID_TELEM_CMD_ECHO": "CAN_ID_TELEM_CMD_ECHO",
+    "CAN_ID_TELEM_FEEDBACK": "CAN_ID_TELEM_FEEDBACK",
     "MODE_SAFE":             "MODE_SAFE",
     "MODE_TELEOP":           "MODE_TELEOP",
     "MODE_AUTONOMOUS":       "MODE_AUTONOMOUS",
@@ -105,7 +108,7 @@ class TestConfigSync(unittest.TestCase):
         # the sequence number and CRC taking the rest of the frame.
         import struct
         for name in ("CONTROL_FMT", "DRIVE_L_FMT", "DRIVE_R_FMT",
-                     "POWER_FMT", "STATE_FMT", "ECHO_FMT"):
+                     "POWER_FMT", "STATE_FMT", "ECHO_FMT", "FEEDBACK_FMT"):
             self.assertEqual(struct.calcsize(getattr(rp, name)),
                              self.cpp["FRAME_PAYLOAD"],
                              "%s is not FRAME_PAYLOAD bytes" % name)
@@ -139,6 +142,12 @@ class TestConfigSync(unittest.TestCase):
     def test_c2_monitor_defaults_to_the_configured_timeout(self):
         # The constant is worthless if the only caller hardcodes its own.
         self.assertEqual(c2_link.C2Monitor().C2_timeout_s, cfg.C2_TIMEOUT_S)
+
+    def test_stale_thresholds_outlast_a_telemetry_period(self):
+        # Otherwise feedback sampled once per cycle would read stale between
+        # two perfectly on-time samples.
+        self.assertGreater(cfg.ENCODER_STALE_MS, cfg.TELEMETRY_PERIOD_MS)
+        self.assertGreater(cfg.STEER_STALE_MS, cfg.TELEMETRY_PERIOD_MS)
 
     def test_degraded_hold_outlasts_a_telemetry_period(self):
         # A gap or CRC error must stay visible for more than one frame, or an

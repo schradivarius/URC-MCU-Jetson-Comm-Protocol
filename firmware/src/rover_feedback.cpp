@@ -30,5 +30,11 @@ uint32_t FeedbackAge::elapsed() const {
     return now_ms_() - last_sample_ms_;
 }
 
+uint16_t staleFaultBits(const FeedbackAge& encoder, const FeedbackAge& steering) {
+    uint16_t bits = 0;
+    if (encoder.isStale())  bits |= FAULT_ENCODER_STALE;
+    if (steering.isStale()) bits |= FAULT_STEER_STALE;
+    return bits;
+}
 
 } // namespace rover

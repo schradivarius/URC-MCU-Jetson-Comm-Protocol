@@ -16,9 +16,10 @@ autonomy and teleop commands are refused in each other's modes.
 
 | | |
 |---|---|
-| Protocol, safety logic, firmware | Implemented, **224 tests** passing |
+| Protocol, safety logic, firmware | Implemented, **263 tests** passing |
 | Cross-language codec | Pinned byte-for-byte, plus every validation predicate |
 | Autonomy → drive-stage loop (Task 4) | Closed and verified end to end (`make autonomy`) |
+| Feedback age and full feedback telemetry (Task 5.5) | Sent in `TELEM_FEEDBACK` (`0x205`), logged per snapshot (`autonomy_sim.py --log`). Stale feedback is reported, not acted on |
 | **Validated on real hardware** | **Not yet — see [Known gaps](#known-gaps)** |
 
 ---
@@ -33,7 +34,7 @@ than mocking them, so there is no dependency to manage.
 git clone https://github.com/schradivarius/URC-MCU-Jetson-Comm-Protocol.git
 cd URC-MCU-Jetson-Comm-Protocol
 
-make test      # 126 C++ tests + 98 host tests
+make test      # 154 C++ tests + 109 host tests
 make demo      # no-hardware message-exchange demonstration (Task 3)
 make autonomy  # mock autonomy stack driving the firmware (Task 4)
 ```
@@ -52,7 +53,8 @@ firmware/                    C++ — runs on the Teensy 4.1
   src/rover_config.h           every protocol + timing constant ─┐
   src/rover_protocol.*         message definitions + codec      ─┤ pure C++,
   src/rover_controller.*       command/safety state machine      │ no Arduino
-  src/rover_drive.*            drive/steering output stage      ─┘
+  src/rover_drive.*            drive/steering output stage       │
+  src/rover_feedback.*         feedback age + stale detection   ─┘
 
 host/                        Python — runs on the Jetson
   rover_config.py              constants (pinned to rover_config.h)
@@ -68,8 +70,8 @@ tools/
   rover_sim.cpp                simulator: REAL controller + drive stage, fake plant
   golden_vectors.cpp           emits vectors for cross-language pinning
 
-tests/cpp/                   126 tests — firmware core
-tests/host/                  98 tests — config sync, golden vectors, integration,
+tests/cpp/                   154 tests — firmware core
+tests/host/                  109 tests — config sync, golden vectors, integration,
                                         the autonomy mission
 ```
 
@@ -96,13 +98,14 @@ make test-host   # host side only — compiles the C++ core
 
 | Suite | Tests | Answers |
 |---|---:|---|
-| `tests/cpp/test_protocol.cpp` | 41 | Wire format, CRC-8, and every validation predicate |
-| `tests/cpp/test_controller.cpp` | 68 | **Does the rover stop when it should?** And: does it refuse a command from the wrong half of the stack? |
+| `tests/cpp/test_protocol.cpp` | 49 | Wire format, CRC-8, and every validation predicate |
+| `tests/cpp/test_controller.cpp` | 76 | **Does the rover stop when it should?** And: does it refuse a command from the wrong half of the stack? |
 | `tests/cpp/test_drive.cpp` | 17 | Does a command become the right motor output — and never one it was told not to? |
-| `tests/host/test_config_sync.py` | 14 | Do the C++ and Python configs hold the same constants? |
-| `tests/host/test_golden_vectors.py` | 30 | Do C++ and Python agree byte-for-byte? |
-| `tests/host/test_integration.py` | 44 | Do both ends actually talk to each other? |
-| `tests/host/test_autonomy_mission.py` | 10 | Does an autonomy decision reach the drive stage — and would we notice if it stopped? |
+| `tests/cpp/test_feedback.cpp` | 12 | Does feedback age and go stale at exactly the threshold — including across the `millis()` wrap? |
+| `tests/host/test_config_sync.py` | 15 | Do the C++ and Python configs hold the same constants? |
+| `tests/host/test_golden_vectors.py` | 31 | Do C++ and Python agree byte-for-byte? |
+| `tests/host/test_integration.py` | 49 | Do both ends actually talk to each other? |
+| `tests/host/test_autonomy_mission.py` | 14 | Does an autonomy decision reach the drive stage — and would we notice if it stopped? |
 
 Every test is named for the failure it prevents, so the reason it exists
 outlives anyone's memory of writing it. **Start a safety review at

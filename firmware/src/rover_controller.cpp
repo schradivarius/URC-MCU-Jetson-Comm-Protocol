@@ -203,7 +203,7 @@ bool RoverController::telemetryDue() {
             > static_cast<int32_t>(telemetry_period_ms_)) {
         next_telemetry_ms_ = now + telemetry_period_ms_;
     }
-    telemetry_seq_++;   // wraps; all four frames of this cycle share it
+    telemetry_seq_++;   // wraps; all six frames of this cycle share it
     return true;
 }
 

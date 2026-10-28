@@ -120,10 +120,10 @@ public:
 
     // True once per telemetry period. Self-pacing, and it will not burst out a
     // backlog after a stalled loop. Advances the telemetry sequence number, so
-    // call it ONCE per cycle and stamp all four frames with telemetrySeq().
+    // call it ONCE per cycle and stamp all six frames with telemetrySeq().
     bool telemetryDue();
 
-    // The sequence number for the current cycle. All four telemetry frames of
+    // The sequence number for the current cycle. All six telemetry frames of
     // one cycle share it, which is how the Jetson tells a coherent snapshot
     // from one torn across two cycles.
     uint8_t telemetrySeq() const { return telemetry_seq_; }

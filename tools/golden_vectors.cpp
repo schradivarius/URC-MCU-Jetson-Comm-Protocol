@@ -217,5 +217,31 @@ int main() {
                       e.ret ? 1 : 0, e.seq);
         emitHex("CMD_ECHO", args, buf, n);
     }
+
+    // --- TELEM_FEEDBACK --------------------------------------------------
+    // args: enc_age, steer_age, stop, abort, indicator_request, active_mode,
+    //       active_source, seq. Covers both age sentinels, every flag field
+    //       at its extremes (indicator 7 fills bits 3-5), FAULT in bits 6-7,
+    //       and every active_source value.
+    struct FB { uint16_t ea, sa; bool stop, abort; uint8_t ind, mode, src, seq; };
+    const FB fbs[] = {
+        {CMD_AGE_UNKNOWN, CMD_AGE_UNKNOWN, true,  false, INDICATOR_OFF,
+         MODE_FAULT,      0,   0},
+        {   12,    40, false, false, INDICATOR_TELEOP,     MODE_TELEOP,     1,  31},
+        {  300,     0, true,  true,  INDICATOR_ARRIVED,    MODE_AUTONOMOUS, 2,  32},
+        {CMD_AGE_MAX, 299, false, true, INDICATOR_MAX,     MODE_SAFE,       3,  33},
+        {    0, CMD_AGE_MAX, false, false, INDICATOR_FAULT, MODE_FAULT,     2, 255},
+    };
+    for (const FB& f : fbs) {
+        TelemetryFeedback m;
+        m.enc_age_ms = f.ea; m.steer_age_ms = f.sa;
+        m.flags = packFeedbackFlags(f.stop, f.abort, f.ind, f.mode);
+        m.active_source = f.src;
+        uint8_t n = encodeTelemetryFeedback(m, f.seq, buf);
+        std::snprintf(args, sizeof(args), "%u,%u,%d,%d,%u,%u,%u,%u",
+                      f.ea, f.sa, f.stop ? 1 : 0, f.abort ? 1 : 0,
+                      f.ind, f.mode, f.src, f.seq);
+        emitHex("FEEDBACK", args, buf, n);
+    }
     return 0;
 }

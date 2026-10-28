@@ -15,9 +15,10 @@ here anyway, because "one place to change a timeout" is the point of the file.
 
 # --- protocol version: bump whenever a message's layout or meaning changes ---
 # v0.5 is the first revision with the application-layer CRC and sequence
-# number; v0.6 adds the command-source bit and TELEM_CMD_ECHO. Not carried on
-# the wire.
-PROTOCOL_VERSION = 6
+# number; v0.6 adds the command-source bit and TELEM_CMD_ECHO; v0.7 adds
+# TELEM_FEEDBACK (feedback ages, echoed command flags and source) and the two
+# stale fault bits. Not carried on the wire.
+PROTOCOL_VERSION = 7
 
 # --- link ---
 CAN_BITRATE_HZ = 500000       # 500 kbps; every node must match
@@ -26,6 +27,8 @@ CAN_BITRATE_HZ = 500000       # 500 kbps; every node must match
 WATCHDOG_TIMEOUT_MS = 300     # controller stops after this long without CONTROL
 TELEMETRY_PERIOD_MS = 50      # 20 Hz
 LINK_DEGRADED_HOLD_MS = 1000  # how long a gap or CRC error holds DEGRADED
+ENCODER_STALE_MS = 300        # no encoder sample for this long -> stale
+STEER_STALE_MS = 300          # no steering sample for this long -> stale
 CONTROL_RATE_HZ = 20          # Jetson-side send rate
 LINK_TIMEOUT_S = 0.5          # Jetson-side, informational only
 # No base-station heartbeat for this long sets c2_lost. Deliberately longer
@@ -41,6 +44,7 @@ CAN_ID_TELEM_DRIVE_R = 0x201
 CAN_ID_TELEM_POWER   = 0x202
 CAN_ID_TELEM_STATE   = 0x203
 CAN_ID_TELEM_CMD_ECHO = 0x204
+CAN_ID_TELEM_FEEDBACK = 0x205
 
 # --- operating modes ---
 # The Jetson commands SAFE, TELEOP or AUTONOMOUS; the controller enters FAULT

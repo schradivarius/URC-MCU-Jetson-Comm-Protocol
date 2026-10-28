@@ -5,6 +5,7 @@ autonomy_sim.py -- a fake autonomy stack driving the real firmware.
     python3 host/autonomy_sim.py --mock            # against the C++ simulator
     python3 host/autonomy_sim.py --channel vcan0   # against a virtual CAN bus
     python3 host/autonomy_sim.py --channel can0    # against the real Teensy
+    python3 host/autonomy_sim.py --mock --log run.csv   # plus a CSV per snapshot
 
 WHAT THIS IS FOR
     Task 3 proved a Jetson command can reach the controller intact. This
@@ -39,6 +40,7 @@ HOW A STEP IS VERIFIED, AND WHY IT IS NOT JUST A SLEEP
 """
 
 import argparse
+import csv
 import os
 import sys
 import time
@@ -58,7 +60,9 @@ else:
 
 import can_link  # noqa: E402
 import rover_protocol as rp  # noqa: E402
-from jetson_test import JetsonLink, open_link  # noqa: E402
+from jetson_test import (  # noqa: E402
+    SNAPSHOT_COLUMNS, JetsonLink, format_age, open_link, snapshot_row,
+)
 from rover_config import CONTROL_RATE_HZ  # noqa: E402
 
 # Half the sequence space. A snapshot's ack_seq counts as "at or after" the
@@ -338,25 +342,46 @@ def build_mission():
     ]
 
 
-# Every field the task's feedback loop requires, and where it rides.
+# Every field the feedback loop requires (Task 4, extended by Task 5.5), and
+# where it rides. Some items need more than one snapshot key.
 FEEDBACK_FIELDS = (
-    "mode",               # current mode              (TELEM_STATE)
-    "drive_applied",      # accepted drive command    (TELEM_CMD_ECHO)
-    "steer_applied",      # accepted steering command (TELEM_CMD_ECHO)
-    "controller_health",  # controller-health state   (TELEM_STATE)
-    "cmd_age_ms",         # command age               (TELEM_DRIVE_R)
-    "fault_status",       # fault state               (TELEM_POWER)
+    "drive_applied",      # commanded drive value        (TELEM_CMD_ECHO)
+    "enc_left",           # measured drive / encoder     (TELEM_DRIVE_L)
+    "enc_right",          #   ...right side              (TELEM_DRIVE_R)
+    "steer_applied",      # commanded steering value     (TELEM_CMD_ECHO)
+    "steer_fb",           # measured steering value      (TELEM_DRIVE_L)
+    "mode",               # commanded mode               (TELEM_STATE)
+    "active_mode",        #   ...and the mode executed   (TELEM_FEEDBACK)
+    "active_source",      # active command source        (TELEM_FEEDBACK)
+    "stop",               # STOP state                   (TELEM_FEEDBACK)
+    "autonomy_abort",     # abort state                  (TELEM_FEEDBACK)
+    "fault_status",       # fault / stale-data state     (TELEM_POWER)
+    "cmd_age_ms",         # command age                  (TELEM_DRIVE_R)
+    "enc_age_ms",         # encoder feedback age         (TELEM_FEEDBACK)
+    "steer_age_ms",       # steering feedback age        (TELEM_FEEDBACK)
+    "controller_health",  # controller-health state      (TELEM_STATE)
+    "indicator_request",  # requested indicator state    (TELEM_FEEDBACK)
 )
 
 
-def run_mission(link, steps=None, verbose=True, settle_s=0.4):
+def run_mission(link, steps=None, verbose=True, settle_s=0.4, log=None):
     """Drive `steps` to completion against `link`. Returns a MissionReport.
 
     Stops at the first failure: once a step's precondition never arrived, the
     ones after it would be testing something other than what they claim.
+
+    `log`, if given, is a csv.writer (anything with writerow). It gets a
+    SNAPSHOT_COLUMNS header and then one row per complete snapshot -- every
+    one, not one per step, so the gaps between steps are in the record too.
+    Logging only: it changes nothing about which steps run or how they pass.
     """
     jl = JetsonLink(link)
     report = MissionReport()
+    if log is not None:
+        t0 = time.monotonic()
+        log.writerow(SNAPSHOT_COLUMNS)
+        jl.tele.on_snapshot = lambda s: log.writerow(
+            snapshot_row(s, time.monotonic() - t0))
     period = 1.0 / CONTROL_RATE_HZ
     steps = build_mission() if steps is None else steps
 
@@ -416,6 +441,8 @@ def main():
                     help="run against the compiled C++ simulator (no hardware)")
     ap.add_argument("--channel", help="CAN interface, e.g. can0 or vcan0")
     ap.add_argument("--bitrate", type=int, default=500000)
+    ap.add_argument("--log", metavar="FILE",
+                    help="write every telemetry snapshot to FILE as CSV")
     args = ap.parse_args()
 
     if not args.mock and not args.channel:
@@ -429,10 +456,14 @@ def main():
     print("=" * 78)
 
     link = open_link(args)
+    log_file = open(args.log, "w", newline="") if args.log else None
     try:
-        report = run_mission(link)
+        report = run_mission(link,
+                             log=csv.writer(log_file) if log_file else None)
     finally:
         link.close()
+        if log_file:
+            log_file.close()
 
     print()
     last = report.results[-1].snapshot if report.results else None
@@ -440,13 +471,27 @@ def main():
         missing = [f for f in FEEDBACK_FIELDS if f not in last]
         print("feedback loop: %s" % ("every required field reached the Jetson"
                                      if not missing else "MISSING %s" % missing))
-        print("  mode=%s  applied=(%+d,%+d)  health=%s  age=%sms  faults=%s"
-              % (rp.MODE_NAMES.get(last["mode"], "?"), last["drive_applied"],
-                 last["steer_applied"],
-                 rp.CTRL_HEALTH_NAMES.get(last["controller_health"], "?"),
-                 last["cmd_age_ms"],
-                 ",".join(rp.fault_names(last["fault_status"])) or "none"))
+        f = last["fault_status"]
+        print("  mode=%s (executing %s)  source=%s  stop=%s  abort=%s"
+              % (rp.MODE_NAMES.get(last["mode"], "?"),
+                 rp.MODE_NAMES.get(last["active_mode"], "?"),
+                 rp.ACTIVE_SOURCE_NAMES.get(last["active_source"], "?"),
+                 last["stop"], last["autonomy_abort"]))
+        print("  drive: applied=%+d  enc=(%+d,%+d)   steer: applied=%+d  fb=%+d"
+              % (last["drive_applied"], last["enc_left"], last["enc_right"],
+                 last["steer_applied"], last["steer_fb"]))
+        print("  ages: cmd=%s  enc=%s  steer=%s"
+              % (format_age(last["cmd_age_ms"]),
+                 format_age(last["enc_age_ms"], bool(f & rp.FAULT_ENCODER_STALE)),
+                 format_age(last["steer_age_ms"], bool(f & rp.FAULT_STEER_STALE))))
+        print("  health=%s  indicator: requested=%s shown=%s  faults=%s"
+              % (rp.CTRL_HEALTH_NAMES.get(last["controller_health"], "?"),
+                 rp.INDICATOR_NAMES.get(last["indicator_request"], "?"),
+                 rp.INDICATOR_NAMES.get(last["indicator_state"], "?"),
+                 ",".join(rp.fault_names(f)) or "none"))
     print("snapshots assembled: %d" % report.snapshots_seen)
+    if args.log:
+        print("snapshot log: %s" % args.log)
     print()
 
     if report.ok:
