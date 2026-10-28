@@ -17,7 +17,7 @@ here anyway, because "one place to change a timeout" is the point of the file.
 # v0.5 is the first revision with the application-layer CRC and sequence
 # number; v0.6 adds the command-source bit and TELEM_CMD_ECHO. Not carried on
 # the wire.
-PROTOCOL_VERSION = 6
+PROTOCOL_VERSION = 7
 
 # --- link ---
 CAN_BITRATE_HZ = 500000       # 500 kbps; every node must match

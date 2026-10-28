@@ -43,6 +43,8 @@ public:
     // and -- critically -- does NOT refresh the command watchdog.
     bool ingestFrame(uint32_t can_id, const uint8_t* buf, uint8_t len);
 
+    void updateFaults(uint16_t hardware_faults, uint8_t controller_health);
+
     // --- safety ----------------------------------------------------------
 
     uint16_t cmdAgeMs() const;
@@ -55,6 +57,9 @@ public:
     // Recomputed on every call, not latched: once the link is back, the rover
     // is in whatever mode was last commanded.
     uint8_t activeMode() const;
+
+    bool modeRefused() const;
+    uint16_t latchedFaults() const {return latched_faults_;}
 
     // THE fail-safe decision. An explicit stop flag, an active mode that does
     // not positively permit motion (which covers SAFE, a comm timeout and a
@@ -211,9 +216,20 @@ private:
     uint32_t elapsedSinceControl() const;
     bool recentlyDegraded() const;
 
+    void requestMode(const ControlMsg& msg);
+    uint16_t faultCauses() const;
+    bool hardwareFaultActive() const;
+    bool faultConditionPresent() const;
+    void latchIfFaulted();
+
     MillisFn now_ms_;
     uint32_t watchdog_timeout_ms_;
     uint32_t telemetry_period_ms_;
+
+    uint8_t    mode_;
+    uint16_t   latched_faults_;
+    uint16_t   hw_faults_;
+    uint8_t    hw_health_;
 
     ControlMsg last_control_;
     bool       have_control_;
