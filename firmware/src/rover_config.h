@@ -21,9 +21,11 @@ namespace rover {
 // --- Protocol version ------------------------------------------------------
 // Bump whenever a message's layout or meaning changes. Not carried on the
 // wire yet; DLC and the application-layer CRC are the only runtime mismatch
-// signals. v0.5 is the first revision with the CRC and sequence number; v0.6
-// adds the command-source bit and the TELEM_CMD_ECHO acknowledgement frame.
-static const uint8_t PROTOCOL_VERSION = 6;
+// signals. v0. is the first revision with the CRC and sequence number; v0.6
+// adds the command-source bit and the TELEM_CMD_ECHO acknowledgement frame;
+// v0.7 adds the TELEM_FEEDBACK frame (0x205) with feedback ages and the echoed
+// command flags/source, and the ENCODER_STALE / STEER_STALE fault bits.
+static const uint8_t PROTOCOL_VERSION = 7;
 
 // --- Link ------------------------------------------------------------------
 static const uint32_t CAN_BITRATE_HZ = 500000;   // 500 kbps; every node must match
@@ -46,7 +48,7 @@ static const uint32_t LINK_DEGRADED_HOLD_MS = 1000;
 // telemetry because a late command can hurt the rover and late telemetry only
 // annoys an operator. 0x000-0x0FF is left free for a future e-stop frame.
 //
-// Telemetry is five frames rather than one: see the snapshot-tearing note in
+// Telemetry is six frames rather than one: see the snapshot-tearing note in
 // rover_protocol.h, which is about what the split MEANS and so stays there.
 enum : uint32_t {
     CAN_ID_CONTROL        = 0x100,  // Jetson -> Teensy, highest priority in use
@@ -55,13 +57,14 @@ enum : uint32_t {
     CAN_ID_TELEM_POWER    = 0x202,  // current, voltage, fault word
     CAN_ID_TELEM_STATE    = 0x203,  // mode, link health, controller health
     CAN_ID_TELEM_CMD_ECHO = 0x204,  // what the controller accepted and is acting on
+    CAN_ID_TELEM_FEEDBACK = 0x205,  // what the controller accepted and is doing
 };
 
-// Bus load, so nobody has to recompute it when adding the sixth frame: one
-// CONTROL plus five telemetry frames at 20 Hz is 120 frames/s. A Classic CAN
+// Bus load, so nobody has to recompute it when adding another frame: one
+// CONTROL plus six telemetry frames at 20 Hz is 140 frames/s. A Classic CAN
 // frame with an 11-bit id and 8 data bytes is ~128 bits once stuffing is
-// allowed for, so ~15.4 kbit/s of 500 kbit/s -- about 3%. There is room, but
-// it is no longer free: a sixth telemetry frame is a decision, not a detail.
+// allowed for, so ~17.9 kbit/s of 500 kbit/s -- about 3.6%. The sixth frame
+// was added in v0.7; weigh any further frame against bus load.
 
 // --- Frame sizes -----------------------------------------------------------
 // Every frame is 8 bytes ON PURPOSE: that is Classic CAN's limit, so this

@@ -6,6 +6,15 @@
 // board attached. Only rover_firmware.cpp touches hardware.
 //
 // ---------------------------------------------------------------------------
+// v0.7: feedback AGE, and the command fields no other frame echoed
+// ---------------------------------------------------------------------------
+// TELEM_FEEDBACK (0x205) carries how long since the encoder and steering last
+// produced a sample -- reported, never acted on -- plus stop, autonomy_abort,
+// indicator_request, the active mode and the active command source, which no
+// other frame echoed. FAULT_ENCODER_STALE and FAULT_STEER_STALE flag an age
+// past its limit.
+//
+// ---------------------------------------------------------------------------
 // v0.6: a command SOURCE, and an acknowledgement of what was acted on
 // ---------------------------------------------------------------------------
 // Task 3 proved a Jetson command can reach the controller intact. Task 4 is
@@ -57,7 +66,7 @@
 // WHY EVERY FRAME IS STILL 8 BYTES
 //   8 bytes is Classic CAN's limit, so this protocol runs unchanged on CAN1 or
 //   CAN2 (Classic) and on CAN3 (CAN FD), and alongside motor controllers that
-//   are commonly Classic-only. Telemetry is therefore SPLIT ACROSS FOUR
+//   are commonly Classic-only. Telemetry is therefore SPLIT ACROSS SIX
 //   FRAMES rather than sent as one CAN FD frame. See the note on snapshot
 //   tearing at CAN_ID_TELEM_DRIVE_L.
 //
@@ -87,9 +96,9 @@ namespace rover {
 // deterministically instead of with sleeps.
 typedef uint32_t (*MillisFn)();
 
-// SNAPSHOT TEARING, on the four telemetry ids in rover_config.h: every frame
+// SNAPSHOT TEARING, on the six telemetry ids in rover_config.h: every frame
 // of one control cycle carries the SAME sequence number. The Jetson can
-// therefore tell whether the four frames it holds came from one cycle or
+// therefore tell whether the six frames it holds came from one cycle or
 // straddle two, and discard or flag a torn snapshot rather than silently
 // mixing a fresh encoder reading with a stale fault word. A single CAN FD
 // frame would be atomic and avoid this entirely; that is the main argument
@@ -209,6 +218,8 @@ enum : uint16_t {
     // who needs to know the rover is being commanded by the wrong half of the
     // stack. Self-clearing: the next authorised frame drops it.
     FAULT_CMD_SOURCE     = 0x0400,
+    FAULT_ENCODER_STALE  = 0x0800,  // no encoder sample within ENCODER_STALE_MS
+    FAULT_STEER_STALE    = 0x1000,  // no steering sample within STEER_STALE_MS
 };
 
 // Link health, reported for each link independently.
@@ -364,7 +375,7 @@ struct ControlMsg {
     uint8_t seq;               // increments once per frame, wraps 255->0
 };
 
-// Controller -> Jetson, five frames, all 20 Hz, all sharing one cycle's seq.
+// Controller -> Jetson, six frames, all 20 Hz, all sharing one cycle's seq.
 
 struct TelemetryDriveL {
     int32_t enc_left;      // cumulative ticks, WRAPS -- treat as relative
@@ -407,6 +418,19 @@ struct TelemetryCmdEcho {
                             // boot there is no frame to acknowledge and 0 is a
                             // perfectly ordinary sequence number.
     uint8_t status;         // packed: see packCmdStatus()
+};
+
+// Feedback freshness, plus the command fields no other frame echoes. The ages
+// say how long since the encoder and steering last produced a SAMPLE -- a new
+// reading arriving, whether or not its value changed. That is a question about
+// time, not correctness: a stale age is REPORTED (and raises the *_STALE fault
+// bits), never acted on, and judging whether a value is plausible is not
+// this frame's job.
+struct TelemetryFeedback {
+    uint16_t enc_age_ms;     // ms since the last encoder sample; CMD_AGE_UNKNOWN = none yet
+    uint16_t steer_age_ms;   // ms since the last steering sample; CMD_AGE_UNKNOWN = none yet
+    uint8_t  flags;          // packed: see packFeedbackFlags()
+    uint8_t  active_source;  // 0 = NONE, 1 = TELEOP, 2 = AUTONOMY, 3 = EMERGENCY
 };
 
 // ---------------------------------------------------------------------------
@@ -461,12 +485,41 @@ enum : uint8_t {
     CMD_ECHO_RESERVED_MASK = 0x80,  // bit 7, must be zero
 };
 
+// ---------------------------------------------------------------------------
+// TelemetryFeedback::flags packing.
+//
+//   bit  0    reserved, transmit as 0
+//   bit  1    stop               echoed from the last accepted CONTROL frame
+//   bit  2    autonomy_abort     echoed from the last accepted CONTROL frame
+//   bits 3-5  indicator_request  what the Jetson ASKED for (0-4), not what is
+//                                shown -- TelemetryState::indicator_state is
+//                                what is shown
+//   bits 6-7  active mode        RoverController::activeMode(), a MODE_*
+//                                value; unlike TelemetryState::mode this can
+//                                read FAULT
+// ---------------------------------------------------------------------------
+enum : uint8_t {
+    FEEDBACK_RESERVED_MASK       = 0x01,  // bit 0, must be zero
+    FEEDBACK_FLAG_STOP           = 0x02,  // bit 1
+    FEEDBACK_FLAG_AUTONOMY_ABORT = 0x04,  // bit 2
+    FEEDBACK_INDICATOR_MASK      = 0x38,  // bits 3-5
+    FEEDBACK_INDICATOR_SHIFT     = 3,
+    FEEDBACK_ACTIVE_MODE_MASK    = 0xC0,  // bits 6-7
+    FEEDBACK_ACTIVE_MODE_SHIFT   = 6,
+};
+
 uint8_t      packCmdStatus(uint8_t status, DecodeResult decode, bool return_active);
 uint8_t      cmdStatusOf(uint8_t packed);
 DecodeResult decodeResultOf(uint8_t packed);
 bool         returnActiveOf(uint8_t packed);
 const char*  cmdStatusName(uint8_t status);
 
+uint8_t      packFeedbackFlags(bool stop, bool autonomy_abort,
+                               uint8_t indicator_request, uint8_t active_mode);
+bool         feedbackStopOf(uint8_t packed);
+bool         feedbackAbortOf(uint8_t packed);
+uint8_t      feedbackIndicatorOf(uint8_t packed);
+uint8_t      feedbackActiveModeOf(uint8_t packed);
 
 uint8_t      encodeControl(const ControlMsg& msg, uint8_t* buf);
 DecodeResult decodeControl(uint32_t can_id, const uint8_t* buf, uint8_t len,
@@ -491,6 +544,10 @@ DecodeResult decodeTelemetryState(uint32_t can_id, const uint8_t* buf, uint8_t l
 uint8_t      encodeTelemetryCmdEcho(const TelemetryCmdEcho& msg, uint8_t seq, uint8_t* buf);
 DecodeResult decodeTelemetryCmdEcho(uint32_t can_id, const uint8_t* buf, uint8_t len,
                                     TelemetryCmdEcho& out, uint8_t& seq_out);
+
+uint8_t      encodeTelemetryFeedback(const TelemetryFeedback& msg, uint8_t seq, uint8_t* buf);
+DecodeResult decodeTelemetryFeedback(uint32_t can_id, const uint8_t* buf, uint8_t len,
+                                     TelemetryFeedback& out, uint8_t& seq_out);
 
 }  // namespace rover
 

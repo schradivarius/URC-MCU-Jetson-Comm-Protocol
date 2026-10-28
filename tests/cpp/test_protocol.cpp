@@ -495,6 +495,143 @@ static void the_cmd_echo_frame_round_trips() {
     }
 }
 
+static void the_feedback_flags_byte_packs_and_unpacks() {
+    // Every combination the four fields can legally hold, so a mask or shift
+    // that is off by one bit shows up as a field that comes back wrong.
+    for (int stop = 0; stop <= 1; ++stop) {
+        for (int abort = 0; abort <= 1; ++abort) {
+            for (uint8_t ind = 0; ind <= INDICATOR_MAX; ++ind) {
+                for (uint8_t mode = MODE_SAFE; mode <= MODE_FAULT; ++mode) {
+                    const uint8_t packed =
+                        packFeedbackFlags(stop != 0, abort != 0, ind, mode);
+                    CHECK_EQ(feedbackStopOf(packed), stop != 0);
+                    CHECK_EQ(feedbackAbortOf(packed), abort != 0);
+                    CHECK_EQ(feedbackIndicatorOf(packed), ind);
+                    CHECK_EQ(feedbackActiveModeOf(packed), mode);
+                    // Bit 0 used to be the source; it is reserved now.
+                    CHECK_EQ(packed & FEEDBACK_RESERVED_MASK, 0);
+                }
+            }
+        }
+    }
+}
+
+static void an_oversized_feedback_field_cannot_spill_into_its_neighbour() {
+    // The mask after each shift is what stops a bad value from corrupting the
+    // next field. 12 is 0b1100: unmasked, its top bit would land in bit 6 and
+    // turn the active mode from SAFE into AUTONOMOUS.
+    const uint8_t packed = packFeedbackFlags(false, false, 12, MODE_SAFE);
+    CHECK_EQ(feedbackActiveModeOf(packed), MODE_SAFE);
+    CHECK_EQ(feedbackIndicatorOf(packed), 12 & 0x07);
+    CHECK(!feedbackStopOf(packed));
+    CHECK(!feedbackAbortOf(packed));
+}
+
+static void the_feedback_frame_round_trips() {
+    // The ages include both reserved values, which must survive untouched:
+    // UNKNOWN means "no sample ever", MAX means "saturated", and confusing
+    // them sends someone looking for the wrong fault.
+    const struct { uint16_t enc, steer; uint8_t src, mode; } cases[] = {
+        {CMD_AGE_UNKNOWN, CMD_AGE_UNKNOWN, 0, MODE_SAFE},
+        {0, 0, 1, MODE_TELEOP},
+        {ENCODER_STALE_MS, STEER_STALE_MS - 1, 2, MODE_AUTONOMOUS},
+        {CMD_AGE_MAX, 1234, 3, MODE_FAULT},
+    };
+    for (const auto& c : cases) {
+        TelemetryFeedback in;
+        in.enc_age_ms = c.enc; in.steer_age_ms = c.steer;
+        in.flags = packFeedbackFlags(true, false, INDICATOR_ARRIVED, c.mode);
+        in.active_source = c.src;
+        uint8_t buf[8] = {0};
+        CHECK_EQ(encodeTelemetryFeedback(in, 99, buf), FRAME_DLC);
+
+        TelemetryFeedback out; uint8_t seq = 0;
+        CHECK_EQ(decodeTelemetryFeedback(CAN_ID_TELEM_FEEDBACK, buf, FRAME_DLC,
+                                         out, seq), DECODE_OK);
+        CHECK_EQ(out.enc_age_ms, c.enc);
+        CHECK_EQ(out.steer_age_ms, c.steer);
+        CHECK_EQ(out.flags, in.flags);
+        CHECK_EQ(out.active_source, c.src);
+        CHECK_EQ(seq, 99);
+    }
+}
+
+static void the_feedback_ages_are_little_endian_on_the_wire() {
+    // Pins the byte positions, not just the round trip: an encoder and a
+    // decoder that both swapped the bytes would still round-trip, and the
+    // Python side would read garbage.
+    TelemetryFeedback in = {0x1234, 0xABCD, 0x5A, 2};
+    uint8_t buf[8] = {0};
+    encodeTelemetryFeedback(in, 0, buf);
+    CHECK_EQ(buf[0], 0x34);
+    CHECK_EQ(buf[1], 0x12);
+    CHECK_EQ(buf[2], 0xCD);
+    CHECK_EQ(buf[3], 0xAB);
+    CHECK_EQ(buf[4], 0x5A);
+    CHECK_EQ(buf[5], 2);
+}
+
+static void a_feedback_frame_with_the_wrong_length_is_rejected() {
+    TelemetryFeedback in = {100, 200, packFeedbackFlags(false, true, 1, 1), 1};
+    uint8_t buf[8] = {0};
+    encodeTelemetryFeedback(in, 5, buf);
+    for (uint8_t len = 0; len <= 8; ++len) {
+        if (len == FRAME_DLC) continue;
+        // A rejected frame must leave the caller's struct alone.
+        TelemetryFeedback out = {7, 7, 7, 7}; uint8_t seq = 0;
+        CHECK_EQ(decodeTelemetryFeedback(CAN_ID_TELEM_FEEDBACK, buf, len, out, seq),
+                 DECODE_BAD_DLC);
+        CHECK_EQ(out.enc_age_ms, 7);
+        CHECK_EQ(out.active_source, 7);
+    }
+}
+
+static void a_corrupted_feedback_byte_is_caught_by_the_crc() {
+    TelemetryFeedback in = {250, CMD_AGE_UNKNOWN,
+                            packFeedbackFlags(true, true, INDICATOR_FAULT, MODE_FAULT), 3};
+    uint8_t good[8] = {0};
+    encodeTelemetryFeedback(in, 17, good);
+    TelemetryFeedback out; uint8_t seq = 0;
+    for (int byte = 0; byte < 7; ++byte) {          // every byte the CRC covers
+        for (int bit = 0; bit < 8; ++bit) {
+            uint8_t bad[8];
+            for (int i = 0; i < 8; ++i) bad[i] = good[i];
+            bad[byte] ^= static_cast<uint8_t>(1u << bit);
+            CHECK_EQ(decodeTelemetryFeedback(CAN_ID_TELEM_FEEDBACK, bad, FRAME_DLC,
+                                             out, seq), DECODE_BAD_CRC);
+        }
+    }
+}
+
+static void a_feedback_frame_on_the_wrong_can_id_fails() {
+    // Because the CRC is id-seeded. Also catches an encoder that seals with
+    // the CMD_ECHO id it was copied from.
+    TelemetryFeedback in = {10, 20, 0, 1};
+    uint8_t buf[8] = {0};
+    encodeTelemetryFeedback(in, 3, buf);
+    TelemetryFeedback out; uint8_t seq = 0;
+    CHECK_EQ(decodeTelemetryFeedback(CAN_ID_TELEM_FEEDBACK, buf, FRAME_DLC, out, seq),
+             DECODE_OK);
+    CHECK_EQ(decodeTelemetryFeedback(CAN_ID_TELEM_CMD_ECHO, buf, FRAME_DLC, out, seq),
+             DECODE_BAD_CRC);
+    CHECK_EQ(decodeTelemetryFeedback(CAN_ID_TELEM_STATE, buf, FRAME_DLC, out, seq),
+             DECODE_BAD_CRC);
+}
+
+static void the_stale_fault_bits_are_pinned_and_named() {
+    // Values pinned so the C++ and Python fault words cannot drift apart, and
+    // CMD_SOURCE checked too: it was missing from faultNames() until v0.7.
+    CHECK_EQ(static_cast<unsigned>(FAULT_ENCODER_STALE), 0x0800u);
+    CHECK_EQ(static_cast<unsigned>(FAULT_STEER_STALE), 0x1000u);
+    const char* names[16];
+    const size_t n = faultNames(static_cast<uint16_t>(
+        FAULT_CMD_SOURCE | FAULT_ENCODER_STALE | FAULT_STEER_STALE), names, 16);
+    CHECK_EQ(n, static_cast<size_t>(3));
+    CHECK_STREQ(names[0], "CMD_SOURCE");
+    CHECK_STREQ(names[1], "ENCODER_STALE");
+    CHECK_STREQ(names[2], "STEER_STALE");
+}
+
 static void indicator_predicate_covers_all_256_values() {
     for (int i = 0; i <= 255; ++i) {
         CHECK_EQ(isKnownIndicator(static_cast<uint8_t>(i)), i <= INDICATOR_FAULT);
@@ -531,6 +668,8 @@ static void every_frame_is_exactly_eight_bytes() {
     CHECK_EQ(encodeTelemetryPower(pw, 0, buf), 8);
     TelemetryState st = {0, 0, 0, 0, 0, 0};
     CHECK_EQ(encodeTelemetryState(st, 0, buf), 8);
+    TelemetryFeedback fb = {0, 0, 0, 0};
+    CHECK_EQ(encodeTelemetryFeedback(fb, 0, buf), 8);
 }
 
 static void control_outranks_telemetry_on_the_bus() {
@@ -540,6 +679,7 @@ static void control_outranks_telemetry_on_the_bus() {
     CHECK(CAN_ID_CONTROL < CAN_ID_TELEM_DRIVE_R);
     CHECK(CAN_ID_CONTROL < CAN_ID_TELEM_POWER);
     CHECK(CAN_ID_CONTROL < CAN_ID_TELEM_STATE);
+    CHECK(CAN_ID_CONTROL < CAN_ID_TELEM_FEEDBACK);
     // Headroom below CONTROL reserved for a future dedicated e-stop frame.
     CHECK(CAN_ID_CONTROL >= 0x100);
 }
@@ -548,6 +688,7 @@ static void telemetry_ids_are_distinct() {
     CHECK(CAN_ID_TELEM_DRIVE_L != CAN_ID_TELEM_DRIVE_R);
     CHECK(CAN_ID_TELEM_DRIVE_R != CAN_ID_TELEM_POWER);
     CHECK(CAN_ID_TELEM_POWER   != CAN_ID_TELEM_STATE);
+    CHECK(CAN_ID_TELEM_CMD_ECHO != CAN_ID_TELEM_FEEDBACK);
 }
 
 // --- range handling ---------------------------------------------------------
@@ -626,6 +767,14 @@ int main() {
     RUN_TEST(fault_has_no_owner);
     RUN_TEST(the_command_status_byte_packs_and_unpacks);
     RUN_TEST(the_cmd_echo_frame_round_trips);
+    RUN_TEST(the_feedback_flags_byte_packs_and_unpacks);
+    RUN_TEST(an_oversized_feedback_field_cannot_spill_into_its_neighbour);
+    RUN_TEST(the_feedback_frame_round_trips);
+    RUN_TEST(the_feedback_ages_are_little_endian_on_the_wire);
+    RUN_TEST(a_feedback_frame_with_the_wrong_length_is_rejected);
+    RUN_TEST(a_corrupted_feedback_byte_is_caught_by_the_crc);
+    RUN_TEST(a_feedback_frame_on_the_wrong_can_id_fails);
+    RUN_TEST(the_stale_fault_bits_are_pinned_and_named);
     RUN_TEST(indicator_predicate_covers_all_256_values);
     RUN_TEST(undefined_indicator_request_is_rejected);
     RUN_TEST(every_frame_is_exactly_eight_bytes);

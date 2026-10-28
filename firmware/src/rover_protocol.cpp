@@ -175,11 +175,13 @@ size_t faultNames(uint16_t bitmask, const char** out, size_t cap) {
         FAULT_COMM_TIMEOUT, FAULT_OVER_CURRENT, FAULT_ESTOP_ACTIVE,
         FAULT_ENCODER_FAULT, FAULT_UNDERVOLTAGE, FAULT_FIRMWARE_FAULT,
         FAULT_PROTOCOL_ERROR, FAULT_C2_LINK_LOST, FAULT_SEQ_GAP, FAULT_CRC_ERROR,
+        FAULT_CMD_SOURCE, FAULT_ENCODER_STALE, FAULT_STEER_STALE
     };
     static const char* names[] = {
         "COMM_TIMEOUT", "OVER_CURRENT", "ESTOP_ACTIVE",
         "ENCODER_FAULT", "UNDERVOLTAGE", "FIRMWARE_FAULT",
         "PROTOCOL_ERROR", "C2_LINK_LOST", "SEQ_GAP", "CRC_ERROR",
+        "CMD_SOURCE", "ENCODER_STALE", "STEER_STALE"
     };
     size_t n = 0;
     for (size_t i = 0; i < sizeof(bits) / sizeof(bits[0]) && n < cap; ++i) {
@@ -399,6 +401,64 @@ DecodeResult decodeTelemetryCmdEcho(uint32_t can_id, const uint8_t* buf, uint8_t
     out.ack_seq       = buf[4];
     out.status        = buf[5];
     return DECODE_OK;
+}
+
+uint8_t encodeTelemetryFeedback(const TelemetryFeedback& msg, uint8_t seq, uint8_t* buf) {
+    putU16(buf + 0, msg.enc_age_ms);
+    putU16(buf + 2, msg.steer_age_ms);
+    buf[4] = msg.flags;
+    buf[5] = msg.active_source;
+    return sealFrame(CAN_ID_TELEM_FEEDBACK, seq, buf);
+}
+
+DecodeResult decodeTelemetryFeedback(uint32_t can_id, const uint8_t* buf, uint8_t len,
+                                     TelemetryFeedback& out, uint8_t& seq_out) {
+    DecodeResult r = openFrame(can_id, buf, len, seq_out);
+    if (r != DECODE_OK) return r;
+    out.enc_age_ms    = getU16(buf + 0);
+    out.steer_age_ms  = getU16(buf + 2);
+    out.flags         = buf[4];
+    out.active_source = buf[5];
+    return DECODE_OK;
+}
+
+// ---------------------------------------------------------------------------
+// Feedback flags byte
+// ---------------------------------------------------------------------------
+
+// The active-mode field is two bits wide, so every MODE_* has to fit.
+static_assert(MODE_FAULT <= 3, "MODE_* no longer fits in 2 bits");
+
+uint8_t packFeedbackFlags(bool stop, bool autonomy_abort,
+                          uint8_t indicator_request, uint8_t active_mode) {
+    uint8_t packed = 0;
+    if (stop) packed = static_cast<uint8_t>(packed | FEEDBACK_FLAG_STOP);
+    if (autonomy_abort) packed = static_cast<uint8_t>(packed | FEEDBACK_FLAG_AUTONOMY_ABORT);
+    packed = static_cast<uint8_t>(
+        packed | ((indicator_request << FEEDBACK_INDICATOR_SHIFT)
+                  & FEEDBACK_INDICATOR_MASK));
+    packed = static_cast<uint8_t>(
+        packed | ((active_mode << FEEDBACK_ACTIVE_MODE_SHIFT)
+                  & FEEDBACK_ACTIVE_MODE_MASK));
+    return packed;
+}
+
+bool feedbackStopOf(uint8_t packed) {
+    return (packed & FEEDBACK_FLAG_STOP) != 0;
+}
+
+bool feedbackAbortOf(uint8_t packed) {
+    return (packed & FEEDBACK_FLAG_AUTONOMY_ABORT) != 0;
+}
+
+uint8_t feedbackIndicatorOf(uint8_t packed) {
+    return static_cast<uint8_t>(
+        (packed & FEEDBACK_INDICATOR_MASK) >> FEEDBACK_INDICATOR_SHIFT);
+}
+
+uint8_t feedbackActiveModeOf(uint8_t packed) {
+    return static_cast<uint8_t>(
+        (packed & FEEDBACK_ACTIVE_MODE_MASK) >> FEEDBACK_ACTIVE_MODE_SHIFT);
 }
 
 }  // namespace rover
