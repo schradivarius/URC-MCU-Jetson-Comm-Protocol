@@ -343,4 +343,26 @@ TelemetryCmdEcho RoverController::buildCmdEcho(int16_t drive_applied,
     return m;
 }
 
+TelemetryFeedback RoverController::buildFeedback(uint16_t enc_age_ms,
+                                                 uint16_t steer_age_ms) const {
+    TelemetryFeedback m;
+    m.enc_age_ms   = enc_age_ms;
+    m.steer_age_ms = steer_age_ms;
+    // activeMode(), not last_control_.mode: the mode actually being EXECUTED,
+    // so this reads FAULT after a comm timeout even while AUTONOMOUS is the
+    // last thing commanded.
+    m.flags        = packFeedbackFlags(last_control_.stop,
+                                       last_control_.autonomy_abort,
+                                       last_control_.indicator_request,
+                                       activeMode());
+    // 0 = NONE, 1 = TELEOP, 2 = AUTONOMY. Taken from from_autonomy until the
+    // 5.4 source tracking (getActiveSource()) is merged and wired in. NONE
+    // before the first valid frame, the same rule as c2LinkState(): nobody
+    // has told us, so do not claim the operator is in control.
+    if (!have_control_)                   m.active_source = 0;
+    else if (last_control_.from_autonomy) m.active_source = 2;
+    else                                  m.active_source = 1;
+    return m;
+}
+
 }  // namespace rover

@@ -143,6 +143,13 @@ public:
     // sensor readings. Pass what commandedOutputs() returned.
     TelemetryCmdEcho buildCmdEcho(int16_t drive_applied, int16_t steer_applied) const;
 
+    // Feedback freshness. The ages are passed in for the same reason as
+    // buildCmdEcho()'s outputs: the controller never sees the sensors, so the
+    // caller measures them (FeedbackAge, already clamped) and hands them over.
+    // The flags echo the last CONTROL frame plus activeMode(); active_source
+    // reads NONE (0) until a valid CONTROL frame has arrived.
+    TelemetryFeedback buildFeedback(uint16_t enc_age_ms, uint16_t steer_age_ms) const;
+
     // Every fault the controller itself knows about, OR-ed together. Exposed
     // so the firmware can report the same word it acts on.
     uint16_t faultWord(uint16_t sensor_faults = 0, uint16_t extra_faults = 0) const;
