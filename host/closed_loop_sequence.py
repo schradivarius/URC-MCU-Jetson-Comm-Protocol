@@ -198,6 +198,7 @@ def steer_feedback_within(target, tolerance):
 # PLACEHOLDERS: the right values depend on how noisy the real encoders are.
 SPEED_TOLERANCE = 0.10          # within 10% of the target
 STOPPED_MAX = 200               # counts/sec
+SETTLE_READINGS = 4             # agreeing readings before a speed counts as settled
 
 # The rover sends one snapshot every TELEMETRY_PERIOD_MS and numbers each one,
 # so the time between two snapshots is (how many numbers apart) x 50 ms -- the
@@ -272,30 +273,36 @@ def speed_meter():
         return speed
     return read
 
+def cruise_speed(baseline, pct=SPEED_TOLERANCE, stopped_max=STOPPED_MAX,
+                  readings=SETTLE_READINGS):
+    """ Passes once the rover is moving FORWARD and its speed has settled, and
+    puts that settled speed in baseline[0] for later steps to compare against.
 
-def cruise_speed(baseline, pct=SPEED_TOLERANCE, stopped_max=STOPPED_MAX):
-    """Passes once the rover is moving and its speed has settled, and puts
-    that speed in baseline[0] for later steps to compare against.
-
-    "Settled" means two readings in a row agree within pct. With today's
-    simulator that is immediate; once Task 5.1 makes the rover speed up
-    gradually, this waits out the ramp instead of grabbing a half-way speed.
+    "Settled" means the last `readings` speeds span less than pct of their own
+    average. Two consecutive readings agreeing within pct is not enough: near
+    the top of a ramp the step between readings is already smaller than that,
+    so a two-reading test latches a half-way speed as the cruise speed and
+    every later ratio is measured against the wrong number.
     """
+    
     meter = speed_meter()
-    last_speed = None
+    window = []
 
     def check(s):
-        nonlocal last_speed
         speed = meter(s)
         if speed is None:
             return "Nothing measured yet."
-        if abs(speed) <= stopped_max:
-            last_speed = None
-            return f"not moving yet (speed {speed:.0f})"
-        previous, last_speed = last_speed, speed
-        if previous is None or speed_problem(speed, previous, pct, stopped_max):
+        if speed <= stopped_max:
+            del window[:]
+            return f"not moving forward yet (speed {speed:.0f})"
+        window.append(speed)
+        del window[:-readings]
+        if len(window) < readings:
             return f"speed still changing ({speed:.0f})"
-        baseline[0] = speed
+        average = sum(window) / len(window)
+        if max(window) - min(window) > pct * abs(average):
+            return f"speed still changing({speed:.0f})"
+        baselijne[0] = average
         return None
     return check
 
@@ -508,48 +515,45 @@ def run_mission(link, steps=None, verbose=True, settle_s=0.4, recorder=None):
         jl.poll()
         time.sleep(period)
 
-    for step in steps:
-        started = time.monotonic()
-        first_seq = None
-        detail = "no telemetry snapshot arrived"
-        ok = False
-        snapshot = None
+     try:
+        for step in steps:
+            started = time.monotonic()
+            first_seq = None
+            detail = "no telemetry snapshot arrived"
+            ok = False
+            snapshot = None
 
-        while time.monotonic() - started < step.timeout_s:
-            sent_seq = jl.send_control(**step.command)
-            if first_seq is None:
-                first_seq = sent_seq
-            jl.poll()
+            while time.monotonic() - started < step.timeout_s:
+                sent_seq = jl.send_control(**step.command)
+                if first_seq is None:
+                    first_seq = sent_seq
+                jl.poll()
 
-            snapshot = jl.snapshot
-            if snapshot is not None:
-                report.snapshots_seen = jl.tele.complete_count
-                if recorder is not None:
-                    recorder.record(step.name, snapshot)
-                # Only a snapshot acknowledging a frame from THIS step can say
-                # anything about this step. Anything older is the previous
-                # command still echoing back.
-                if (snapshot.get("cmd_status") == rp.CMD_STATUS_NO_COMMAND
-                        or not seq_at_or_after(snapshot["ack_seq"], first_seq)):
-                    detail = "still waiting for the controller to acknowledge"
-                else:
-                    detail = step.check(snapshot)
-                    if detail is None:
-                        ok = True
-                        break
-            time.sleep(period)
+                snapshot = jl.snapshot
+                if snapshot is not None:
+                    report.snapshots_seen = jl.tele.complete_count
+                    # Only a snapshot acknowledging a frame from THIS step can say
+                    # anything about this step. Anything older is the previous
+                    # command still echoing back.
+                    if (snapshot.get("cmd_status") == rp.CMD_STATUS_NO_COMMAND
+                            or not seq_at_or_after(snapshot["ack_seq"], first_seq)):
+                        detail = "still waiting for the controller to acknowledge"
+                    else:
+                        detail = step.check(snapshot)
+                        if detail is None:
+                            ok = True
+                            break
+                time.sleep(period)
 
-        report.results.append(StepResult(step.name, ok, detail,
-                                         time.monotonic() - started, snapshot))
-        if verbose:
-            print(report.results[-1])
-            if snapshot is not None:
-                speed = recorder.last_speed if recorder is not None else None
-                print("       light=%-14s speed=%s" % (
-                    INDICATOR_COLORS.get(snapshot["indicator_state"], "?"),
-                    "?" if speed is None else "%.0f counts/s" % speed))
-        if not ok:
-            break
+            report.results.append(StepResult(step.name, ok, detail,
+                                             time.monotonic() - started, snapshot))
+            if verbose:
+                print(report.results[-1])
+            if not ok:
+                break
+    finally:
+        jl.send_control(drive_cmd=0, steer_cmd=0, mode=rp.MODE_SAFE,
+                        c2_lost=False)
 
     return report
 
