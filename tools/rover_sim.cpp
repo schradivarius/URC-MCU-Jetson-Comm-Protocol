@@ -32,6 +32,7 @@
 #include "../firmware/src/rover_controller.h"
 #include "../firmware/src/rover_drive.h"
 #include "../firmware/src/rover_drive_sim.h"
+#include "../firmware/src/rover_encoder.h"
 
 using namespace rover;
 
@@ -68,6 +69,7 @@ int main(int argc, char** argv) {
     // them. Only the pins at the far end are missing.
     DriveModule drv;
     DriveSim feedback(seed);
+    SimulatedEncoder enc_l, enc_r;
 
     int16_t steer_fb = 0;
     std::string pending;
@@ -114,9 +116,12 @@ int main(int argc, char** argv) {
         // raw command, so the mix is part of what the host tests observe. The
         // fail-safe has already been applied twice over, so there is no third
         // copy of the stop rule here. Encoders come from the lagging measured speed.
-        feedback.update(out.left_effort, out.right_effort, out.energized, realMillis());
-        const int32_t enc_left  = feedback.left().encoder_ticks;
-        const int32_t enc_right = feedback.right().encoder_ticks;
+        const uint32_t now_ms = realMillis();
+        feedback.update(out.left_effort, out.right_effort, out.energized, now_ms);
+        enc_l.update(scaledFromMps(feedback.left().measured_mps), now_ms);
+        enc_r.update(scaledFromMps(feedback.right().measured_mps), now_ms);
+        const int32_t enc_left  = enc_l.feedback(now_ms).count;
+        const int32_t enc_right = enc_r.feedback(now_ms).count;
         if (steer_fb < out.steer_effort) {
             steer_fb = static_cast<int16_t>((steer_fb + 25 < out.steer_effort)
                                             ? steer_fb + 25 : out.steer_effort);
