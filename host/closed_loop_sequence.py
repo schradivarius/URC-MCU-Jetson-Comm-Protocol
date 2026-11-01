@@ -301,8 +301,8 @@ def cruise_speed(baseline, pct=SPEED_TOLERANCE, stopped_max=STOPPED_MAX,
             return f"speed still changing ({speed:.0f})"
         average = sum(window) / len(window)
         if max(window) - min(window) > pct * abs(average):
-            return f"speed still changing({speed:.0f})"
-        baselijne[0] = average
+            return f"speed still changing ({speed:.0f})"
+        baseline[0] = average
         return None
     return check
 
@@ -420,6 +420,12 @@ def build_mission():
                            indicator_state=rp.INDICATOR_OFF),
                     fault_clear(rp.FAULT_CMD_SOURCE, "CMD_SOURCE"))),
 
+        Step("1b. TELEOP shows blue",
+             dict(drive_cmd=0, steer_cmd=0, mode=rp.MODE_TELEOP,
+                  c2_lost=False, from_autonomy=False),
+             expect(mode=rp.MODE_TELEOP,
+                    indicator_state=rp.INDICATOR_TELEOP)),
+
         Step("2. receive AUTONOMOUS",
              dict(drive_cmd=0, steer_cmd=0, **auto),
              expect(mode=rp.MODE_AUTONOMOUS,
@@ -515,7 +521,7 @@ def run_mission(link, steps=None, verbose=True, settle_s=0.4, recorder=None):
         jl.poll()
         time.sleep(period)
 
-     try:
+    try:
         for step in steps:
             started = time.monotonic()
             first_seq = None
@@ -532,6 +538,8 @@ def run_mission(link, steps=None, verbose=True, settle_s=0.4, recorder=None):
                 snapshot = jl.snapshot
                 if snapshot is not None:
                     report.snapshots_seen = jl.tele.complete_count
+                    if recorder is not None:
+                        recorder.record(step.name, snapshot)
                     # Only a snapshot acknowledging a frame from THIS step can say
                     # anything about this step. Anything older is the previous
                     # command still echoing back.
@@ -549,11 +557,19 @@ def run_mission(link, steps=None, verbose=True, settle_s=0.4, recorder=None):
                                              time.monotonic() - started, snapshot))
             if verbose:
                 print(report.results[-1])
+                if snapshot is not None:
+                    speed = recorder.last_speed if recorder is not None else None
+                    print("       light=%-14s speed=%s" % (
+                        INDICATOR_COLORS.get(snapshot["indicator_state"], "?"),
+                        "?" if speed is None else "%.0f counts/s" % speed))
             if not ok:
                 break
     finally:
-        jl.send_control(drive_cmd=0, steer_cmd=0, mode=rp.MODE_SAFE,
-                        c2_lost=False)
+        for _ in range(3):
+            jl.send_control(drive_cmd=0, steer_cmd=0, mode=rp.MODE_SAFE,
+                            c2_lost=False, stop=True)
+            jl.poll()
+            time.sleep(period)
 
     return report
 
