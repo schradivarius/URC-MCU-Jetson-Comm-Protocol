@@ -71,6 +71,16 @@ static void counting_survives_millis_wraparound() {
     CHECK(enc.feedback(end).valid);
 }
 
+static void a_long_stall_is_not_counted_as_travel() {
+    SimulatedEncoder enc;
+    enc.update(CMD_MAX, 0);
+    CHECK(!enc.feedback(5000).valid);
+    enc.update(CMD_MAX, 5000);
+    const int32_t capped =
+        ENCODER_MAX_RPM * ENCODER_TICKS_PER_REV * (int32_t)ENCODER_MAX_STEP_MS / 60000;
+    CHECK_EQ(enc.feedback(5000).count, capped);
+}
+
 int main() {
     RUN_TEST(starts_at_zero_and_not_valid);
     RUN_TEST(full_forward_for_one_second_turns_max_rpm_worth_of_ticks);
@@ -80,5 +90,6 @@ int main() {
     RUN_TEST(timestamp_is_the_time_of_the_last_update);
     RUN_TEST(feedback_goes_stale_when_updates_stop);
     RUN_TEST(counting_survives_millis_wraparound);
+    RUN_TEST(a_long_stall_is_not_counted_as_travel);
     return testing::summary("test_encoder");
 }

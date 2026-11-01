@@ -13,6 +13,7 @@ namespace rover {
 static const int32_t  ENCODER_TICKS_PER_REV = 2048;  // ticks per wheel turn
 static const int32_t  ENCODER_MAX_RPM       = 120;   // wheel RPM at CMD_MAX
 static const uint32_t ENCODER_STALE_MS      = 100;   // older than this = not current
+static const uint32_t ENCODER_MAX_STEP_MS   = 100;   // longest gap counted in one update
  
 
 struct EncoderFeedback {
@@ -26,7 +27,10 @@ class SimulatedEncoder {
 public:
     SimulatedEncoder();
 
-    void update(int16_t effort, uint32_t now_ms);
+    // speed_scaled is the MEASURED wheel speed as a fraction of full speed,
+    // CMD_MIN..CMD_MAX. Never a drive command: the whole point of this module
+    // is to report what the wheel did.
+    void update(int16_t speed_scaled, uint32_t now_ms);
  
     EncoderFeedback feedback(uint32_t now_ms) const;
  

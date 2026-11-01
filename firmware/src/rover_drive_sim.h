@@ -5,6 +5,8 @@
 
 #include <stdint.h>
 
+#include "rover_protocol.h"
+
 namespace rover {
 
 static const float SIM_MAX_SPEED_MPS  = 1.0f;    // speed at full effort (CMD_MAX)
@@ -53,6 +55,16 @@ private:
     WheelFeedback left_, right_;
     float frac_left_, frac_right_;   // leftover partial tick
 };
+
+// The measured speed on the same -1000..1000 scale a drive command uses, so
+// the encoder module can be handed what the wheel DID rather than what it was
+// asked to do.
+inline int16_t scaledFromMps(float mps) {
+    float s = mps / SIM_MAX_SPEED_MPS * static_cast<float>(CMD_MAX);
+    if (s > static_cast<float>(CMD_MAX)) s = static_cast<float>(CMD_MAX);
+    if (s < static_cast<float>(CMD_MIN)) s = static_cast<float>(CMD_MIN);
+    return static_cast<int16_t>(s);
+}
 
 }  // namespace rover
 
