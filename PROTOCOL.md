@@ -1,4 +1,4 @@
-# Rover Onboard Computer ↔ Embedded Controller Protocol (v0.6)
+# Rover Onboard Computer ↔ Embedded Controller Protocol (v0.7)
 
 **Scope:** Onboard computer (Jetson Orin Nano, candidate) ↔ embedded controller
 (**Teensy 4.1**, NXP i.MX RT1062, C++ / Teensyduino), over **CAN**.
@@ -48,6 +48,32 @@
 > produced and the next field goes in the mode byte (§3.1.2). And
 > `controller_health` is no longer a constant `NOT_REPORTED`: the new drive
 > stage reports its own state (§3.5).
+>
+> **v0.7 — the controller owns the mode.** Up to v0.6 the controller ran in
+> whatever mode the last `CONTROL` frame named. From v0.7 the Teensy keeps
+> its own mode, and a frame's `mode` byte is a **request** that the controller
+> can refuse. No byte moves on the wire. What changes is what some values
+> *mean*:
+>
+> * **Checked transitions** (§3.1.7). Anyone may command `SAFE`. Only the
+>   operator (`from_autonomy = 0`) may grant `TELEOP` or `AUTONOMOUS`, so the
+>   autonomy stack cannot put itself in charge. A refused request is reported
+>   as the new `cmd_status` value `MODE_REFUSED = 4` (§3.6).
+> * **`FAULT` latches.** A comm timeout, C2 loss in `TELEOP`, or a critical
+>   hardware fault while the rover is in a motion mode puts it in `FAULT`. It
+>   stays there, even after the cause clears, until `SAFE` is commanded. The
+>   cause bits stay set in `fault_status` for as long as the latch holds
+>   (§3.4).
+> * **Hardware faults are inputs.** `RoverController::updateFaults()` runs once
+>   per loop. Over-current, a soft e-stop and a drive-stage `FAULT` are
+>   *critical* and fault a moving rover. Every other hardware fault is only
+>   reported, as before.
+> * **`TELEM_STATE.mode` reports the actual mode**, `FAULT` included, rather
+>   than echoing the request (§3.5).
+>
+> What the Jetson has to do differently: grant a motion mode with an operator
+> frame first, and send `SAFE` after any fault before asking to move again
+> (§3.1.7). `PROTOCOL_VERSION` is 7.
 >
 > Full field tables with types, units, ranges, meanings and update rates are in
 > section 3.
@@ -136,6 +162,12 @@ completes. That is silent, so `TelemetryAssembler.missing_ids()` names the ids
 nothing has ever arrived on and `jetson_test.py` prints them — which ids showed
 up *is* the version diagnostic.
 
+**Except between v0.6 and v0.7**, which send the same ids. v0.7 changed meaning
+and kept the layout, so this diagnostic cannot tell them apart. The sign of a
+v0.6 Jetson talking to a v0.7 controller is `cmd_status = 4` (`MODE_REFUSED`)
+when it first asks for `AUTONOMOUS`, or a rover that stays in `FAULT` after a
+timeout. §3.1.2 has the full skew table.
+
 ## 3. Message definitions
 
 ### 3.0 Requirement coverage
@@ -200,7 +232,7 @@ would only add a staleness question nobody needs to ask.
 |---|---|---|---|---|---|
 | 0–1 | `drive_cmd` | int16 | 0.1 % of full drive effort | −1000 … +1000 | Desired drive. Positive is forward. A value outside the range **rejects the whole frame** — see 3.1.4. |
 | 2–3 | `steer_cmd` | int16 | 0.1 % of full steering range | −1000 … +1000 | Desired steering. Positive is right. Range-checked exactly like `drive_cmd`. |
-| 4 | `mode` | uint8 | enum | **0, 1, 2 only** | `0=SAFE, 1=TELEOP, 2=AUTONOMOUS`. Any other value, including `3=FAULT`, **rejects the frame** — see 3.1.1. |
+| 4 | `mode` | uint8 | enum | **0, 1, 2 only** | **Requested** mode: `0=SAFE, 1=TELEOP, 2=AUTONOMOUS`. Since v0.7 the controller may refuse it (§3.1.7). Any other value, including `3=FAULT`, **rejects the frame** — see 3.1.1. |
 | 5 | `flags` | uint8 | bitfield | see below | Six fields packed, no spare bits; see 3.1.2. |
 | 6 | `seq` | uint8 | frames | 0–255 wraps | See 2.2. |
 | 7 | `crc8` | uint8 | — | 0–255 | See 4. |
@@ -216,21 +248,36 @@ a real bug:
 | May the Jetson *send* this value? (`isCommandableMode`) | `0`, `1`, `2`. **`SAFE` is valid** — a legitimate command meaning "do not move". `3=FAULT` is not: only the controller enters it. |
 | May the rover *move*? (`modePermitsMotion`) | `TELEOP` or `AUTONOMOUS` only — a **whitelist**. |
 
-**Commanded mode vs. active mode.** `SAFE` means stopped *on purpose*;
-`FAULT` means stopped because a link the mode needs is gone. The controller
-works out which mode it is actually executing with
-`RoverController::activeMode()`:
+**Requested mode vs. active mode.** `SAFE` means stopped *on purpose*.
+`FAULT` means stopped because something the motion mode needs has failed. Since
+v0.7 the controller keeps its own mode, which a frame can only *ask* to change
+(§3.1.7). `RoverController::activeMode()` reports the mode the controller is
+actually running:
 
 | Situation | Active mode |
 |---|---|
-| No valid `CONTROL` yet, or none for 300 ms (`COMM_TIMEOUT`) | `FAULT` |
-| `TELEOP` commanded, but `c2_lost = 1` | `FAULT` |
-| Anything else | the commanded mode |
+| Boot, before any operator grant | `SAFE` |
+| In `TELEOP` or `AUTONOMOUS`, and no valid `CONTROL` for 300 ms (`COMM_TIMEOUT`) | `FAULT`, **latched** |
+| In `TELEOP`, and a frame reports `c2_lost = 1` | `FAULT`, **latched** |
+| In `TELEOP` or `AUTONOMOUS`, and a critical hardware fault is present (§3.4) | `FAULT`, **latched** |
+| Latched in `FAULT`, until a `SAFE` request is accepted | `FAULT` |
+| Anything else | the controller's own mode: the last request it **accepted** |
 
-`FAULT` is not latched: once the link is back, the active mode is whatever was
-last commanded. `effectiveStop()` and `indicatorState()` are both derived from
-it, so the stop decision, the mode and the rear light cannot disagree.
-`TELEM_STATE.mode` still echoes the *commanded* mode.
+**`FAULT` is latched.** Restoring the link does not resume motion. The rover
+stays in `FAULT` until `SAFE` is commanded, and only then may the operator grant
+a motion mode again (§3.1.7). Before v0.7 `FAULT` cleared itself the moment its
+cause went away, so the rover could start moving again with nobody having
+looked at why it stopped.
+
+**A silent Jetson in `SAFE` is not a fault.** The rover is not moving and was
+not going to, so a comm timeout there is reported (`COMM_TIMEOUT`,
+`jetson_link = LOST`) but leaves the mode `SAFE`. Boot is the same case: the
+rover boots `SAFE` with the indicator `OFF`, where v0.6 showed `FAULT` until the
+first frame arrived.
+
+`effectiveStop()`, `indicatorState()` and `TELEM_STATE.mode` are all derived
+from `activeMode()`, so the stop decision, the reported mode and the rear light
+cannot disagree.
 
 A non-commandable mode **rejects the whole frame**, exactly like a bad CRC: the
 sender disagrees with us about the protocol. Deliberately **not**
@@ -264,6 +311,8 @@ there is no version field on the wire (§6):
 |---|---|
 | v0.6 Jetson → v0.5 controller | A teleop frame (bit 7 clear) is accepted normally. An **autonomy** frame (bit 7 set) hits v0.5's reserved-bit check, is rejected as `DECODE_BAD_FLAGS`, does not refresh the watchdog, and the rover stops. |
 | v0.5 Jetson → v0.6 controller | Every frame reads as teleop-sourced. `TELEOP` works; `AUTONOMOUS` refuses motion and raises `FAULT_CMD_SOURCE`, and the rover sits still. |
+| v0.6 Jetson → v0.7 controller | The frames decode, but a v0.6 autonomy stack asks for `AUTONOMOUS` itself (`from_autonomy = 1`). That request is refused, so the rover stays in `SAFE` and reports `cmd_status = 4`, which a v0.6 Jetson decodes as an unknown status. After any timeout the rover latches `FAULT`, and a v0.6 Jetson never sends the `SAFE` that clears it. The rover sits still. `TELEOP` granted from the operator path still works until the first fault. |
+| v0.7 Jetson → v0.6 controller | A v0.6 controller runs whatever mode each frame names. The v0.7 grant frame carries `stop = 1`, and the frames after it are ones a v0.6 controller already accepts, so the rover behaves as under v0.6. It loses the v0.7 protections without moving on anything it misunderstood. |
 
 Neither direction moves a rover on a misunderstood command, which is the only
 property that matters here.
@@ -285,9 +334,15 @@ base station drops while onboard autonomy keeps running.
 
 | Mode | `c2_lost = 1` → | Why |
 |---|---|---|
-| `TELEOP` | **stop** | The operator's commands can no longer arrive, so nobody is driving |
+| `TELEOP` | **stop, and latch `FAULT`** (v0.7) | The operator's commands can no longer arrive, so nobody is driving |
 | `AUTONOMOUS` | **keep driving** | The Jetson is driving, and is provably alive or the command watchdog would already have stopped the rover |
 | `SAFE` | stopped anyway | — |
+
+Since v0.7 C2 loss also blocks a **request** for `TELEOP`: a frame asking for
+`TELEOP` with `c2_lost = 1` is refused (`MODE_REFUSED`), because granting it
+would only fault the rover on the same frame. And because `FAULT` now latches,
+a `TELEOP` rover that loses C2 stays stopped after the link comes back, until
+`SAFE` is commanded (§3.1.7).
 
 `FAULT_C2_LINK_LOST` is raised in **every** mode: during an autonomous run it
 is the only sign that the rover is out of contact, which an operator needs
@@ -351,6 +406,15 @@ the operator gets instead is `CMD_STATUS_WRONG_SOURCE` in `TELEM_CMD_ECHO` and
 `FAULT_CMD_SOURCE` in `fault_status`, both naming the actual problem. The
 condition is self-clearing: the next authorised frame drops it.
 
+Since v0.7 two cases are **not** reported as a mismatch, because neither asks
+for motion from the wrong producer:
+
+- **A frame with `stop = 1`.** This is what makes the operator's grant frame
+  work (§3.1.7). The operator asks for `AUTONOMOUS` with the stop flag set, and
+  that is a hand-over, not an operator trying to drive in autonomy's mode.
+- **A frame whose mode request was refused.** Its verdict is `MODE_REFUSED`,
+  which already names the problem.
+
 **Safety flags are never gated by it.** `stop`, `autonomy_abort`,
 `return_request` and `c2_lost` are honoured from either producer, because
 anyone who can see the rover is in trouble must be able to stop it, and because
@@ -366,11 +430,15 @@ flight is enough to drive an autonomous rover from the teleop path. The
 controller is the only place that sees the mode and the command *in the same
 frame*, so it is the only place the two can be checked against each other.
 
-**What this does not catch**, stated plainly: the check is between two fields
-of one frame, so a Jetson that sends a *stale mode* alongside a stale command
-is self-consistent and passes. That case is caught one layer up, by the mode
-echo in `TELEM_STATE` (§3.5) disagreeing with what the operator set — which is
-exactly why the echo exists. The gate narrows the window; it does not close it,
+**What this does not catch**, stated plainly. Up to v0.6 the check was between
+two fields of one frame, so a stale *mode* sent alongside a stale command was
+self-consistent and passed. v0.7 closes half of that. The mode is now the
+controller's, and only the operator may move it into a motion mode (§3.1.7),
+so a stale autonomy frame that still says `AUTONOMOUS` after the operator has
+taken `TELEOP` is refused as `MODE_REFUSED` rather than obeyed. What is left is
+a stale **operator** frame, which carries the authority to change the mode.
+That case is still caught only one layer up, by `TELEM_STATE.mode` disagreeing
+with what the operator set. The gate narrows the window; it does not close it,
 and nothing inside one trusted sender can.
 
 **Why a bit and not a second CAN id.** A dedicated id per producer would bind
@@ -401,6 +469,88 @@ sending ordinary drive and steer commands. What only the controller can do is
 confirm the request arrived, and that is what it now does. The open question in
 §9 — whether `return_request` should move the rover and whether
 `autonomy_abort` should stop it — is unchanged and still Calb's call.
+
+#### 3.1.7 Mode transitions — the controller owns the mode (v0.7)
+
+The Teensy keeps the rover's mode itself. Every accepted `CONTROL` frame is a
+**request** to change it, and `RoverController::requestMode()` decides whether
+to grant it. A request for the mode the rover is already in is a no-op.
+
+**The transition table** (`transitionAllowed()` in `rover_protocol.cpp`,
+mirrored as `transition_allowed()` in `host/rover_protocol.py`):
+
+| From ↓ / to → | `SAFE` | `TELEOP` | `AUTONOMOUS` |
+|---|---|---|---|
+| `SAFE` | anyone | **operator** | **operator** |
+| `TELEOP` | anyone | — (no-op) | **operator** |
+| `AUTONOMOUS` | anyone | **operator** | — (no-op) |
+| `FAULT` | anyone, **once the fault is gone** | refused | refused |
+
+"Operator" means `from_autonomy = 0`; "anyone" means either producer. A request
+for an undefined mode never reaches this table, because the decoder has already
+rejected the frame (§3.1.1), and the function fails closed on any value outside
+it anyway.
+
+The table encodes three rules:
+
+1. **Anyone may stand the rover down.** `SAFE` is always reachable, from either
+   producer, for the same reason `stop` is honoured from either (§3.1.5).
+2. **Only the operator puts a producer in charge.** The autonomy stack cannot
+   grant itself `AUTONOMOUS`, and cannot hand the rover to `TELEOP` either.
+   Before v0.7 the autonomy stack could take the rover just by naming the mode
+   in its own frame.
+3. **`SAFE` is the only way out of `FAULT`.** `FAULT` → `TELEOP` or
+   `AUTONOMOUS` directly is refused, so the operator always acknowledges a
+   fault before the rover moves again.
+
+Three further conditions refuse a request that the table would allow:
+
+| Condition | Refused request | Why |
+|---|---|---|
+| A critical hardware fault is still present (over-current, soft e-stop, or the drive stage reporting `FAULT`) | `FAULT` → `SAFE` | Clearing the latch is a statement that the problem has been dealt with, and it has not been while it is still present |
+| `c2_lost = 1` | → `TELEOP` | It would fault on the same frame (§3.1.3) |
+| — | → `FAULT` | Not commandable; the frame is rejected before it gets here (§3.1.1) |
+
+An accepted `SAFE` request also **clears the latched fault causes** from
+`fault_status` (§3.4).
+
+**What a refusal looks like.** The frame is still *well formed*, so it is
+accepted like any other: it refreshes the watchdog and its safety flags are
+obeyed. Its mode request is ignored and its motion is not applied.
+`TELEM_CMD_ECHO.cmd_status` reads `MODE_REFUSED`, and `TELEM_STATE.mode` shows
+the mode the rover actually stayed in. The verdict stops being reported once
+the frame goes stale, because by then it is no longer a live request; the
+verdict falls back to `STOPPED` (§3.6).
+
+**`TELEOP` ↔ `AUTONOMOUS` is direct, operator only.** The Systems spec is not
+clear on whether switching between the two motion modes must pass through
+`SAFE`. v0.7 allows the direct switch, but only from the operator. That is a
+single cell in the table, and it is listed in §9 until Systems confirms it.
+
+**What the Jetson has to do differently:**
+
+- **Grant a motion mode first.** The operator path sends the mode it wants with
+  nothing to move:
+
+  ```
+  mode=AUTONOMOUS, from_autonomy=0, stop=1, drive_cmd=0, steer_cmd=0
+  ```
+
+  The autonomy stack then sends ordinary `mode=AUTONOMOUS, from_autonomy=1`
+  frames, which are no-op requests in the mode it now owns. `TELEOP` needs no
+  separate grant: the operator both grants it and drives it, so the operator's
+  first `TELEOP` frame may already carry motion. `stop = 1` is what keeps the grant frame from reading as
+  an operator trying to drive in autonomy's mode (§3.1.5).
+- **Send `SAFE` after any fault before driving again.** Once `TELEM_STATE.mode`
+  reads `FAULT`, requests for `TELEOP` or `AUTONOMOUS` come back as
+  `MODE_REFUSED` until a `SAFE` request has been accepted. Read `fault_status`
+  first: it still holds the cause.
+- **Read the verdict, not just the echo.** `MODE_REFUSED` means "I am not in
+  the mode you asked for, and I am not going to be". A Jetson that keeps sending
+  a refused request without reacting will sit still forever.
+
+`host/autonomy_sim.py` and `host/demo.py` both do these three things, and are
+the reference for how a v0.7 Jetson drives the rover (§7).
 
 ### 3.2 `TELEM_DRIVE_L` — `0x200`, DLC 8, 20 Hz
 
@@ -439,14 +589,14 @@ left. Bits `0x0001`–`0x0040` keep their v0.3 values.
 
 | Bit | Name | Meaning |
 |---|---|---|
-| `0x0001` | `COMM_TIMEOUT` | No valid CONTROL frame within the watchdog |
-| `0x0002` | `OVER_CURRENT` | Current exceeded a threshold |
-| `0x0004` | `ESTOP_ACTIVE` | A **soft** e-stop is engaged. Deliberately *not* the rules-mandated E-stop — see below |
+| `0x0001` | `COMM_TIMEOUT` | No valid CONTROL frame within the watchdog. In `TELEOP` or `AUTONOMOUS` it also latches `FAULT`, and the bit then stays set until `SAFE` (v0.7) |
+| `0x0002` | `OVER_CURRENT` | Current exceeded a threshold. **Critical** since v0.7: faults a moving rover, and blocks leaving `FAULT` while present |
+| `0x0004` | `ESTOP_ACTIVE` | A **soft** e-stop is engaged. Deliberately *not* the rules-mandated E-stop — see below. **Critical** since v0.7, like `OVER_CURRENT` |
 | `0x0008` | `ENCODER_FAULT` | Encoder reading invalid or stalled |
 | `0x0010` | `UNDERVOLTAGE` | Supply voltage below threshold |
 | `0x0020` | `FIRMWARE_FAULT` | This boot followed a watchdog reset (5.2) |
 | `0x0040` | `PROTOCOL_ERROR` | A frame on our id was uninterpretable: wrong DLC, undefined mode, bad flags, bad indicator, or `drive_cmd`/`steer_cmd` out of range |
-| `0x0080` | `C2_LINK_LOST` | The last `CONTROL` frame reported the base-station link lost (`c2_lost = 1`). Raised in every mode; stops the rover only in `TELEOP` (§3.1.3). Cleared, not latched, once the value goes stale — see §3.5 |
+| `0x0080` | `C2_LINK_LOST` | The last `CONTROL` frame reported the base-station link lost (`c2_lost = 1`). Raised in every mode; stops the rover only in `TELEOP` (§3.1.3). Cleared once the value goes stale (§3.5) **unless** it is the latched cause of a `FAULT`, see below |
 | `0x0100` | `SEQ_GAP` | CONTROL frames were lost, duplicated or reordered |
 | `0x0200` | `CRC_ERROR` | Application-layer CRC mismatch on our id |
 | `0x0400` | `CMD_SOURCE` | A command arrived from the producer that does not own the current mode: an autonomy frame in `TELEOP`, or an operator frame in `AUTONOMOUS`. Drive and steering are refused; see §3.1.5 |
@@ -457,6 +607,26 @@ contiguous frame arrives, so fixing the sender clears the fault rather than
 leaving it latched and misleading for the rest of the session. `C2_LINK_LOST`
 clears the same way, and also clears when the value behind it goes stale (§3.5)
 rather than asserting a link state the controller can no longer vouch for.
+
+**Critical faults (v0.7).** `FAULT_CRITICAL_MASK` in `rover_protocol.h`, mirrored
+in `host/rover_protocol.py`, is `OVER_CURRENT | ESTOP_ACTIVE`. A drive stage
+reporting `controller_health = FAULT` (§3.5) counts as critical too. The
+firmware passes both to `RoverController::updateFaults()` once per loop. A
+critical fault in `TELEOP` or `AUTONOMOUS` latches `FAULT`. In `SAFE` it latches
+nothing, because the rover is not moving, but a request to move while it is
+present enters the mode and faults on the same frame. Every other hardware bit
+(`ENCODER_FAULT`, `UNDERVOLTAGE`, …) is reported only, exactly as before v0.7.
+
+**Latched causes (v0.7).** When the rover latches `FAULT`, the bits that caused
+it (`COMM_TIMEOUT`, `C2_LINK_LOST` and any critical hardware bits) are recorded
+and **ORed into `fault_status` until `SAFE` is accepted**, even after the
+condition itself has cleared. This is deliberate. Otherwise a rover sitting in
+`FAULT` after the link came back would report a fault with no cause.
+`test_controller.cpp`'s `the_latched_reason_outlives_the_condition` pins it.
+It is the one exception to the self-clearing rule above: a latched
+`C2_LINK_LOST` can be set while `c2_link` reads `OK` or `NOT_REPORTED`. Read
+`TELEM_STATE.c2_link` for the link's state now. A latched bit in `fault_status`
+says why the rover stopped.
 
 **`ESTOP_ACTIVE` cannot report the E-stop the rules require, and must not be
 read as doing so.** Rule 2.a.v mandates a red push-button E-stop that *"shall
@@ -480,7 +650,7 @@ the button.
 
 | Byte | Field | Type | Units | Valid range | Meaning |
 |---|---|---|---|---|---|
-| 0 | `mode` | uint8 | enum | 0–2 | **Echo** of the mode the controller believes it is in. Without it, a dropped or misread mode change is invisible from outside the rover. |
+| 0 | `mode` | uint8 | enum | 0–3 | The mode the controller is **actually in**, `activeMode()`, including `3=FAULT`. Since v0.7 this is not an echo of the request: compare it with the mode you asked for, and read `cmd_status` (§3.6) to see whether the request was refused. Without it, a dropped, misread or refused mode change is invisible from outside the rover. |
 | 1 | `jetson_link` | uint8 | enum | 0–3 | Health of the **Jetson ↔ controller** link. |
 | 2 | `c2_link` | uint8 | enum | 0–3 | Health of the **base-station C2** link, as *forwarded by the Jetson* (§3.1.3). Never derived from `jetson_link`. |
 | 3 | `controller_health` | uint8 | enum | 0–3 | Aggregate low-level motor-driver / ESC health. |
@@ -516,6 +686,12 @@ ever the `c2_lost` bit the Jetson forwarded, mapped by `c2LinkState()`:
 | `JETSON_HEARTBEAT_LOST` — the forwarded value is **stale** | `LINK_NOT_REPORTED` | clear |
 | Last frame said `c2_lost = 1` | `LINK_LOST` | **set** |
 | Last frame said `c2_lost = 0` | `LINK_OK` | clear |
+
+The `FAULT_C2_LINK_LOST` column is the live value. Since v0.7 the bit can also
+stay set as the **latched cause** of a `FAULT` (§3.4) while `c2_link` reads
+`OK` or `NOT_REPORTED`. `c2_link` always obeys the staleness rule below. A
+latched cause records why the rover stopped and is not a claim about the link
+now.
 
 **The staleness rule lives in the sender, and that is the change from v0.3.1.**
 The controller only knows C2 from the last `CONTROL` frame, so once the Jetson
@@ -589,7 +765,7 @@ that actually knows:
 | `NOT_REPORTED` | the drive stage has never been updated — honestly "we do not know", not a misleading OK |
 | `OK` | driving normally, or holding a stop at neutral |
 | `DEGRADED` | the last mix **saturated** and was scaled down, so the rover is not delivering the commanded combination of speed and turn. Live, not latched, and a normal thing to see at full throttle in a tight turn |
-| `FAULT` | **latched.** A command outside `CMD_MIN..CMD_MAX` reached the drive stage, which cannot happen while `decodeControl()` is doing its job — so something above it is broken |
+| `FAULT` | **latched.** A command outside `CMD_MIN..CMD_MAX` reached the drive stage, which cannot happen while `decodeControl()` is doing its job — so something above it is broken. Since v0.7 it is a **critical** fault (§3.4): it faults a moving rover, and because the drive stage never clears it, the rover cannot leave `FAULT` again without a reboot |
 
 This is still not real ESC telemetry. When motor drivers arrive on the bus with
 their own messages, their aggregate health supersedes this and the field does
@@ -647,34 +823,40 @@ controller overrides it. Checked top to bottom, first match wins
 
 | # | Condition | Shown | Request |
 |---|---|---|---|
-| 1 | Command watchdog tripped (active mode `FAULT`) | `FAULT` | ignored |
-| 2 | `TELEOP` with `c2_lost = 1` (active mode `FAULT`) | `FAULT` | ignored |
-| 3 | Mode `SAFE` | `OFF` | ignored |
-| 4 | Mode `TELEOP` | `TELEOP` | ignored — a human-driven rover never shows red or green |
-| 5 | Mode `AUTONOMOUS` | `ARRIVED` if `ARRIVED` was requested **by the autonomy stack**, else `AUTONOMOUS` | only `ARRIVED`, and only from the source that owns the mode |
+| 1 | Active mode `FAULT`: a comm timeout, C2 loss or a critical fault in a motion mode, or a `FAULT` still latched from one (§3.1.1) | `FAULT` | ignored |
+| 2 | Mode `SAFE`, including at boot and with a silent Jetson | `OFF` | ignored |
+| 3 | Mode `TELEOP` | `TELEOP` | ignored — a human-driven rover never shows red or green |
+| 4 | Mode `AUTONOMOUS` | `ARRIVED` if `ARRIVED` was requested **by the autonomy stack**, else `AUTONOMOUS` | only `ARRIVED`, and only from the source that owns the mode |
 
-**Rule 5 gained the authority test in v0.6** (§3.1.5). "I have arrived" is an
+"Mode" here is always the controller's own mode, never the one the last frame
+asked for. A refused request therefore cannot change the light. Before v0.7
+rows 1 and 2 were two rows, the watchdog and C2 loss in `TELEOP`. Both are now
+ways into `FAULT`, which latches, so the light stays yellow until `SAFE` is
+commanded.
+
+**Rule 4 gained the authority test in v0.6** (§3.1.5). "I have arrived" is an
 assertion about what the *autonomy* did, and under rule 1.e.xvii it is worth 25
 points, so a teleop-path frame claiming it during an autonomous run is the one
 mix-up that could put flashing green on a rover that has arrived nowhere. Every
 other indicator request is already decided by the mode alone, so the gate
 changes nothing else.
 
-Rules 1 and 2 are the two ways nothing can be driving the rover, and they show
-`FAULT` rather than `OFF` because `OFF` reads as a legitimate idle state.
+Rule 1 covers every way nothing can be driving the rover. It shows `FAULT`
+rather than `OFF` because `OFF` reads as a legitimate idle state.
 
 **A fault that does not stop the rover does not touch the light.** An
-undervoltage warning, an over-current trip or one lost frame leaves an
-autonomous rover showing red, which is what URC requires it to show; those
-conditions are reported in `fault_status`, which is where an operator reads
-them. v0.4 forced `FAULT` on *any* set bit, so a single `SEQ_GAP` mid-course
+undervoltage warning, an encoder fault or one lost frame leaves an autonomous
+rover showing red, which is what URC requires it to show; those conditions are
+reported in `fault_status`, which is where an operator reads them. (Before v0.7
+over-current was on that list too. It is now critical, so it stops the rover,
+and the light goes to rule 1.) v0.4 forced `FAULT` on *any* set bit, so a single `SEQ_GAP` mid-course
 would have blanked a correctly-operating autonomous rover's light.
 
 `stop` also does not change the light: a paused autonomous rover is still under
 autonomous operation, so it stays red.
 
 Comparing `indicator_request` against `indicator_state` tells an operator
-immediately whether the controller honoured the request, and rule 4 means a
+immediately whether the controller honoured the request, and rule 3 means a
 disagreement is normal rather than alarming.
 
 ### 3.6 `TELEM_CMD_ECHO` — `0x204`, DLC 8, 20 Hz
@@ -696,20 +878,28 @@ being acted on.
 
 | Bits | Field | Range | Meaning |
 |---|---|---|---|
-| 0–2 | `cmd_status` | 0–3 | What is being done with the last accepted command. |
+| 0–2 | `cmd_status` | 0–4 | What is being done with the last accepted command. |
 | 3–5 | `last_decode` | 0–6 | `DecodeResult` for the **last frame seen on `0x100`**, or `DECODE_OK`. |
 | 6 | `return_active` | 0/1 | The controller is holding a return request (§3.1.6). |
 | 7 | *reserved* | **0** | The last reserved bit anywhere in this protocol. |
 
-**`cmd_status`** — checked in this order, first match wins, so the value is
-always the single most important reason the drive stage is seeing what it is:
+**`cmd_status`** — the single most important reason the drive stage is seeing
+what it is. The controller checks the conditions in the order
+`NO_COMMAND`, `MODE_REFUSED`, `STOPPED`, `WRONG_SOURCE`, `APPLIED`, and the
+first match wins (`RoverController::commandStatus()`):
 
 | Value | Name | Meaning |
 |---|---|---|
 | 0 | `APPLIED` | the echoed drive and steer are what the drive stage was handed |
-| 1 | `STOPPED` | a stop condition zeroed them: the command watchdog, the `stop` flag, a mode that does not permit motion, an autonomy abort, or C2 loss in `TELEOP`. *Which* one is in `fault_status` and the mode echo |
+| 1 | `STOPPED` | a stop condition zeroed them: the command watchdog, the `stop` flag, a mode that does not permit motion (`SAFE` or `FAULT`), an autonomy abort, or C2 loss in `TELEOP`. *Which* one is in `fault_status` and `TELEM_STATE.mode` |
 | 2 | `WRONG_SOURCE` | the frame was valid and the rover is not stopped, but its producer does not own the current mode, so its motion was refused (§3.1.5) |
 | 3 | `NO_COMMAND` | no valid `CONTROL` frame has ever arrived |
+| 4 | `MODE_REFUSED` | **v0.7.** The last frame asked for a mode the controller is not in, and it was not granted: the transition is not allowed for that producer, the rover is latched in `FAULT`, or a condition in §3.1.7 refused it. `TELEM_STATE.mode` shows the mode the rover stayed in. Not reported once the frame is stale; the verdict then falls back to `STOPPED` |
+
+`MODE_REFUSED` ranks above `STOPPED` on purpose. A rover in `FAULT` that keeps
+receiving `TELEOP` requests is stopped *because* those requests are refused, and
+"send `SAFE`" is the action that verdict asks for. Values 5–7 fit in the 3-bit
+field (`CMD_STATUS_MAX = 7`) and are unassigned.
 
 **`last_decode` is a separate field from the verdict, on purpose.** A frame can
 be rejected — a bad CRC, say — while an older accepted command is still being
@@ -810,7 +1000,9 @@ resulting stop is diagnosable rather than silent.
 Five triggers — **comm timeout**, **explicit `stop`**, **any mode that does not
 positively permit motion**, **`autonomy_abort` while `AUTONOMOUS`**, and
 **`c2_lost` while `TELEOP`** — all force a stop through a single function,
-`RoverController::effectiveStop()`. There is exactly one place in the codebase
+`RoverController::effectiveStop()`. (Since v0.7 a critical hardware fault reaches
+it through the same "mode does not permit motion" trigger, by way of `FAULT`;
+see below.) There is exactly one place in the codebase
 where "should this rover be moving?" is answered. `commandedOutputs()` then
 zeroes drive and steer *before* they reach the motor layer, so a future edit to
 `setMotorOutputs()` cannot accidentally act on a stale command.
@@ -819,6 +1011,16 @@ The first and fifth are deliberately different. A silent Jetson stops the rover
 in **every** mode, because nothing is driving it. C2 loss stops it only in
 `TELEOP`, because an autonomous Jetson drives perfectly well without the base
 station — and the autonomy course is laid out so that it has to (§3.1.3).
+
+**v0.7 makes the mode test stronger without adding a trigger.** "A mode that
+does not positively permit motion" is now the controller's own `activeMode()`,
+not the mode a frame asked for (§3.1.7). So a refused request cannot move the
+rover, and `FAULT` covers three causes: a comm timeout or C2 loss in a motion
+mode, and a critical hardware fault (§3.4). `FAULT` also **latches**, so once one
+of those causes has stopped the rover it stays stopped until the operator
+commands `SAFE`, even if the cause has gone. The latch adds no second stop
+path. It only keeps the active mode at `FAULT`, and `effectiveStop()` is still
+the one place the stop decision is made.
 
 The mode test is a **whitelist**. An earlier version asked `mode ==
 MODE_SAFE` and stopped only then, so every undefined mode value read as
@@ -950,11 +1152,11 @@ converged, a single radio hiccup would start stopping the rover in `TELEOP`.
 
 | Constant | Value | Notes |
 |---|---|---|
-| `PROTOCOL_VERSION` | 6 | Bump when a message's layout or meaning changes. Not sent on the wire; DLC and the CRC are the runtime mismatch signals, plus *which ids arrive* (§2.2) |
+| `PROTOCOL_VERSION` | 7 | Bump when a message's layout or meaning changes. Not sent on the wire; DLC and the CRC are the runtime mismatch signals, plus *which ids arrive* (§2.2) |
 | `CAN_BITRATE_HZ` | 500000 | Every node on the bus must match |
 | `CAN_ID_*` | `0x100`, `0x200`–`0x204` | §2.1 |
 | `FRAME_DLC`, `FRAME_PAYLOAD` | 8, 6 | Plus `FRAME_SEQ_OFFSET` 6 and `FRAME_CRC_OFFSET` 7 |
-| `MODE_*`, `MODE_MAX` | 0, 1, 2 | §3.1.1 |
+| `MODE_*`, `MODE_MAX` | 0, 1, 2, 3 | `MODE_MAX` is 2, the highest commandable mode. `MODE_FAULT` (3) is reported but never commanded (§3.1.1) |
 | `CMD_MIN`, `CMD_MAX` | −1000, 1000 | Valid `drive_cmd`/`steer_cmd` range (§3.1.4) |
 | `OVER_CURRENT_CA` | 4000 | 40.00 A, placeholder (C++ only) |
 | `UNDERVOLTAGE_CV` | 2000 | 20.00 V, placeholder (C++ only) |
@@ -964,7 +1166,7 @@ converged, a single radio hiccup would start stopping the rover in `TELEOP`.
 ## 7. Demonstration and tests — no hardware required
 
 ```
-make test      # 126 C++ tests + 98 host tests
+make test      # 146 C++ tests + 100 host tests
 make demo      # the Task 3 message-exchange demonstration
 make autonomy  # the Task 4 mock-autonomy mission
 ```
@@ -976,21 +1178,28 @@ shortcut. It runs the Task 4 command sequence and then the mode-separation
 demonstration, verifying each step against telemetry before moving on:
 
 ```
-PASS 1. start in SAFE                     PASS 8.  TELEOP refuses an autonomy command
-PASS 2. receive AUTONOMOUS                PASS 9.  AUTONOMOUS accepts the same command
-PASS 3. command forward movement          PASS 10. AUTONOMOUS refuses a teleop command
-PASS 4. change steering                   PASS 11. an arrival claim needs authority too
-PASS 5. stop                              PASS 12. stop overrides an authorised command
-PASS 6. report TARGET_REACHED             PASS 13. abort overrides an authorised command
-PASS 7. request autonomous return         PASS 14. teleop drives again afterwards
+PASS 1. start in SAFE                         PASS 10. operator takes back TELEOP
+PASS 2. autonomy cannot put itself in charge  PASS 11. TELEOP refuses an autonomy command
+PASS 3. operator grants AUTONOMOUS            PASS 12. operator grants AUTONOMOUS again
+PASS 4. autonomy takes over                   PASS 13. AUTONOMOUS accepts the same command
+PASS 5. command forward movement              PASS 14. AUTONOMOUS refuses a teleop command
+PASS 6. change steering                       PASS 15. an arrival claim needs authority too
+PASS 7. stop                                  PASS 16. stop overrides an authorised command
+PASS 8. report TARGET_REACHED                 PASS 17. abort overrides an authorised command
+PASS 9. request autonomous return             PASS 18. teleop drives again afterwards
 
 feedback loop: every required field reached the Jetson
-  mode=TELEOP  applied=(+400,+0)  health=OK  age=38ms  faults=none
+  mode=TELEOP  applied=(+400,+0)  health=OK  age=43ms  faults=none
 ```
 
-Steps 8 and 9 send an **identical** drive command and differ only in the mode;
-step 14 is there because a safety gate that cannot be left is a rover that has
-to be power-cycled at a competition.
+Steps 2–4 are the v0.7 hand-over (§3.1.7). The autonomy stack asks for
+`AUTONOMOUS` and is refused (`MODE_REFUSED`), then the operator grants it with
+a stop-flagged frame, then the autonomy stack drives. Steps 10 and 12 are the
+same grant in the other direction and back. Steps 11 and 13 send an
+**identical** drive command and differ only in the mode. Step 18 is there
+because a safety gate that cannot be left is a rover that has to be
+power-cycled at a competition. The operator goes straight from `AUTONOMOUS` to
+`TELEOP` there, which is the direct switch §9 still lists as open.
 
 A passing harness that cannot fail is not evidence, so
 `tests/host/test_autonomy_mission.py` runs the **negative controls** too: a
@@ -1000,27 +1209,48 @@ acknowledged frame — which is the check that a step is reading telemetry it
 caused rather than the previous step's.
 
 `make demo` runs a live exchange against `tools/rover_sim`, then exercises a
-link cut, the stop flag, an autonomy abort, **C2 loss in each of the two modes
-that differ**, a corrupted frame and a sequence gap. Captured output, trimmed
-to one line per phase:
+link cut and the **v0.7 recovery from it**, the stop flag, an operator grant of
+`AUTONOMOUS`, an autonomy abort, **C2 loss in each of the two modes that
+differ**, a corrupted frame and a sequence gap. Captured output, trimmed to one
+line per phase:
 
 ```
+-- B: link cut -- Jetson stops sending (800ms > 300ms watchdog) --
+  t= 1.50s  seq= 30  enc=  +31600    +0.00A  24.00V  mode=FAULT      jet=LOST     c2=NOT_REPORTED ind=FAULT      age=457ms   faults=COMM_TIMEOUT
+-- B: link restored -- FAULT is latched, nothing moves --
+  t= 2.15s  seq= 43  enc=  +31600    +0.00A  24.00V  mode=FAULT      jet=OK       c2=OK           ind=FAULT      age=14ms    faults=COMM_TIMEOUT
+-- B: operator commands SAFE -- the only way out of FAULT --
+  t= 2.49s  seq= 50  enc=  +31600    +0.00A  24.00V  mode=SAFE       jet=OK       c2=OK           ind=OFF        age=19ms    faults=none
+-- B: operator grants TELEOP again --
+  t= 2.80s  seq= 56  enc=  +33920    +4.50A  23.93V  mode=TELEOP     jet=OK       c2=OK           ind=TELEOP     age=15ms    faults=none
+-- D: operator grants AUTONOMOUS --
+  t= 3.81s  seq= 77  enc=  +41600    +0.00A  24.00V  mode=AUTONOMOUS jet=OK       c2=OK           ind=AUTONOMOUS age=9ms     faults=none
 -- D2: C2 lost while AUTONOMOUS -- keeps driving, fault raised --
-  t= 3.99s  seq= 80  enc=  +54580   +12.00A  23.80V  mode=AUTONOMOUS jet=OK   c2=LOST         ind=AUTONOMOUS age=20ms  faults=C2_LINK_LOST
--- D3: C2 lost while TELEOP -- stops, nobody can reach it --
-  t= 4.50s  seq= 91  enc=  +63380    +0.00A  24.00V  mode=TELEOP     jet=OK   c2=LOST         ind=FAULT      age=20ms  faults=C2_LINK_LOST
+  t= 4.52s  seq= 91  enc=  +47200   +12.00A  23.80V  mode=AUTONOMOUS jet=OK       c2=LOST         ind=AUTONOMOUS age=18ms    faults=C2_LINK_LOST
+-- D3: C2 lost while TELEOP -- latches FAULT, nobody can reach it --
+  t= 5.34s  seq=107  enc=  +73600    +0.00A  24.00V  mode=FAULT      jet=OK       c2=LOST         ind=FAULT      age=7ms     faults=C2_LINK_LOST
 -- E: corrupted payload (app-layer CRC must reject it) --
-  t= 5.19s  seq=104  enc=  +63380    +0.00A  24.00V  mode=TELEOP     jet=LOST c2=NOT_REPORTED ind=FAULT      age=487ms faults=COMM_TIMEOUT,CRC_ERROR
+  t= 6.19s  seq=124  enc=  +73600    +0.00A  24.00V  mode=FAULT      jet=LOST     c2=NOT_REPORTED ind=FAULT      age=493ms   faults=COMM_TIMEOUT,C2_LINK_LOST,CRC_ERROR
 -- F: sequence gap (frames 100 -> 140) --
-  t= 5.38s  seq=108  enc=  +66420    +6.00A  23.90V  mode=TELEOP     jet=DEGRADED c2=OK       ind=TELEOP     age=98ms  faults=SEQ_GAP
+  t= 6.37s  seq=128  enc=  +73600    +0.00A  24.00V  mode=FAULT      jet=DEGRADED c2=OK           ind=FAULT      age=105ms   faults=C2_LINK_LOST,SEQ_GAP
 ```
 
-Three things in that capture are the whole point of §3.1.3 and §3.5. In **D2**
-an autonomous rover keeps drawing current with C2 lost, and the fault is
-reported anyway. In **D3** the same loss in `TELEOP` zeroes the current. In
-**E** the Jetson has gone silent, so `c2=NOT_REPORTED` and `C2_LINK_LOST` is
-*absent* rather than latched: the controller stops asserting a C2 verdict it
-can no longer vouch for.
+What to read in that capture:
+
+- **B** is the v0.7 latch (§3.1.7). The link comes back (`jet=OK`) and the rover
+  still does not move, still shows `FAULT`, and still reports the cause. Only
+  `SAFE` clears it, and only then does the operator's `TELEOP` drive.
+- **D2** is §3.1.3: an autonomous rover keeps drawing current with C2 lost, and
+  the fault is reported anyway.
+- **D3** is the same loss in `TELEOP`. It zeroes the current and latches
+  `FAULT`, and now `TELEM_STATE` reports `mode=FAULT` (the actual mode).
+  Before v0.7 it echoed `TELEOP`.
+- **E** and **F** run with the rover still latched from D3, so both stay in
+  `FAULT`. In E the Jetson has gone silent, so `c2=NOT_REPORTED`: the
+  controller stops asserting a live C2 verdict it can no longer vouch for.
+  `C2_LINK_LOST` stays in `fault_status` anyway, because it is the latched
+  cause of the D3 fault (§3.4), not a claim about the link now. Before v0.7 it
+  dropped out here.
 
 Against real hardware the same host script runs unchanged:
 
@@ -1051,6 +1281,10 @@ runs it, and asserts Python produces identical output for:
   reserved mask quietly swallowing a live flag
 - `sourceOwnsMode` for **both sources × all 256** mode values, so the command
   mux cannot mean one thing on the Jetson and another on the Teensy
+- `transitionAllowed` (v0.7) for every controller state × every requested mode
+  × both sources, plus one undefined value on each side, so the Jetson can
+  predict a refusal before it reads one. `test_protocol.cpp` separately checks
+  that all 256 × 256 values off the table are refusals
 - `packCmdStatus` for every verdict × decode result × return flag: two 3-bit
   fields and a flag sharing one byte is exactly the packing that goes wrong on
   one side only
@@ -1157,20 +1391,41 @@ Verified to fail on an injected endianness change.
   C2-observer disagreement takes `0x0800`.
 - **Not yet used:** CAN FD, the second and third CAN buses, and a dedicated
   high-priority e-stop frame in the reserved `0x000`–`0x0FF` block.
-- **The authority gate compares two fields of one frame**, so a Jetson that
-  sends a stale *mode* alongside a stale command is self-consistent and passes
-  it (§3.1.5). The mode echo in `TELEM_STATE` is what catches that, one layer
-  up. Nothing inside a single trusted sender can close the window entirely;
-  this narrows it.
-- **`TELEM_STATE.mode` still echoes the *commanded* mode.**
-  [PR #18](https://github.com/schradivarius/URC-MCU-Jetson-Comm-Protocol/pull/18)
-  (merged via #24) renamed the modes to `SAFE`/`TELEOP`/`AUTONOMOUS`, added a
-  non-commandable `MODE_FAULT = 3` and introduced `activeMode()`. Echoing
-  `activeMode()` instead would let the Jetson see `FAULT`, which is strictly
-  more informative, but it changes what goes on the wire and is a team
-  decision. `MODE_FAULT` has no owner under §3.1.5: `sourceOwnsMode()` falls
-  through `modePermitsMotion()` to "no mismatch possible", which is pinned by
+- **The authority gate still trusts a stale operator frame.** v0.7 made the
+  mode the controller's, so a stale *autonomy* frame can no longer carry the
+  rover into or keep it in `AUTONOMOUS` (§3.1.5). A stale *operator* frame
+  still can, because the operator is allowed to change the mode.
+  `TELEM_STATE.mode` disagreeing with what the operator set is what catches
+  that, one layer up. Nothing inside a single trusted sender can close the
+  window entirely; this narrows it.
+- **Settled in v0.7: `TELEM_STATE.mode` reports `activeMode()`**, `FAULT`
+  included (§3.5). This was a v0.6 open item. Echoing the commanded mode
+  stopped making sense once the controller can refuse it. `MODE_FAULT` still
+  has no owner under §3.1.5: `sourceOwnsMode()` falls through
+  `modePermitsMotion()` to "no mismatch possible", which is pinned by
   `fault_has_no_owner`.
+- **`TELEOP` ↔ `AUTONOMOUS` directly is a Systems decision.** The Systems spec
+  does not say whether switching between the two motion modes must pass
+  through `SAFE`. v0.7 allows the direct switch, operator only (§3.1.7). If
+  Systems says otherwise, it is two cells of `TRANSITIONS` in
+  `rover_protocol.cpp` plus `_TRANSITIONS` in `host/rover_protocol.py`, and
+  `the_transition_table_matches_the_spec` and the golden vectors will point at
+  both.
+- **The Systems spec's newer mode states are not implemented.** v0.7 brings
+  `SAFE`, `TELEOP`, `AUTONOMOUS` and `FAULT` in line with the spec and adds no
+  new states. Adding one is a wire change, since `isCommandableMode()` rejects
+  any mode a controller does not implement (§3.1.1). Every controller must
+  learn a new state before any host sends it.
+- **Nothing produces `ESTOP_ACTIVE` yet.** It is in `FAULT_CRITICAL_MASK`, so
+  the latch is ready for a soft e-stop, but no soft e-stop exists (§3.4).
+  Today the only critical hardware inputs that can actually fire are
+  over-current and a drive-stage `FAULT`.
+- **A drive-stage `FAULT` needs a reboot to clear.** `DriveModule` latches its
+  range fault for the whole session, and v0.7 refuses `FAULT` → `SAFE` while
+  any critical fault is present, so the rover cannot leave `FAULT` again (§3.5).
+  That is defensible, since the condition means something above the drive
+  stage is broken. It should be a decision rather than a side effect, though,
+  and the alternative is a deliberate reset path for the drive stage.
 
 ## 10. Repository layout and build
 
@@ -1189,7 +1444,7 @@ Verified to fail on an injected endianness change.
 | `host/autonomy_sim.py` | Jetson | Mock autonomy stack: the Task 4 mission (§7) |
 | `tools/rover_sim.cpp` | dev machine | Simulator: real controller, fake plant |
 | `tools/golden_vectors.cpp` | dev machine | Emits vectors for cross-language pinning |
-| `tests/cpp/`, `tests/host/` | dev machine | 224 tests total |
+| `tests/cpp/`, `tests/host/` | dev machine | 246 tests total |
 
 ### 10.1 Flashing the Teensy 4.1
 
