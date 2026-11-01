@@ -60,6 +60,7 @@
 
 #include "src/rover_controller.h"
 #include "src/rover_drive.h"
+#include "src/rover_drive_sim.h"
 #include "src/rover_protocol.h"
 
 using namespace rover;
@@ -135,8 +136,7 @@ static uint16_t g_boot_faults = 0;
 // they report their own encoder counts and current over the bus.
 // ---------------------------------------------------------------------------
 
-static int32_t sim_enc_left  = 0;
-static int32_t sim_enc_right = 0;
+static DriveSim sim_plant;
 static int16_t sim_steer_fb  = 0;
 
 struct SensorReading {
@@ -177,8 +177,7 @@ static SensorReading readSensors(const DriveOutputs& out) {
     // wrapI32 takes int64 and wraps explicitly. Letting an int32 counter
     // overflow would be UNDEFINED BEHAVIOUR in C++ -- not a wrap, not an
     // exception, but a compiler free to do anything at all.
-    sim_enc_left  = wrapI32(static_cast<int64_t>(sim_enc_left)  + out.left_effort / 10);
-    sim_enc_right = wrapI32(static_cast<int64_t>(sim_enc_right) + out.right_effort / 10);
+    sim_plant.update(out.left_effort, out.right_effort, out.energized, millis());
 
     if (sim_steer_fb < target)      sim_steer_fb = min(target, (int16_t)(sim_steer_fb + 25));
     else if (sim_steer_fb > target) sim_steer_fb = max(target, (int16_t)(sim_steer_fb - 25));
@@ -186,8 +185,8 @@ static SensorReading readSensors(const DriveOutputs& out) {
     const int32_t effort_mag =
         (abs(out.left_effort) + abs(out.right_effort)) / 2;
 
-    r.enc_left   = sim_enc_left;
-    r.enc_right  = sim_enc_right;
+    r.enc_left   = sim_plant.left().encoder_ticks;
+    r.enc_right  = sim_plant.right().encoder_ticks;
     r.steer_fb   = sim_steer_fb;
     r.current_ca = out.energized ? static_cast<int16_t>(effort_mag * 3 / 2) : 0;
     // Fake 24 V pack sagging a little under load.
