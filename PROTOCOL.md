@@ -1166,7 +1166,7 @@ converged, a single radio hiccup would start stopping the rover in `TELEOP`.
 ## 7. Demonstration and tests — no hardware required
 
 ```
-make test      # 146 C++ tests + 100 host tests
+make test      # 164 C++ tests + 100 host tests
 make demo      # the Task 3 message-exchange demonstration
 make autonomy  # the Task 4 mock-autonomy mission
 ```
@@ -1444,7 +1444,7 @@ Verified to fail on an injected endianness change.
 | `host/autonomy_sim.py` | Jetson | Mock autonomy stack: the Task 4 mission (§7) |
 | `tools/rover_sim.cpp` | dev machine | Simulator: real controller, fake plant |
 | `tools/golden_vectors.cpp` | dev machine | Emits vectors for cross-language pinning |
-| `tests/cpp/`, `tests/host/` | dev machine | 246 tests total |
+| `tests/cpp/`, `tests/host/` | dev machine | 264 tests total |
 
 ### 10.1 Flashing the Teensy 4.1
 

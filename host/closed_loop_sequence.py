@@ -426,6 +426,17 @@ def build_mission():
              expect(mode=rp.MODE_TELEOP,
                     indicator_state=rp.INDICATOR_TELEOP)),
 
+        # v0.7: only the operator may put the rover in AUTONOMOUS (PROTOCOL.md
+        # 3.1.7). The grant carries stop=1, so it is a hand-over rather than
+        # the operator trying to drive in autonomy's mode.
+        Step("1c. operator grants AUTONOMOUS",
+             dict(drive_cmd=0, steer_cmd=0, stop=True, mode=rp.MODE_AUTONOMOUS,
+                  c2_lost=False, from_autonomy=False),
+             all_of(expect(mode=rp.MODE_AUTONOMOUS,
+                           cmd_status=rp.CMD_STATUS_STOPPED,
+                           indicator_state=rp.INDICATOR_AUTONOMOUS),
+                    fault_clear(rp.FAULT_CMD_SOURCE, "CMD_SOURCE"))),
+
         Step("2. receive AUTONOMOUS",
              dict(drive_cmd=0, steer_cmd=0, **auto),
              expect(mode=rp.MODE_AUTONOMOUS,
