@@ -25,3 +25,5 @@ htmlcov/
 tests/cpp/build/
 /.pio/libdeps/teensy41/FlexCAN_T4
 /.pio
+# A hand-built simulator binary. The tests build their own in tests/cpp/build/.
+tools/rover_sim

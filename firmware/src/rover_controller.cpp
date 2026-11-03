@@ -30,11 +30,7 @@ RoverController::RoverController(MillisFn now_ms,
       seq_gaps_seen_(0),
       crc_errors_seen_(0),
       frames_lost_estimate_(0),
-      current_mode_(RoverMode::SAFE),
-      active_source_(CommandSource::NONE),
-      commanded_drive_(0),
       measured_drive_(0),
-      commanded_steering_(0),
       measured_steering_(0) {
     // Boot state is the safest available: stopped, disabled, no command ever
     // received -- so cmdAgeMs() reads CMD_AGE_UNKNOWN, the watchdog is tripped
@@ -397,52 +393,24 @@ TelemetryCmdEcho RoverController::buildCmdEcho(int16_t drive_applied,
     return m;
 }
 
-void RoverController::enforceCommandAuthority(CommandSource source, int16_t drive, int16_t steer) {
-    bool authorized = false;
-
-    uint8_t active_m = activeMode();  
-    if (active_m == MODE_SAFE) { 
-        current_mode_ = RoverMode::SAFE; 
-    } else if (active_m == MODE_TELEOP) {
-        current_mode_ = RoverMode::TELEOP;
-    }
-    else if (active_m == MODE_AUTONOMOUS) { 
-        current_mode_ = RoverMode::AUTONOMOUS;
-    } else { 
-        current_mode_ = RoverMode::SAFE;
-    }
-
-    if(effectiveStop()) {
-        commanded_drive_ = 0;
-        commanded_steering_ = 0;
-        active_source_ = CommandSource::EMERGENCY_SOURCE;
-        return;
-    }
-    
-    switch(current_mode_) {
-        case RoverMode::SAFE:
-            authorized = false;
-            break;
-        
-        case RoverMode::TELEOP:
-            if (source == CommandSource::TELEOP_SOURCE) authorized = true;
-            break;
-
-        case RoverMode::AUTONOMOUS:
-            if (source == CommandSource::AUTONOMY_SOURCE) authorized = true;
-            break;
-    }
-
-    if(authorized){
-        commanded_drive_ = drive;
-        commanded_steering_ = steer; 
-        active_source_ = source;
-    } else {
-        commanded_drive_ = 0;
-        commanded_steering_ = 0;
-    }
-
+// Derived, not stored: the one place a command becomes an output is
+// commandedOutputs(), so reading through it means these can never disagree
+// with what the drive stage was handed.
+int16_t RoverController::getCommandedDrive() const {
+    int16_t drive, steer;
+    commandedOutputs(drive, steer);
+    return drive;
 }
 
+int16_t RoverController::getCommandedSteer() const {
+    int16_t drive, steer;
+    commandedOutputs(drive, steer);
+    return steer;
+}
+
+void RoverController::updateMeasured(int16_t drive, int16_t steer) {
+    measured_drive_    = drive;
+    measured_steering_ = steer;
+}
 
 }  // namespace rover

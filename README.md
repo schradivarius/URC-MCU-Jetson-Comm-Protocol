@@ -16,7 +16,7 @@ autonomy and teleop commands are refused in each other's modes.
 
 | | |
 |---|---|
-| Protocol, safety logic, firmware | Implemented, **264 tests** passing |
+| Protocol, safety logic, firmware | Implemented, **268 tests** passing |
 | Cross-language codec | Pinned byte-for-byte, plus every validation predicate |
 | Autonomy → drive-stage loop (Task 4) | Closed and verified end to end (`make autonomy`) |
 | **Validated on real hardware** | **Not yet — see [Known gaps](#known-gaps)** |
@@ -33,7 +33,7 @@ than mocking them, so there is no dependency to manage.
 git clone https://github.com/schradivarius/URC-MCU-Jetson-Comm-Protocol.git
 cd URC-MCU-Jetson-Comm-Protocol
 
-make test      # 164 C++ tests + 100 host tests
+make test      # 168 C++ tests + 100 host tests
 make demo      # no-hardware message-exchange demonstration (Task 3)
 make autonomy  # mock autonomy stack driving the firmware (Task 4)
 ```
