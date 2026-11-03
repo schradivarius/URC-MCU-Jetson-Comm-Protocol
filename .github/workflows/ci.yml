@@ -32,7 +32,9 @@ jobs:
 
   host:
     name: Host side (Jetson)
-    runs-on: ubuntu-latest
+    # Pinned: ubuntu-latest is now Ubuntu 26.04, which ships no Python 3.9
+    # build, so setup-python fails before any test runs. 24.04 still has it.
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:

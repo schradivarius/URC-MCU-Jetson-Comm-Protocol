@@ -156,6 +156,23 @@ class TestAuthorityAgreement(GoldenBase):
                 # is authorised to move either, which modePermitsMotion says.
                 self.assertFalse(p.mode_permits_motion(mode))
 
+    def test_transitions_agree_for_every_state_request_and_source(self):
+        rows = self.rowsOf("TRANSITION")
+        # 5 states (4 + one undefined) x 4 requests (3 + one undefined) x 2.
+        self.assertEqual(len(rows), 40)
+        for _, args, allowed in rows:
+            frm, to, src = (int(a) for a in args.split(","))
+            self.assertEqual(p.transition_allowed(frm, to, bool(src)),
+                             allowed == "1",
+                             "transition_allowed disagrees for %s" % args)
+
+    def test_the_autonomy_stack_can_never_grant_itself_motion(self):
+        # Independent of the C++ output, like the authority check above.
+        for frm in range(256):
+            for to in (p.MODE_TELEOP, p.MODE_AUTONOMOUS):
+                if frm != to:
+                    self.assertFalse(p.transition_allowed(frm, to, True))
+
     def test_the_command_status_byte_packs_identically(self):
         rows = self.rowsOf("CMDSTATUS")
         for _, args, packed_hex in rows:

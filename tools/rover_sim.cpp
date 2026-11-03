@@ -31,6 +31,8 @@
 
 #include "../firmware/src/rover_controller.h"
 #include "../firmware/src/rover_drive.h"
+#include "../firmware/src/rover_drive_sim.h"
+#include "../firmware/src/rover_encoder.h"
 
 using namespace rover;
 
@@ -50,8 +52,12 @@ static void emitFrame(uint32_t id, const uint8_t* buf, uint8_t len) {
 
 int main(int argc, char** argv) {
     bool verbose = false;
+    uint32_t seed = 1;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "-v") == 0) verbose = true;
+        if (std::strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
+            seed = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+        }
     }
 
     g_start = std::chrono::steady_clock::now();
@@ -62,8 +68,9 @@ int main(int argc, char** argv) {
     // actual mixing, clamping and stop behaviour rather than a Python idea of
     // them. Only the pins at the far end are missing.
     DriveModule drv;
+    DriveSim feedback(seed);
+    SimulatedEncoder enc_l, enc_r;
 
-    int32_t enc_left = 0, enc_right = 0;
     int16_t steer_fb = 0;
     std::string pending;
     char chunk[512];
@@ -108,9 +115,13 @@ int main(int argc, char** argv) {
         // Fake plant, driven by the DRIVE MODULE's output rather than by the
         // raw command, so the mix is part of what the host tests observe. The
         // fail-safe has already been applied twice over, so there is no third
-        // copy of the stop rule here.
-        enc_left  = wrapI32(static_cast<int64_t>(enc_left)  + out.left_effort / 10);
-        enc_right = wrapI32(static_cast<int64_t>(enc_right) + out.right_effort / 10);
+        // copy of the stop rule here. Encoders come from the lagging measured speed.
+        const uint32_t now_ms = realMillis();
+        feedback.update(out.left_effort, out.right_effort, out.energized, now_ms);
+        enc_l.update(scaledFromMps(feedback.left().measured_mps), now_ms);
+        enc_r.update(scaledFromMps(feedback.right().measured_mps), now_ms);
+        const int32_t enc_left  = enc_l.feedback(now_ms).count;
+        const int32_t enc_right = enc_r.feedback(now_ms).count;
         if (steer_fb < out.steer_effort) {
             steer_fb = static_cast<int16_t>((steer_fb + 25 < out.steer_effort)
                                             ? steer_fb + 25 : out.steer_effort);
@@ -125,6 +136,14 @@ int main(int argc, char** argv) {
         // Fake pack voltage: 24.00 V nominal, sagging a little under load.
         const int16_t voltage_cv = static_cast<int16_t>(2400 - effort_mag / 40);
 
+        // The same thresholds and the same every-cycle call as
+        // rover_firmware.cpp, so a critical fault latches FAULT here exactly
+        // as it would on the rover.
+        uint16_t hw_faults = 0;
+        if (current_ca > OVER_CURRENT_CA) hw_faults |= FAULT_OVER_CURRENT;
+        if (voltage_cv < UNDERVOLTAGE_CV) hw_faults |= FAULT_UNDERVOLTAGE;
+        ctl.updateFaults(hw_faults, drv.health());
+
         if (ctl.telemetryDue()) {
             const uint8_t seq = ctl.telemetrySeq();   // one seq for all four
             uint8_t buf[8];
@@ -135,7 +154,7 @@ int main(int argc, char** argv) {
             TelemetryDriveR dr = ctl.buildDriveR(enc_right);
             emitFrame(CAN_ID_TELEM_DRIVE_R, buf, encodeTelemetryDriveR(dr, seq, buf));
 
-            TelemetryPower pw = ctl.buildPower(current_ca, voltage_cv);
+            TelemetryPower pw = ctl.buildPower(current_ca, voltage_cv, hw_faults);
             emitFrame(CAN_ID_TELEM_POWER, buf, encodeTelemetryPower(pw, seq, buf));
 
             // controller_health now comes from the drive stage, which is the
@@ -161,6 +180,16 @@ int main(int argc, char** argv) {
                              out.steer_effort, out.left_pwm_us, out.right_pwm_us,
                              out.steer_pwm_us,
                              out.energized ? "ENERGIZED" : "neutral");
+                std::fprintf(stderr,
+                             "feedback: t=%lums dt=%lums  "
+                             "L cmd=%+.2f meas=%+.2f m/s enc=%ld (%+.0f t/s)  "
+                             "R cmd=%+.2f meas=%+.2f m/s enc=%ld (%+.0f t/s)\n",
+                             (unsigned long)feedback.lastUpdateMs(),
+                             (unsigned long)feedback.lastDtMs(),
+                             feedback.left().commanded_mps, feedback.left().measured_mps,
+                             (long)feedback.left().encoder_ticks, feedback.left().ticks_per_s,
+                             feedback.right().commanded_mps, feedback.right().measured_mps,
+                             (long)feedback.right().encoder_ticks, feedback.right().ticks_per_s);
             }
         }
     }
