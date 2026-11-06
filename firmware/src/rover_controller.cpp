@@ -1,4 +1,5 @@
 #include "rover_controller.h"
+#include <cstdint>
 
 namespace rover {
 
@@ -28,7 +29,9 @@ RoverController::RoverController(MillisFn now_ms,
       frames_ignored_(0),
       seq_gaps_seen_(0),
       crc_errors_seen_(0),
-      frames_lost_estimate_(0) {
+      frames_lost_estimate_(0),
+      measured_drive_(0),
+      measured_steering_(0) {
     // Boot state is the safest available: stopped, disabled, no command ever
     // received -- so cmdAgeMs() reads CMD_AGE_UNKNOWN, the watchdog is tripped
     // from the first cycle, and the rover cannot move until the Jetson asks.
@@ -388,6 +391,26 @@ TelemetryCmdEcho RoverController::buildCmdEcho(int16_t drive_applied,
     m.ack_seq = last_control_.seq;
     m.status  = packCmdStatus(commandStatus(), last_decode_, returnRequestActive());
     return m;
+}
+
+// Derived, not stored: the one place a command becomes an output is
+// commandedOutputs(), so reading through it means these can never disagree
+// with what the drive stage was handed.
+int16_t RoverController::getCommandedDrive() const {
+    int16_t drive, steer;
+    commandedOutputs(drive, steer);
+    return drive;
+}
+
+int16_t RoverController::getCommandedSteer() const {
+    int16_t drive, steer;
+    commandedOutputs(drive, steer);
+    return steer;
+}
+
+void RoverController::updateMeasured(int16_t drive, int16_t steer) {
+    measured_drive_    = drive;
+    measured_steering_ = steer;
 }
 
 }  // namespace rover

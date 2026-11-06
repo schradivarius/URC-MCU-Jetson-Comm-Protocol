@@ -6,6 +6,8 @@
 // safety test.
 
 #include "../../firmware/src/rover_controller.h"
+#include "../../firmware/src/rover_drive.h"
+#include "../../firmware/src/rover_drive_sim.h"
 #include "test_framework.h"
 
 using namespace rover;
@@ -1325,6 +1327,130 @@ static void non_critical_faults_are_reported_but_do_not_stop_the_rover() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Commanded vs. measured
+// ---------------------------------------------------------------------------
+
+static void commanded_is_what_the_drive_stage_is_handed() {
+    // Derived from commandedOutputs(), so every reason that zeroes the output
+    // zeroes the commanded value too: there is no second copy to fall behind.
+    RoverController ctl = freshController();
+    CHECK_EQ(ctl.getCommandedDrive(), 0);
+    CHECK_EQ(ctl.getCommandedSteer(), 0);
+
+    sendControl(ctl, 500, 100, MODE_TELEOP, false);
+    CHECK_EQ(ctl.getCommandedDrive(), 500);
+    CHECK_EQ(ctl.getCommandedSteer(), 100);
+
+    sendControl(ctl, 500, 100, MODE_TELEOP, /*stop=*/true);
+    CHECK_EQ(ctl.getCommandedDrive(), 0);
+    CHECK_EQ(ctl.getCommandedSteer(), 0);
+
+    // Autonomy's frame in the operator's mode: authority refused.
+    sendFrame(ctl, 500, 100, MODE_TELEOP, false, false, false, INDICATOR_OFF,
+              false, SRC_AUTONOMY);
+    CHECK_EQ(ctl.getCommandedDrive(), 0);
+
+    // Autonomy asking for AUTONOMOUS itself: mode refused.
+    sendFrame(ctl, 500, 100, MODE_AUTONOMOUS, false, false, false,
+              INDICATOR_OFF, false, SRC_AUTONOMY);
+    CHECK_EQ(ctl.commandStatus(), CMD_STATUS_MODE_REFUSED);
+    CHECK_EQ(ctl.getCommandedDrive(), 0);
+    CHECK_EQ(ctl.getCommandedSteer(), 0);
+}
+
+static void measured_is_whatever_the_plant_last_reported() {
+    RoverController ctl = freshController();
+    CHECK_EQ(ctl.getMeasuredDrive(), 0);   // nothing reported yet
+    CHECK_EQ(ctl.getMeasuredSteer(), 0);
+
+    ctl.updateMeasured(321, -45);
+    CHECK_EQ(ctl.getMeasuredDrive(), 321);
+    CHECK_EQ(ctl.getMeasuredSteer(), -45);
+
+    // Feedback only: a new command does not overwrite it, and it never
+    // becomes a command.
+    sendControl(ctl, 500, 100, MODE_TELEOP, false);
+    CHECK_EQ(ctl.getMeasuredDrive(), 321);
+    CHECK_EQ(ctl.getCommandedDrive(), 500);
+    ctl.updateMeasured(999, 999);
+    CHECK_EQ(ctl.getCommandedDrive(), 500);
+    CHECK_EQ(ctl.getCommandedSteer(), 100);
+}
+
+// The rover_firmware.cpp loop in miniature: controller -> drive stage ->
+// simulated plant -> updateMeasured(). `stalled` energizes the drive stage
+// but lets nothing turn, as a jammed or disconnected drivetrain would.
+struct Plant {
+    DriveModule drv;
+    DriveSim    sim;
+    int16_t     steer_fb = 0;
+};
+
+static void runLoop(RoverController& ctl, Plant& p, uint32_t ms, int16_t drive,
+                    int16_t steer, bool stop, bool stalled = false) {
+    for (uint32_t i = 0; i < ms; ++i) {
+        if (i % 50 == 0) sendFrame(ctl, drive, steer, MODE_TELEOP, stop);
+        advance(1);
+        int16_t d, s;
+        ctl.commandedOutputs(d, s);
+        const DriveOutputs& out = p.drv.update(d, s, !ctl.effectiveStop());
+        p.sim.update(out.left_effort, out.right_effort,
+                     out.energized && !stalled, g_now);
+        // The same steering ramp as the firmware's simulated feedback.
+        if (!stalled) {
+            if (p.steer_fb < out.steer_effort)
+                p.steer_fb = static_cast<int16_t>(p.steer_fb + 25 < out.steer_effort
+                                                  ? p.steer_fb + 25 : out.steer_effort);
+            else if (p.steer_fb > out.steer_effort)
+                p.steer_fb = static_cast<int16_t>(p.steer_fb - 25 > out.steer_effort
+                                                  ? p.steer_fb - 25 : out.steer_effort);
+        }
+        ctl.updateMeasured(
+            scaledFromMps((p.sim.left().measured_mps + p.sim.right().measured_mps) / 2.0f),
+            p.steer_fb);
+    }
+}
+
+static int gap(int16_t a, int16_t b) { return a > b ? a - b : b - a; }
+
+static void measured_follows_commanded_in_the_closed_loop() {
+    RoverController ctl = freshController();
+    sendControl(ctl, 0, 0, MODE_TELEOP, false);
+    Plant p;
+
+    // The plant lags: right after the command the gap is wide open...
+    runLoop(ctl, p, 10, 500, 200, false);
+    CHECK_EQ(ctl.getCommandedDrive(), 500);
+    CHECK(gap(ctl.getCommandedDrive(), ctl.getMeasuredDrive()) > 300);
+
+    // ...and closes once it settles. 10 is the DriveSim tests' 0.01 m/s.
+    runLoop(ctl, p, 1000, 500, 200, false);
+    CHECK(gap(ctl.getCommandedDrive(), ctl.getMeasuredDrive()) <= 10);
+    CHECK_EQ(ctl.getMeasuredSteer(), 200);
+
+    // A stop zeroes the command at once; the wheels take a moment to follow.
+    runLoop(ctl, p, 1, 500, 200, /*stop=*/true);
+    CHECK_EQ(ctl.getCommandedDrive(), 0);
+    CHECK(ctl.getMeasuredDrive() > 0);
+    runLoop(ctl, p, 500, 500, 200, true);
+    CHECK_EQ(ctl.getMeasuredDrive(), 0);
+}
+
+static void a_stalled_drivetrain_leaves_the_gap_open() {
+    // The point of comparing the two: a command that is being applied, and
+    // wheels that are not doing it.
+    RoverController ctl = freshController();
+    sendControl(ctl, 0, 0, MODE_TELEOP, false);
+    Plant p;
+    runLoop(ctl, p, 1000, 500, 200, false, /*stalled=*/true);
+    CHECK_EQ(ctl.commandStatus(), CMD_STATUS_APPLIED);
+    CHECK_EQ(ctl.getCommandedDrive(), 500);
+    CHECK_EQ(ctl.getMeasuredDrive(), 0);
+    CHECK_EQ(ctl.getMeasuredSteer(), 0);
+    CHECK(gap(ctl.getCommandedSteer(), ctl.getMeasuredSteer()) == 200);
+}
+
 int main() {
     std::printf("test_controller\n");
     RUN_TEST(boots_stopped_and_safe);
@@ -1413,5 +1539,9 @@ int main() {
     RUN_TEST(safe_is_refused_while_the_fault_is_still_there);
     RUN_TEST(non_critical_faults_are_reported_but_do_not_stop_the_rover);
     RUN_TEST(a_critical_fault_in_safe_does_not_latch_but_blocks_driving);
+    RUN_TEST(commanded_is_what_the_drive_stage_is_handed);
+    RUN_TEST(measured_is_whatever_the_plant_last_reported);
+    RUN_TEST(measured_follows_commanded_in_the_closed_loop);
+    RUN_TEST(a_stalled_drivetrain_leaves_the_gap_open);
     return testing::summary("test_controller");
 }
