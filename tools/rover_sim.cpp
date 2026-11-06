@@ -34,6 +34,7 @@
 #include "../firmware/src/rover_drive_sim.h"
 #include "../firmware/src/rover_encoder.h"
 #include "../firmware/src/rover_steer_sim.h"
+#include "../firmware/src/rover_feedback_faults.h"
 
 using namespace rover;
 
@@ -54,10 +55,21 @@ static void emitFrame(uint32_t id, const uint8_t* buf, uint8_t len) {
 int main(int argc, char** argv) {
     bool verbose = false;
     uint32_t seed = 1;
+    uint8_t injected_fault = FB_FAULT_NONE;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "-v") == 0) verbose = true;
         if (std::strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
             seed = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+        }
+        // --inject breaks the SIMULATED sensors, never the firmware: see
+        // rover_feedback_faults.h. An unknown name exits rather than running
+        // a healthy plant, because a typo that silently passes is worse than
+        // no fault injection at all.
+        if (std::strcmp(argv[i], "--inject") == 0 && i + 1 < argc) {
+            if (!parseFeedbackFault(argv[++i], injected_fault)) {
+                std::fprintf(stderr, "rover_sim: unknown --inject %s\n", argv[i]);
+                return 2;
+            }
         }
     }
 
@@ -72,6 +84,8 @@ int main(int argc, char** argv) {
     DriveSim feedback(seed);
     SimulatedEncoder enc_l, enc_r;
     SteerSim steer_plant;
+    FeedbackFaultInjector injector;
+    injector.arm(injected_fault);
     std::string pending;
     char chunk[512];
 
@@ -120,10 +134,21 @@ int main(int argc, char** argv) {
         feedback.update(out.left_effort, out.right_effort, out.energized, now_ms);
         enc_l.update(scaledFromMps(feedback.left().measured_mps), now_ms);
         enc_r.update(scaledFromMps(feedback.right().measured_mps), now_ms);
-        const int32_t enc_left  = enc_l.feedback(now_ms).count;
-        const int32_t enc_right = enc_r.feedback(now_ms).count;
         steer_plant.update(out.steer_effort, now_ms);
-        const int16_t steer_fb = steer_plant.feedback(now_ms).measured;
+
+        // THE SENSOR BOUNDARY. Everything below reads ef/sf and nothing
+        // else, so an injected fault is wrong EVERYWHERE a real broken
+        // sensor would be, not only in the freshness report. Same order as
+        // rover_firmware.cpp. A no-op unless --inject armed something.
+        EncoderFeedback ef = enc_l.feedback(now_ms);
+        SteerFeedback   sf = steer_plant.feedback(now_ms);
+        injector.apply(ef, sf, now_ms);
+
+        const int32_t enc_left  = ef.count;
+        // The right encoder is not injected: a wheel sensor dies on its own
+        // wheel. See the same note in rover_firmware.cpp.
+        const int32_t enc_right = enc_r.feedback(now_ms).count;
+        const int16_t steer_fb  = sf.measured;
         const int32_t effort_mag =
             (std::abs(out.left_effort) + std::abs(out.right_effort)) / 2;
         const int16_t current_ca =
@@ -147,8 +172,6 @@ int main(int argc, char** argv) {
         // The same feedback-freshness feed as rover_firmware.cpp. The plant
         // owns the sane range for its own units; the controller owns the
         // staleness rule, because that is a time rule.
-        const EncoderFeedback ef = enc_l.feedback(now_ms);
-        const SteerFeedback   sf = steer_plant.feedback(now_ms);
         ctl.updateFeedback(
             ef.last_update_ms,
             ef.rpm >= -ENCODER_MAX_RPM && ef.rpm <= ENCODER_MAX_RPM,

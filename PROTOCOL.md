@@ -135,8 +135,10 @@
 | TELEMETRY rate | 20 Hz (6 frames per cycle = 120 frames/s) |
 | Byte order | Little-endian, written byte-by-byte (not struct-punned) |
 
-At 500 kbps an 8-byte frame is roughly 220 µs of airtime. Six frames per cycle
-is ~1.3 ms of a 50 ms period — about **3% bus utilisation**. Throughput is
+At 500 kbps an 8-byte frame is roughly 220 µs of airtime. Seven frames per
+cycle — one `CONTROL` and six telemetry — is ~1.5 ms of a 50 ms period, about
+**3% bus utilisation**. (`rover_config.h` quotes 3.6% for the same thing: it
+allows for bit stuffing, which this figure does not.) Throughput is
 nowhere near the constraint; CAN was chosen for determinism and noise immunity,
 not speed. Say so plainly when anyone asks.
 
@@ -1044,6 +1046,31 @@ untouched. `stale_feedback_does_not_stop_the_rover` in
 `tests/cpp/test_controller.cpp` fails the moment someone moves that line early
 by accident; when Task 6 moves it on purpose, that test is the one to change.
 
+**How the four conditions are demonstrated, not just asserted.** A detector
+tested only against the code that feeds it is a test of self-agreement. So the
+failures are injected on the **simulated** side, at the sensor boundary, by
+`firmware/src/rover_feedback_faults.*`: the firmware is byte-identical either
+way and is told nothing, and the corrupted reading is wrong everywhere a real
+broken sensor's would be — including the value echoed in `TELEM_DRIVE_L`.
+
+| `rover_sim --inject` | The Task 5 condition |
+|---|---|
+| `encoder-frozen` | Encoder feedback stops updating |
+| `steer-frozen` | Steering feedback stops updating |
+| `encoder-impossible` | An encoder value the hardware cannot produce |
+| `steer-impossible` | A steering position the actuator cannot reach |
+| `delayed` | Real readings, `FB_FAULT_DELAY_MS` (250 ms) late |
+
+`tests/cpp/test_feedback_faults.cpp` drives the controller through each of them
+directly; `tests/host/test_feedback_failures.py` runs the same five through the
+compiled firmware and asserts that the right flag and fault reach the Jetson's
+own decoder. Frozen and delayed are deliberately kept distinguishable: a frozen
+channel's age grows without limit, a delayed one settles at the delay. On the
+Teensy the same injection is the `SIMULATED_FEEDBACK_FAULT` constant in
+`firmware/rover_firmware.cpp` — a build-time choice, not a `CONTROL` field,
+because a way to break the rover's own sensors from the Jetson is a weapon
+rather than a feature.
+
 **Why a sixth frame rather than spare bytes.** There are none. Every frame
 above is full at DLC 8 — six payload bytes plus the sequence number and the
 CRC — and the only unclaimed byte in the whole set is `TELEM_STATE` byte 5,
@@ -1294,7 +1321,7 @@ converged, a single radio hiccup would start stopping the rover in `TELEOP`.
 ## 7. Demonstration and tests — no hardware required
 
 ```
-make test      # 168 C++ tests + 100 host tests
+make test      # 214 C++ tests + 113 host tests
 make demo      # the Task 3 message-exchange demonstration
 make autonomy  # the Task 4 mock-autonomy mission
 ```
