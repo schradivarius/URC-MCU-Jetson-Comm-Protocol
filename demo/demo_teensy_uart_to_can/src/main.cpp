@@ -22,7 +22,7 @@ constexpr size_t MESSAGE_SIZE = 33;
 constexpr size_t DATA_SIZE = MESSAGE_SIZE - 1;
 
 void dispatchMessage(const uint8_t* message);
-CAN_message_t motorUartToCan(CanID target, const uint8_t* value);
+bool motorUartToCan(CanID target, const uint8_t* value, CAN_message_t& out);
 
 
 // initialize CAN object for CAN channel 1
@@ -61,16 +61,19 @@ void dispatchMessage(const uint8_t* message) {
   const uint8_t* data = &message[1];
 
   if (id >= 1 && id <= 6) {
-    motorUartToCan( (CanID)id, data);
+    CAN_message_t msg;
+    if (motorUartToCan((CanID)id, data, msg)) {
+      can1.write(msg);
+    }
   }
 
 }
 
 
-CAN_message_t motorUartToCan(CanID target, const uint8_t* ptr) {
+bool motorUartToCan(CanID target, const uint8_t* ptr, CAN_message_t& out) {
 
   if(target<1 || target>6){
-    return NULL;
+    return false;
   }
   
   uint32_t value = ((uint32_t)ptr[0])    |
@@ -78,7 +81,7 @@ CAN_message_t motorUartToCan(CanID target, const uint8_t* ptr) {
                 ((uint32_t)ptr[2] << 16) |
                 ((uint32_t)ptr[3] << 24);
 
-  CAN_message_t msg;
+  CAN_message_t& msg = out;
 
   msg.id = target; // should be in hexa but thas too hard for mine
   msg.len = 8; // can 2.0 length bub
@@ -98,5 +101,5 @@ CAN_message_t motorUartToCan(CanID target, const uint8_t* ptr) {
     msg.buf[i] = 0x00;
   }
 
-  return msg;
+  return true;
 }
