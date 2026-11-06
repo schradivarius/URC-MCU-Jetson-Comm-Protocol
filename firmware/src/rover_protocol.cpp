@@ -71,7 +71,7 @@ inline DecodeResult openFrame(uint32_t can_id, const uint8_t* buf, uint8_t len,
     return DECODE_OK;
 }
 
-}  // namespace
+} // namespace
 
 // ---------------------------------------------------------------------------
 // CRC-8 / SAE-J1850: poly 0x1D, init 0xFF, MSB-first, final XOR 0xFF.
@@ -133,6 +133,31 @@ bool sourceOwnsMode(bool from_autonomy, uint8_t mode) {
     // asking the question gets "yes" rather than a spurious mismatch.
     if (!modePermitsMotion(mode)) return true;
     return from_autonomy == (mode == MODE_AUTONOMOUS);
+}
+
+namespace {
+    enum Rule : uint8_t {DENY, ANYONE, OPERATOR};
+
+    const Rule TRANSITIONS[MODE_FAULT + 1][MODE_MAX + 1] = {
+        //             {TO SAFE,  TO TELEOP, TO AUTONOMOUS}
+        /*SAFE*/       {ANYONE,   OPERATOR,  OPERATOR},
+        /*TELEOP*/     {ANYONE,   ANYONE,    OPERATOR},
+        /*AUTONOMOUS*/ {ANYONE,   OPERATOR,  ANYONE},
+        /*FAULT*/      {ANYONE,   DENY,      DENY},
+};
+} // NAMESPACE
+
+bool transitionAllowed(uint8_t from, uint8_t to, bool from_autonomy) {
+    // Both indices are range-checked before they touch the table: `from` and
+    // `to` are uint8, so 256 values fit where 4 and 3 are defined, and reading
+    // past the end of an array is undefined behaviour, not a refusal.
+    if (from > MODE_FAULT || !isCommandableMode(to)) return false;
+    switch (TRANSITIONS[from][to]) {
+        case ANYONE:   return true;
+        case OPERATOR: return !from_autonomy;
+        case DENY:     return false;
+    }
+    return false;
 }
 
 bool isValidCommand(int16_t value) {
@@ -355,6 +380,7 @@ const char* cmdStatusName(uint8_t status) {
         case CMD_STATUS_STOPPED:      return "STOPPED";
         case CMD_STATUS_WRONG_SOURCE: return "WRONG_SOURCE";
         case CMD_STATUS_NO_COMMAND:   return "NO_COMMAND";
+        case CMD_STATUS_MODE_REFUSED: return "MODE_REFUSED";
     }
     return "UNKNOWN";
 }
