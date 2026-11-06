@@ -33,7 +33,7 @@ than mocking them, so there is no dependency to manage.
 git clone https://github.com/schradivarius/URC-MCU-Jetson-Comm-Protocol.git
 cd URC-MCU-Jetson-Comm-Protocol
 
-make test      # 168 C++ tests + 100 host tests
+make test      # 182 C++ tests + 100 host tests
 make demo      # no-hardware message-exchange demonstration (Task 3)
 make autonomy  # mock autonomy stack driving the firmware (Task 4)
 ```
@@ -50,9 +50,12 @@ Two languages, because the two ends of the link are different machines:
 firmware/                    C++ — runs on the Teensy 4.1
   rover_firmware.cpp           hardware wiring ONLY (CAN, watchdog, pins)
   src/rover_config.h           every protocol + timing constant ─┐
-  src/rover_protocol.*         message definitions + codec      ─┤ pure C++,
-  src/rover_controller.*       command/safety state machine      │ no Arduino
-  src/rover_drive.*            drive/steering output stage      ─┘
+  src/rover_protocol.*         message definitions + codec       │
+  src/rover_controller.*       command/safety state machine      │ pure C++,
+  src/rover_drive.*            drive/steering output stage       │ no Arduino
+  src/rover_drive_sim.*        simulated drivetrain (lags)       │
+  src/rover_encoder.*          simulated wheel encoders          │
+  src/rover_steer_sim.*        simulated steering actuator      ─┘
 
 host/                        Python — runs on the Jetson
   rover_config.py              constants (pinned to rover_config.h)
@@ -68,8 +71,8 @@ tools/
   rover_sim.cpp                simulator: REAL controller + drive stage, fake plant
   golden_vectors.cpp           emits vectors for cross-language pinning
 
-tests/cpp/                   126 tests — firmware core
-tests/host/                  98 tests — config sync, golden vectors, integration,
+tests/cpp/                   182 tests — firmware core
+tests/host/                  100 tests — config sync, golden vectors, integration,
                                         the autonomy mission
 ```
 
