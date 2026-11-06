@@ -233,5 +233,29 @@ int main() {
                       e.ret ? 1 : 0, e.seq);
         emitHex("CMD_ECHO", args, buf, n);
     }
+
+    // --- TELEM_FEEDBACK (v0.8) -------------------------------------------
+    struct FB { uint16_t enc_age, steer_age; uint8_t src, flags, seq; };
+    const FB fbs[] = {
+        {                   0,                    0, CMD_SOURCE_NONE,     0, 0},
+        {                  20,                   35, CMD_SOURCE_OPERATOR, 0, 31},
+        {                 999,                    1, CMD_SOURCE_AUTONOMY,
+         FB_FLAG_ENCODER_STALE, 32},
+        {FEEDBACK_AGE_UNKNOWN, FEEDBACK_AGE_UNKNOWN, CMD_SOURCE_NONE,
+         FB_FLAG_ENCODER_STALE | FB_FLAG_STEER_STALE, 33},
+        {    FEEDBACK_AGE_MAX,                    0, CMD_SOURCE_AUTONOMY,
+         FB_FLAG_STEER_INVALID, 34},
+        {                   7,                    7, CMD_SOURCE_OPERATOR,
+         FB_FLAGS_MASK, 255},
+    };
+    for (const FB& f : fbs) {
+        TelemetryFeedback m;
+        m.encoder_age_ms = f.enc_age; m.steer_age_ms = f.steer_age;
+        m.cmd_source = f.src; m.flags = f.flags;
+        uint8_t n = encodeTelemetryFeedback(m, f.seq, buf);
+        std::snprintf(args, sizeof(args), "%u,%u,%u,%u,%u",
+                      f.enc_age, f.steer_age, f.src, f.flags, f.seq);
+        emitHex("FEEDBACK", args, buf, n);
+    }
     return 0;
 }

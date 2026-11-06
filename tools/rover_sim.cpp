@@ -144,9 +144,19 @@ int main(int argc, char** argv) {
             scaledFromMps((feedback.left().measured_mps +
                            feedback.right().measured_mps) / 2.0f),
             steer_fb);
+        // The same feedback-freshness feed as rover_firmware.cpp. The plant
+        // owns the sane range for its own units; the controller owns the
+        // staleness rule, because that is a time rule.
+        const EncoderFeedback ef = enc_l.feedback(now_ms);
+        const SteerFeedback   sf = steer_plant.feedback(now_ms);
+        ctl.updateFeedback(
+            ef.last_update_ms,
+            ef.rpm >= -ENCODER_MAX_RPM && ef.rpm <= ENCODER_MAX_RPM,
+            sf.last_update_ms,
+            isValidCommand(sf.measured));
 
         if (ctl.telemetryDue()) {
-            const uint8_t seq = ctl.telemetrySeq();   // one seq for all four
+            const uint8_t seq = ctl.telemetrySeq();   // one seq for all six
             uint8_t buf[8];
 
             TelemetryDriveL dl = ctl.buildDriveL(enc_left, steer_fb);
@@ -170,6 +180,9 @@ int main(int argc, char** argv) {
             // from, and why it is or is not being acted on.
             TelemetryCmdEcho ce = ctl.buildCmdEcho(drive, steer);
             emitFrame(CAN_ID_TELEM_CMD_ECHO, buf, encodeTelemetryCmdEcho(ce, seq, buf));
+
+            TelemetryFeedback fb = ctl.buildFeedback();
+            emitFrame(CAN_ID_TELEM_FEEDBACK, buf, encodeTelemetryFeedback(fb, seq, buf));
 
             if (verbose) {
                 // Printed drive output, on stderr because stdout is the bus.

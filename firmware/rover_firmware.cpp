@@ -147,6 +147,10 @@ struct SensorReading {
     int32_t  enc_right;
     int16_t  steer_fb;
     int16_t  measured_drive;  // mean wheel speed, CMD_MIN..CMD_MAX scale
+    uint32_t encoder_update_ms;  // clock at the last encoder change
+    uint32_t steer_update_ms;    // clock at the last steering change
+    bool     encoder_sane;       // the reading is one the hardware could give
+    bool     steer_sane;
     int16_t  current_ca;   // SIGNED centiamps  (1 cA = 10 mA)
     int16_t  voltage_cv;   // SIGNED centivolts (1 cV = 10 mV)
     uint16_t fault_bits;
@@ -172,6 +176,10 @@ static SensorReading readSensors(const DriveOutputs& out) {
         //   controller_health : CTRL_HEALTH_* from motor-driver telemetry,
         //                 which on a CAN bus arrives as its own messages
         r.enc_left = 0; r.enc_right = 0; r.steer_fb = 0; r.measured_drive = 0;
+        // No reading yet, so no timestamp to vouch for: the controller
+        // reports FEEDBACK_AGE_UNKNOWN until real sensors fill these in.
+        r.encoder_update_ms = millis(); r.steer_update_ms = millis();
+        r.encoder_sane = true; r.steer_sane = true;
         r.current_ca = 0; r.voltage_cv = 0; r.fault_bits = 0;
         r.controller_health = drive_stage.health();
         r.drive_applied = 0; r.steer_applied = 0;   // filled in by loop()
@@ -199,6 +207,15 @@ static SensorReading readSensors(const DriveOutputs& out) {
     // the mix is left = drive + steer, right = drive - steer.
     r.measured_drive = scaledFromMps(
         (sim_plant.left().measured_mps + sim_plant.right().measured_mps) / 2.0f);
+
+    const EncoderFeedback ef = sim_enc_l.feedback(now_ms);
+    const SteerFeedback   sf = sim_steer.feedback(now_ms);
+    r.encoder_update_ms = ef.last_update_ms;
+    r.steer_update_ms   = sf.last_update_ms;
+    // What the plant knows and the controller cannot: the range each of
+    // these units can physically take.
+    r.encoder_sane = ef.rpm >= -ENCODER_MAX_RPM && ef.rpm <= ENCODER_MAX_RPM;
+    r.steer_sane   = isValidCommand(sf.measured);
     r.current_ca = out.energized ? static_cast<int16_t>(effort_mag * 3 / 2) : 0;
     // Fake 24 V pack sagging a little under load.
     r.voltage_cv = static_cast<int16_t>(2400 - effort_mag / 40);
@@ -264,8 +281,8 @@ static uint16_t detectBootFault() {
 // Telemetry
 // ---------------------------------------------------------------------------
 
-// Four frames per cycle, because each must fit Classic CAN's 8 bytes once the
-// per-frame sequence number and CRC are accounted for. All four carry the SAME
+// Six frames per cycle, because each must fit Classic CAN's 8 bytes once the
+// per-frame sequence number and CRC are accounted for. All six carry the SAME
 // sequence number, which is how the Jetson tells a coherent snapshot from one
 // torn across two cycles. See rover_protocol.h for why not one CAN FD frame.
 static void sendTelemetry(const SensorReading& s) {
@@ -304,6 +321,15 @@ static void sendTelemetry(const SensorReading& s) {
     TelemetryCmdEcho ce = ctl->buildCmdEcho(s.drive_applied, s.steer_applied);
     frame.id  = CAN_ID_TELEM_CMD_ECHO;
     frame.len = encodeTelemetryCmdEcho(ce, seq, frame.buf);
+    Can.write(frame);
+
+    // v0.8: how old each feedback channel is, whether the controller still
+    // believes it, and which producer owns the live command. The echo above
+    // says what the rover was TOLD; this says how much to trust what it is
+    // reporting back.
+    TelemetryFeedback fb = ctl->buildFeedback();
+    frame.id  = CAN_ID_TELEM_FEEDBACK;
+    frame.len = encodeTelemetryFeedback(fb, seq, frame.buf);
     Can.write(frame);
 }
 
@@ -374,6 +400,8 @@ void loop() {
     SensorReading s = readSensors(out);
     ctl->updateFaults(s.fault_bits, s.controller_health);
     ctl->updateMeasured(s.measured_drive, s.steer_fb);
+    ctl->updateFeedback(s.encoder_update_ms, s.encoder_sane,
+                        s.steer_update_ms,   s.steer_sane);
     // Not sensor readings, so they are filled in here rather than inside
     // readSensors(): they are what the controller AUTHORISED, which is what
     // the acknowledgement frame is about.

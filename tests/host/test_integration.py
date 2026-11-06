@@ -99,9 +99,9 @@ class RoverFixture(unittest.TestCase):
 
 
 class TestSnapshotAssembly(RoverFixture):
-    """The five telemetry frames must reassemble into coherent snapshots."""
+    """The six telemetry frames must reassemble into coherent snapshots."""
 
-    def test_all_five_frames_arrive_and_assemble(self):
+    def test_all_six_frames_arrive_and_assemble(self):
         self.drive(0.6)
         self.assertGreater(self.jl.tele.complete_count, 5)
         for can_id in rp.TELEM_IDS:
@@ -111,7 +111,7 @@ class TestSnapshotAssembly(RoverFixture):
         self.assertEqual(self.jl.unknown_frames, 0)
 
     def test_snapshots_are_not_torn(self):
-        # All five frames of a cycle share one sequence number. Over a clean
+        # All six frames of a cycle share one sequence number. Over a clean
         # link every snapshot should be coherent.
         self.drive(1.0)
         self.assertEqual(self.jl.tele.torn_count, 0,
@@ -136,8 +136,44 @@ class TestSnapshotAssembly(RoverFixture):
                       # commands are what let the Jetson tell "my command got
                       # through" from "the rover happens to be moving".
                       "drive_applied", "steer_applied", "ack_seq",
-                      "cmd_status", "last_decode", "return_active"):
+                      "cmd_status", "last_decode", "return_active",
+                      # Task 5's expanded feedback loop adds these. Before
+                      # v0.8 the Jetson could state a command source but
+                      # never read one back, and could not tell a fresh
+                      # feedback value from one that stopped changing.
+                      "cmd_source", "encoder_age_ms", "steer_age_ms",
+                      "feedback_flags", "encoder_stale", "steer_stale",
+                      "encoder_invalid", "steer_invalid"):
             self.assertIn(field, s, "telemetry is missing %r" % field)
+
+    def test_the_feedback_ages_are_real_measurements(self):
+        # Not a constant: the simulator refreshes both channels every loop,
+        # so the age must stay small and must not read UNKNOWN once the
+        # plant has reported at all.
+        self.drive(0.6)
+        s = self.snap()
+        for field in ("encoder_age_ms", "steer_age_ms"):
+            self.assertNotEqual(s[field], rp.FEEDBACK_AGE_UNKNOWN,
+                                "%s never reported" % field)
+            self.assertLess(s[field], rp.FEEDBACK_STALE_MS,
+                            "%s is stale against a healthy plant" % field)
+        self.assertFalse(s["encoder_stale"])
+        self.assertFalse(s["steer_stale"])
+        self.assertFalse(s["encoder_invalid"])
+        self.assertFalse(s["steer_invalid"])
+        self.assertNotIn("STALE_FEEDBACK", self.faults())
+
+    def test_the_active_command_source_is_read_back(self):
+        # The Jetson states from_autonomy on the way out; v0.8 is the first
+        # revision where it can read back which producer the CONTROLLER
+        # settled on, which is not the same answer after a refusal.
+        self.drive(0.6, mode=rp.MODE_TELEOP, from_autonomy=False)
+        self.assertEqual(self.snap()["cmd_source"], rp.CMD_SOURCE_OPERATOR)
+        # An autonomy frame in TELEOP is refused, so nothing is driving
+        # from it and the source is NONE rather than AUTONOMY.
+        self.drive(0.6, mode=rp.MODE_TELEOP, from_autonomy=True)
+        self.assertEqual(self.snap()["cmd_source"], rp.CMD_SOURCE_NONE)
+        self.assertEqual(self.snap()["cmd_status"], rp.CMD_STATUS_WRONG_SOURCE)
 
 
 class TestEndToEnd(RoverFixture):

@@ -32,12 +32,15 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from rover_config import (  # noqa: E402,F401
     CAN_ID_CONTROL, CAN_ID_TELEM_DRIVE_L, CAN_ID_TELEM_DRIVE_R,
     CAN_ID_TELEM_POWER, CAN_ID_TELEM_STATE, CAN_ID_TELEM_CMD_ECHO,
+    CAN_ID_TELEM_FEEDBACK,
     MODE_SAFE, MODE_TELEOP, MODE_AUTONOMOUS, MODE_FAULT, MODE_MAX,
     CMD_MIN, CMD_MAX, PROTOCOL_VERSION, PWM_NEUTRAL_US, PWM_SPAN_US,
+    FEEDBACK_STALE_MS,
 )
 
 TELEM_IDS = (CAN_ID_TELEM_DRIVE_L, CAN_ID_TELEM_DRIVE_R,
-             CAN_ID_TELEM_POWER, CAN_ID_TELEM_STATE, CAN_ID_TELEM_CMD_ECHO)
+             CAN_ID_TELEM_POWER, CAN_ID_TELEM_STATE, CAN_ID_TELEM_CMD_ECHO,
+             CAN_ID_TELEM_FEEDBACK)
 
 # --- operating modes (values in rover_config.py) ---
 MODE_NAMES = {MODE_SAFE: "SAFE", MODE_TELEOP: "TELEOP",
@@ -89,6 +92,9 @@ FAULT_C2_LINK_LOST   = 0x0080
 FAULT_SEQ_GAP        = 0x0100
 FAULT_CRC_ERROR      = 0x0200
 FAULT_CMD_SOURCE     = 0x0400
+# v0.8. Detected and reported only; acting on them is Task 6's safe state.
+FAULT_STALE_FEEDBACK = 0x0800
+FAULT_STEERING_FAULT = 0x1000
 
 FAULT_NAMES = [
     (FAULT_COMM_TIMEOUT, "COMM_TIMEOUT"),
@@ -102,6 +108,8 @@ FAULT_NAMES = [
     (FAULT_SEQ_GAP, "SEQ_GAP"),
     (FAULT_CRC_ERROR, "CRC_ERROR"),
     (FAULT_CMD_SOURCE, "CMD_SOURCE"),
+    (FAULT_STALE_FEEDBACK, "STALE_FEEDBACK"),
+    (FAULT_STEERING_FAULT, "STEERING_FAULT"),
 ]
 
 FAULT_CRITICAL_MASK = FAULT_OVER_CURRENT | FAULT_ESTOP_ACTIVE
@@ -149,6 +157,38 @@ CMD_ECHO_RESERVED_MASK = 0x80   # bit 7, must be zero
 CMD_AGE_UNKNOWN = 0xFFFF
 CMD_AGE_MAX     = 0xFFFE
 
+# --- feedback age sentinels (v0.8), same convention as command age ---
+FEEDBACK_AGE_UNKNOWN = 0xFFFF
+FEEDBACK_AGE_MAX     = 0xFFFE
+
+# --- which producer owns the command being acted on (v0.8) ---
+CMD_SOURCE_NONE     = 0
+CMD_SOURCE_OPERATOR = 1
+CMD_SOURCE_AUTONOMY = 2
+CMD_SOURCE_MAX      = 3
+CMD_SOURCE_NAMES = {CMD_SOURCE_NONE: "NONE",
+                    CMD_SOURCE_OPERATOR: "OPERATOR",
+                    CMD_SOURCE_AUTONOMY: "AUTONOMY"}
+
+# --- TelemetryFeedback.flags (v0.8) ---
+# Stale and invalid are separate: a stale channel reports a value that was
+# true once, an invalid one reports a value that never was.
+FB_FLAG_ENCODER_STALE   = 0x01
+FB_FLAG_STEER_STALE     = 0x02
+FB_FLAG_ENCODER_INVALID = 0x04
+FB_FLAG_STEER_INVALID   = 0x08
+FB_FLAGS_MASK           = 0x0F
+FB_FLAGS_RESERVED_MASK  = 0xF0
+FB_FLAG_NAMES = ((FB_FLAG_ENCODER_STALE, "ENCODER_STALE"),
+                 (FB_FLAG_STEER_STALE, "STEER_STALE"),
+                 (FB_FLAG_ENCODER_INVALID, "ENCODER_INVALID"),
+                 (FB_FLAG_STEER_INVALID, "STEER_INVALID"))
+
+
+def feedback_flag_names(flags):
+    """Which feedback flags are set, for logging."""
+    return [name for bit, name in FB_FLAG_NAMES if flags & bit]
+
 # --- frame geometry: 6 payload bytes + seq + CRC = 8 ---
 # Stated rather than derived, because the seq and CRC bytes are not in any
 # struct format. test_config_sync.py pins these to the C++ values.
@@ -165,6 +205,7 @@ DRIVE_R_FMT = "<iH"     # enc_right, cmd_age_ms
 POWER_FMT   = "<hhH"    # current_ca, voltage_cv, fault_status
 STATE_FMT   = "<6B"     # mode, jetson_link, c2_link, ctrl_health, indicator, rsvd
 ECHO_FMT    = "<hhBB"   # drive_applied, steer_applied, ack_seq, status
+FEEDBACK_FMT = "<HHBB"  # encoder_age_ms, steer_age_ms, cmd_source, flags
 
 INT32_MIN = -(2 ** 31)
 INT32_MAX = 2 ** 31 - 1
@@ -503,10 +544,37 @@ def decode_telemetry_cmd_echo(frame, can_id=CAN_ID_TELEM_CMD_ECHO):
     }
 
 
+def encode_telemetry_feedback(encoder_age_ms, steer_age_ms, cmd_source,
+                              flags, seq=0):
+    return _seal(CAN_ID_TELEM_FEEDBACK,
+                 struct.pack(FEEDBACK_FMT, encoder_age_ms, steer_age_ms,
+                             cmd_source, flags & FB_FLAGS_MASK), seq)
+
+
+def decode_telemetry_feedback(frame, can_id=CAN_ID_TELEM_FEEDBACK):
+    result, payload, seq = _open(can_id, frame)
+    if result != DECODE_OK:
+        return result, None
+    enc_age, steer_age, source, flags = struct.unpack(FEEDBACK_FMT, payload)
+    flags &= FB_FLAGS_MASK
+    return DECODE_OK, {
+        "encoder_age_ms": enc_age, "steer_age_ms": steer_age,
+        "cmd_source": source, "feedback_flags": flags,
+        # Unpacked for the caller, the same way cmd_status is: every
+        # consumer wants the bits by name and none wants the masks.
+        "encoder_stale": bool(flags & FB_FLAG_ENCODER_STALE),
+        "steer_stale": bool(flags & FB_FLAG_STEER_STALE),
+        "encoder_invalid": bool(flags & FB_FLAG_ENCODER_INVALID),
+        "steer_invalid": bool(flags & FB_FLAG_STEER_INVALID),
+        "seq": seq,
+    }
+
+
 DECODERS = {
     CAN_ID_TELEM_DRIVE_L: decode_telemetry_drive_l,
     CAN_ID_TELEM_DRIVE_R: decode_telemetry_drive_r,
     CAN_ID_TELEM_POWER:   decode_telemetry_power,
     CAN_ID_TELEM_STATE:   decode_telemetry_state,
     CAN_ID_TELEM_CMD_ECHO: decode_telemetry_cmd_echo,
+    CAN_ID_TELEM_FEEDBACK: decode_telemetry_feedback,
 }
