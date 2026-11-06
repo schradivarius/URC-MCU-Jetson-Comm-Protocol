@@ -50,6 +50,27 @@ class RoverFixture(unittest.TestCase):
         # test that is not about authority does not have to think about it --
         # and the ones that are say so explicitly.
         kw.setdefault("from_autonomy", kw["mode"] == rp.MODE_AUTONOMOUS)
+        # The same idea for mode changes (v0.7): only the operator may grant
+        # a motion mode, so entering one goes through the operator first. The
+        # tests that are ABOUT transitions call send_frames() instead.
+        if send and kw["mode"] in rp.MOTION_MODES and self.mode() != kw["mode"]:
+            self.grant(kw["mode"], c2_lost=kw["c2_lost"])
+        self.send_frames(seconds, send=send, **kw)
+
+    def grant(self, mode, c2_lost=False):
+        """The operator granting `mode`: stopped, operator-sourced frames
+        asking for it, which is what the Jetson sends when C2 says "go"."""
+        self.send_frames(0.15, drive_cmd=0, steer_cmd=0, mode=mode, stop=True,
+                         c2_lost=c2_lost, from_autonomy=False)
+
+    def mode(self):
+        """The mode the controller last reported, SAFE before any report."""
+        if self.jl.snapshot is None:
+            return rp.MODE_SAFE
+        return self.jl.snapshot["mode"]
+
+    def send_frames(self, seconds, send=True, **kw):
+        """Send exactly these CONTROL frames at 20 Hz (or stay silent)."""
         end = time.monotonic() + seconds
         while time.monotonic() < end:
             if send:
@@ -131,7 +152,7 @@ class TestEndToEnd(RoverFixture):
         self.assertEqual(s["jetson_link"], rp.LINK_OK)
         self.assertEqual(s["indicator_state"], rp.INDICATOR_TELEOP)
 
-    def test_link_cut_trips_comm_timeout_then_recovers(self):
+    def test_link_cut_latches_fault_until_safe_is_commanded(self):
         self.drive(0.6)
         self.assertEqual(self.faults(), [])
         moving = self.snap()["enc_left"]
@@ -149,8 +170,21 @@ class TestEndToEnd(RoverFixture):
         self.assertEqual(self.snap()["enc_left"], frozen,
                          "kept moving while commands were stale")
 
+        # v0.7: the link coming back does NOT resume driving. FAULT latches,
+        # and the reason stays in the fault word while it does.
         self.drive(0.6)
-        self.assertEqual(self.faults(), [], "fault did not clear on its own")
+        s = self.snap()
+        self.assertEqual(s["mode"], rp.MODE_FAULT)
+        self.assertEqual(s["cmd_status"], rp.CMD_STATUS_MODE_REFUSED)
+        self.assertEqual(s["jetson_link"], rp.LINK_OK)
+        self.assertIn("COMM_TIMEOUT", self.faults())
+        self.assertEqual(s["enc_left"], frozen, "drove out of a latched fault")
+
+        # SAFE is the way out; then the operator can grant TELEOP again.
+        self.drive(0.4, mode=rp.MODE_SAFE)
+        self.assertEqual(self.snap()["mode"], rp.MODE_SAFE)
+        self.assertEqual(self.faults(), [])
+        self.drive(0.6)
         self.assertGreater(self.snap()["enc_left"], frozen)
 
     def test_stop_flag_is_honoured(self):
@@ -259,9 +293,13 @@ class TestLinkSeparation(RoverFixture):
         self.assertNotEqual(self.snap()["current_a"], 0.0,
                             "an autonomous rover was stopped by C2 loss alone")
 
+        # A rover already teleoperated when C2 drops, which is the case that
+        # matters: v0.7 will not let TELEOP be entered with C2 lost at all.
+        self.drive(0.4, drive_cmd=800, mode=rp.MODE_TELEOP, c2_lost=False)
         self.drive(0.6, drive_cmd=800, mode=rp.MODE_TELEOP, c2_lost=True)
         self.assertEqual(self.snap()["current_a"], 0.0,
                          "a teleoperated rover kept driving with C2 lost")
+        self.assertEqual(self.snap()["mode"], rp.MODE_FAULT)
 
     def test_a_stale_c2_bit_is_reported_as_not_reported(self):
         # Once the Jetson goes silent the last c2_lost value is stale. A clear
