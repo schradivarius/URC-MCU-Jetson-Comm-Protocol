@@ -31,7 +31,13 @@ RoverController::RoverController(MillisFn now_ms,
       crc_errors_seen_(0),
       frames_lost_estimate_(0),
       measured_drive_(0),
-      measured_steering_(0) {
+      measured_steering_(0),
+      have_encoder_fb_(false),
+      have_steer_fb_(false),
+      encoder_update_ms_(0),
+      steer_update_ms_(0),
+      encoder_sane_(false),
+      steer_sane_(false) {
     // Boot state is the safest available: stopped, disabled, no command ever
     // received -- so cmdAgeMs() reads CMD_AGE_UNKNOWN, the watchdog is tripped
     // from the first cycle, and the rover cannot move until the Jetson asks.
@@ -285,6 +291,13 @@ uint16_t RoverController::faultWord(uint16_t sensor_faults, uint16_t extra_fault
     uint16_t faults = static_cast<uint16_t>(sensor_faults | extra_faults);
     if (watchdogTripped()) faults |= FAULT_COMM_TIMEOUT;
     faults |= latched_faults_;
+    // Task 5 asks that a stale or impossible feedback value be DETECTED, get
+    // a flag, and be REPORTED -- and explicitly defers the safe-state
+    // response to Task 6. So these reach the fault word and the telemetry,
+    // and effectiveStop() is deliberately left alone.
+    if (encoderStale() || steerStale()) faults |= FAULT_STALE_FEEDBACK;
+    if (encoderInvalid())               faults |= FAULT_ENCODER_FAULT;
+    if (steerInvalid())                 faults |= FAULT_STEERING_FAULT;
     // Without these the rover could halt or degrade while telemetry read "no
     // faults, link healthy" -- a silent stop is its own hazard.
     if (protocol_error_)   faults |= FAULT_PROTOCOL_ERROR;
@@ -411,6 +424,75 @@ int16_t RoverController::getCommandedSteer() const {
 void RoverController::updateMeasured(int16_t drive, int16_t steer) {
     measured_drive_    = drive;
     measured_steering_ = steer;
+}
+
+void RoverController::updateFeedback(uint32_t encoder_update_ms, bool encoder_sane,
+                                     uint32_t steer_update_ms,  bool steer_sane) {
+    encoder_update_ms_ = encoder_update_ms;
+    steer_update_ms_   = steer_update_ms;
+    encoder_sane_      = encoder_sane;
+    steer_sane_        = steer_sane;
+    have_encoder_fb_   = true;
+    have_steer_fb_     = true;
+}
+
+// Elapsed-time SUBTRACTION, never a comparison of two timestamps, so this
+// stays correct across the millis() wrap. Same rule as elapsedSinceControl().
+uint16_t RoverController::encoderAgeMs() const {
+    if (!have_encoder_fb_) return FEEDBACK_AGE_UNKNOWN;
+    return clampFeedbackAgeMs(
+        static_cast<int64_t>(now_ms_() - encoder_update_ms_));
+}
+
+uint16_t RoverController::steerAgeMs() const {
+    if (!have_steer_fb_) return FEEDBACK_AGE_UNKNOWN;
+    return clampFeedbackAgeMs(
+        static_cast<int64_t>(now_ms_() - steer_update_ms_));
+}
+
+bool RoverController::encoderStale() const {
+    if (!have_encoder_fb_) return true;   // never reported is not "fresh"
+    return (now_ms_() - encoder_update_ms_) >= FEEDBACK_STALE_MS;
+}
+
+bool RoverController::steerStale() const {
+    if (!have_steer_fb_) return true;
+    return (now_ms_() - steer_update_ms_) >= FEEDBACK_STALE_MS;
+}
+
+// A channel that has never reported is stale, not invalid: there is no value
+// to call impossible. Saying both would send an operator looking for a broken
+// sensor when the real answer is that nothing is wired up.
+bool RoverController::encoderInvalid() const {
+    return have_encoder_fb_ && !encoder_sane_;
+}
+
+bool RoverController::steerInvalid() const {
+    return have_steer_fb_ && !steer_sane_;
+}
+
+uint8_t RoverController::commandSource() const {
+    if (!have_control_ || watchdogTripped())      return CMD_SOURCE_NONE;
+    // SAFE and FAULT have no owner, so nothing is driving from either source.
+    if (!modePermitsMotion(activeMode()))          return CMD_SOURCE_NONE;
+    // Refused motion is not an active source. cmd_status says WRONG_SOURCE or
+    // MODE_REFUSED alongside this, so the two together name the whole story.
+    if (!commandAuthorized())                      return CMD_SOURCE_NONE;
+    return last_control_.from_autonomy ? CMD_SOURCE_AUTONOMY : CMD_SOURCE_OPERATOR;
+}
+
+TelemetryFeedback RoverController::buildFeedback() const {
+    TelemetryFeedback m;
+    m.encoder_age_ms = encoderAgeMs();
+    m.steer_age_ms   = steerAgeMs();
+    m.cmd_source     = commandSource();
+    uint8_t flags = 0;
+    if (encoderStale())   flags |= FB_FLAG_ENCODER_STALE;
+    if (steerStale())     flags |= FB_FLAG_STEER_STALE;
+    if (encoderInvalid()) flags |= FB_FLAG_ENCODER_INVALID;
+    if (steerInvalid())   flags |= FB_FLAG_STEER_INVALID;
+    m.flags = flags;
+    return m;
 }
 
 }  // namespace rover

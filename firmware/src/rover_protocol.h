@@ -178,6 +178,28 @@ enum : uint8_t {
 };
 
 // ---------------------------------------------------------------------------
+// Which producer owns the command the controller is acting on right now.
+//
+// from_autonomy travels Jetson -> controller only, so before v0.8 the Jetson
+// could state a source but never read back which one the controller had
+// settled on. That is the gap this closes: after a refused mode change or a
+// watchdog trip the answer is not simply "whatever I last sent".
+//
+// NONE is the honest answer in three cases, and they are deliberately not
+// distinguished here -- mode, fault_status and cmd_status already say which:
+// no command has ever arrived, the watchdog has tripped so the last frame's
+// source is as stale as the rest of it, or the current mode has no owner.
+// ---------------------------------------------------------------------------
+enum : uint8_t {
+    CMD_SOURCE_NONE     = 0,
+    CMD_SOURCE_OPERATOR = 1,
+    CMD_SOURCE_AUTONOMY = 2,
+    CMD_SOURCE_MAX      = 3,
+};
+
+const char* cmdSourceName(uint8_t source);
+
+// ---------------------------------------------------------------------------
 // Fault flags (TelemetryPower::fault_status).
 //
 // WIDENED TO uint16 in v0.4. The uint8 version had exactly one bit left, and
@@ -205,6 +227,15 @@ enum : uint16_t {
     // who needs to know the rover is being commanded by the wrong half of the
     // stack. Self-clearing: the next authorised frame drops it.
     FAULT_CMD_SOURCE     = 0x0400,
+    // A feedback channel has not been refreshed within FEEDBACK_STALE_MS, so
+    // the controller is no longer willing to vouch for the value it is still
+    // reporting. Task 5 asks only that this be DETECTED and REPORTED; acting
+    // on it is Task 6's safe-state work, so effectiveStop() is untouched.
+    FAULT_STALE_FEEDBACK = 0x0800,
+    // Steering feedback that cannot be true -- outside CMD_MIN..CMD_MAX. The
+    // encoder's equivalent is FAULT_ENCODER_FAULT, which has existed since
+    // v0.3 and until now was never set by anything.
+    FAULT_STEERING_FAULT = 0x1000,
 };
 static const uint16_t FAULT_CRITICAL_MASK = FAULT_OVER_CURRENT | FAULT_ESTOP_ACTIVE;
 // Link health, reported for each link independently.
@@ -263,6 +294,32 @@ enum : uint8_t {
 enum : uint16_t {
     CMD_AGE_UNKNOWN = 0xFFFF,
     CMD_AGE_MAX     = 0xFFFE,
+};
+
+// Feedback age, same convention as command age and for the same reason: "that
+// channel has never reported" is a wiring problem, "it last reported 9
+// seconds ago" is something that died while running.
+enum : uint16_t {
+    FEEDBACK_AGE_UNKNOWN = 0xFFFF,
+    FEEDBACK_AGE_MAX     = 0xFFFE,
+};
+
+// ---------------------------------------------------------------------------
+// TelemetryFeedback::flags.
+//
+// STALE and INVALID are separate because they fail differently and are fixed
+// differently. A stale channel is still reporting a value that was true once;
+// an invalid one is reporting a value that was never true -- a disconnected
+// sensor reading full scale, or a decode that lost sync. An operator chasing
+// a loose connector needs to know which.
+// ---------------------------------------------------------------------------
+enum : uint8_t {
+    FB_FLAG_ENCODER_STALE   = 0x01,
+    FB_FLAG_STEER_STALE     = 0x02,
+    FB_FLAG_ENCODER_INVALID = 0x04,
+    FB_FLAG_STEER_INVALID   = 0x08,
+    FB_FLAGS_MASK           = 0x0F,
+    FB_FLAGS_RESERVED_MASK  = 0xF0,  // must be zero
 };
 
 static const int32_t INT32_MIN_V = -2147483647 - 1;
@@ -326,6 +383,9 @@ int32_t wrapI32(int64_t value);
 
 // Clamp a measured age to the wire range, keeping CMD_AGE_UNKNOWN reserved.
 uint16_t clampCmdAgeMs(int64_t age_ms);
+
+// The same clamp for a feedback age, keeping FEEDBACK_AGE_UNKNOWN reserved.
+uint16_t clampFeedbackAgeMs(int64_t age_ms);
 
 // Which fault names are set, for logging. Writes up to `cap` pointers into
 // `out` and returns how many were written.
@@ -404,6 +464,20 @@ struct TelemetryCmdEcho {
                             // boot there is no frame to acknowledge and 0 is a
                             // perfectly ordinary sequence number.
     uint8_t status;         // packed: see packCmdStatus()
+};
+
+// v0.8. How old each feedback channel is, whether the controller still
+// believes it, and which producer owns the live command.
+//
+// A SIXTH frame rather than spare bytes in an existing one, because there are
+// none: every frame above is full at DLC 8 (6 payload + seq + CRC) and the
+// only unclaimed byte in the whole set is TelemetryState::reserved, which
+// cannot hold three fields. See PROTOCOL.md 2.1.
+struct TelemetryFeedback {
+    uint16_t encoder_age_ms;  // since the last encoder update; FEEDBACK_AGE_*
+    uint16_t steer_age_ms;    // since the last steering update; FEEDBACK_AGE_*
+    uint8_t  cmd_source;      // CMD_SOURCE_*
+    uint8_t  flags;           // FB_FLAG_*
 };
 
 // ---------------------------------------------------------------------------
@@ -488,6 +562,10 @@ DecodeResult decodeTelemetryState(uint32_t can_id, const uint8_t* buf, uint8_t l
 uint8_t      encodeTelemetryCmdEcho(const TelemetryCmdEcho& msg, uint8_t seq, uint8_t* buf);
 DecodeResult decodeTelemetryCmdEcho(uint32_t can_id, const uint8_t* buf, uint8_t len,
                                     TelemetryCmdEcho& out, uint8_t& seq_out);
+
+uint8_t      encodeTelemetryFeedback(const TelemetryFeedback& msg, uint8_t seq, uint8_t* buf);
+DecodeResult decodeTelemetryFeedback(uint32_t can_id, const uint8_t* buf, uint8_t len,
+                                     TelemetryFeedback& out, uint8_t& seq_out);
 
 }  // namespace rover
 

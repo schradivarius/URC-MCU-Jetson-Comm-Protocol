@@ -33,7 +33,7 @@ than mocking them, so there is no dependency to manage.
 git clone https://github.com/schradivarius/URC-MCU-Jetson-Comm-Protocol.git
 cd URC-MCU-Jetson-Comm-Protocol
 
-make test      # 182 C++ tests + 100 host tests
+make test      # 198 C++ tests + 104 host tests
 make demo      # no-hardware message-exchange demonstration (Task 3)
 make autonomy  # mock autonomy stack driving the firmware (Task 4)
 ```
@@ -71,8 +71,8 @@ tools/
   rover_sim.cpp                simulator: REAL controller + drive stage, fake plant
   golden_vectors.cpp           emits vectors for cross-language pinning
 
-tests/cpp/                   182 tests — firmware core
-tests/host/                  100 tests — config sync, golden vectors, integration,
+tests/cpp/                   198 tests — firmware core
+tests/host/                  104 tests — config sync, golden vectors, integration,
                                         the autonomy mission
 ```
 

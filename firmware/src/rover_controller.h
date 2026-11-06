@@ -45,6 +45,38 @@ public:
 
     void updateFaults(uint16_t hardware_faults, uint8_t controller_health);
 
+    // --- feedback freshness ----------------------------------------------
+    //
+    // Called once per loop with the clock value at which each feedback
+    // channel last changed, and whether the value it is reporting is one the
+    // hardware could actually produce. The plant owns what "sane" means for
+    // its own units; the controller owns STALENESS, because staleness is a
+    // time rule and the clock is here.
+    //
+    // A frozen channel keeps passing the SAME timestamp every loop, which is
+    // exactly how a stuck sensor presents itself: the reading is still there
+    // and still plausible, and only its age gives it away.
+    void updateFeedback(uint32_t encoder_update_ms, bool encoder_sane,
+                        uint32_t steer_update_ms,  bool steer_sane);
+
+    // Milliseconds since each channel last changed. FEEDBACK_AGE_UNKNOWN
+    // before the first report, which is a different problem from a large
+    // age and is reported differently for that reason.
+    uint16_t encoderAgeMs() const;
+    uint16_t steerAgeMs() const;
+
+    // Older than FEEDBACK_STALE_MS, or never reported at all. Task 5's
+    // example: an encoder reading of 120 RPM must stop being treated as
+    // current once it has not been updated for seconds.
+    bool encoderStale() const;
+    bool steerStale() const;
+
+    // The value itself is impossible, as opposed to merely old. Kept
+    // separate from staleness because the two fail and are fixed
+    // differently -- see the FB_FLAG_* comment in rover_protocol.h.
+    bool encoderInvalid() const;
+    bool steerInvalid() const;
+
     // --- safety ----------------------------------------------------------
 
     uint16_t cmdAgeMs() const;
@@ -107,6 +139,14 @@ public:
     // c2LinkState() from vouching for a value it can no longer see.
     bool sourceMismatch() const;
 
+    // CMD_SOURCE_*: which producer owns the command being acted on right
+    // now. NOT simply an echo of the last frame's from_autonomy bit: it is
+    // NONE when nobody has spoken, when the watchdog has tripped (a stale
+    // frame's source is as stale as the rest of it), when the active mode has
+    // no owner, and when the producer does not own the mode so its motion was
+    // refused. The Jetson could not previously read any of that back.
+    uint8_t commandSource() const;
+
     // CMD_STATUS_*: the single most important reason the drive stage is
     // seeing what it is seeing. See the enum in rover_protocol.h for the
     // precedence, which is NO_COMMAND, then STOPPED, then WRONG_SOURCE.
@@ -152,6 +192,11 @@ public:
     // nothing about the output stage -- the same shape as buildDriveL() taking
     // sensor readings. Pass what commandedOutputs() returned.
     TelemetryCmdEcho buildCmdEcho(int16_t drive_applied, int16_t steer_applied) const;
+
+    // v0.8. Feedback ages, the stale/invalid flags, and the active command
+    // source. Built entirely from state the controller already holds, so
+    // unlike the other builders it takes no arguments.
+    TelemetryFeedback buildFeedback() const;
 
     // Every fault the controller itself knows about, OR-ed together. Exposed
     // so the firmware can report the same word it acts on.
@@ -280,6 +325,13 @@ private:
 
     int16_t    measured_drive_;
     int16_t    measured_steering_;
+
+    bool       have_encoder_fb_;
+    bool       have_steer_fb_;
+    uint32_t   encoder_update_ms_;
+    uint32_t   steer_update_ms_;
+    bool       encoder_sane_;
+    bool       steer_sane_;
 };
 
 }  // namespace rover

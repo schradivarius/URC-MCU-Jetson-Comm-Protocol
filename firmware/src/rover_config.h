@@ -23,7 +23,10 @@ namespace rover {
 // wire yet; DLC and the application-layer CRC are the only runtime mismatch
 // signals. v0.5 is the first revision with the CRC and sequence number; v0.6
 // adds the command-source bit and the TELEM_CMD_ECHO acknowledgement frame.
-static const uint8_t PROTOCOL_VERSION = 7;
+// v0.7 makes the mode controller-owned. v0.8 adds TELEM_FEEDBACK: the age
+// of each feedback channel, whether it has gone stale, and which producer
+// owns the live command.
+static const uint8_t PROTOCOL_VERSION = 8;
 
 // --- Link ------------------------------------------------------------------
 static const uint32_t CAN_BITRATE_HZ = 500000;   // 500 kbps; every node must match
@@ -53,6 +56,7 @@ enum : uint32_t {
     CAN_ID_TELEM_POWER    = 0x202,  // current, voltage, fault word
     CAN_ID_TELEM_STATE    = 0x203,  // mode, link health, controller health
     CAN_ID_TELEM_CMD_ECHO = 0x204,  // what the controller accepted and is acting on
+    CAN_ID_TELEM_FEEDBACK = 0x205,  // feedback ages, staleness, command source
 };
 
 // Bus load, so nobody has to recompute it when adding the sixth frame: one
@@ -91,6 +95,18 @@ static const uint8_t MODE_MAX = MODE_AUTONOMOUS;   // highest COMMANDABLE mode
 // wiring. Units match the telemetry fields they are compared against.
 static const int16_t OVER_CURRENT_CA = 4000;   // 40.00 A
 static const int16_t UNDERVOLTAGE_CV = 2000;   // 20.00 V
+
+// --- Feedback freshness ----------------------------------------------------
+// How long a feedback channel may go without an update before the controller
+// stops vouching for it. Deliberately longer than the telemetry period (50 ms)
+// and shorter than the command watchdog (300 ms): a channel that misses a
+// handful of cycles is a real problem, but one late cycle is not.
+//
+// Task 5's example is an encoder reading of 120 RPM that must not keep being
+// believed seconds after it last changed. The rule lives in the SENDER, like
+// the C2 staleness rule in PROTOCOL.md 3.5, so a receiver that forgets it
+// cannot be misled.
+static const uint32_t FEEDBACK_STALE_MS = 150;
 
 // --- Drive / steering output stage -----------------------------------------
 // Where a command becomes a motor output. Servo/ESC pulse widths are the

@@ -188,6 +188,21 @@ uint16_t clampCmdAgeMs(int64_t age_ms) {
     return static_cast<uint16_t>(age_ms);
 }
 
+uint16_t clampFeedbackAgeMs(int64_t age_ms) {
+    if (age_ms < 0) return 0;
+    if (age_ms >= static_cast<int64_t>(FEEDBACK_AGE_MAX)) return FEEDBACK_AGE_MAX;
+    return static_cast<uint16_t>(age_ms);
+}
+
+const char* cmdSourceName(uint8_t source) {
+    switch (source) {
+        case CMD_SOURCE_NONE:     return "NONE";
+        case CMD_SOURCE_OPERATOR: return "OPERATOR";
+        case CMD_SOURCE_AUTONOMY: return "AUTONOMY";
+    }
+    return "UNKNOWN";
+}
+
 uint8_t seqDelta(uint8_t previous, uint8_t current) {
     // Unsigned subtraction, so this is correct across the 255->0 wrap without
     // any special case. Same reasoning as the millis() handling in
@@ -200,11 +215,13 @@ size_t faultNames(uint16_t bitmask, const char** out, size_t cap) {
         FAULT_COMM_TIMEOUT, FAULT_OVER_CURRENT, FAULT_ESTOP_ACTIVE,
         FAULT_ENCODER_FAULT, FAULT_UNDERVOLTAGE, FAULT_FIRMWARE_FAULT,
         FAULT_PROTOCOL_ERROR, FAULT_C2_LINK_LOST, FAULT_SEQ_GAP, FAULT_CRC_ERROR,
+        FAULT_CMD_SOURCE, FAULT_STALE_FEEDBACK, FAULT_STEERING_FAULT,
     };
     static const char* names[] = {
         "COMM_TIMEOUT", "OVER_CURRENT", "ESTOP_ACTIVE",
         "ENCODER_FAULT", "UNDERVOLTAGE", "FIRMWARE_FAULT",
         "PROTOCOL_ERROR", "C2_LINK_LOST", "SEQ_GAP", "CRC_ERROR",
+        "CMD_SOURCE", "STALE_FEEDBACK", "STEERING_FAULT",
     };
     size_t n = 0;
     for (size_t i = 0; i < sizeof(bits) / sizeof(bits[0]) && n < cap; ++i) {
@@ -424,6 +441,25 @@ DecodeResult decodeTelemetryCmdEcho(uint32_t can_id, const uint8_t* buf, uint8_t
     out.steer_applied = getI16(buf + 2);
     out.ack_seq       = buf[4];
     out.status        = buf[5];
+    return DECODE_OK;
+}
+
+uint8_t encodeTelemetryFeedback(const TelemetryFeedback& msg, uint8_t seq, uint8_t* buf) {
+    putU16(buf + 0, msg.encoder_age_ms);
+    putU16(buf + 2, msg.steer_age_ms);
+    buf[4] = msg.cmd_source;
+    buf[5] = static_cast<uint8_t>(msg.flags & FB_FLAGS_MASK);
+    return sealFrame(CAN_ID_TELEM_FEEDBACK, seq, buf);
+}
+
+DecodeResult decodeTelemetryFeedback(uint32_t can_id, const uint8_t* buf, uint8_t len,
+                                     TelemetryFeedback& out, uint8_t& seq_out) {
+    DecodeResult r = openFrame(can_id, buf, len, seq_out);
+    if (r != DECODE_OK) return r;
+    out.encoder_age_ms = getU16(buf + 0);
+    out.steer_age_ms   = getU16(buf + 2);
+    out.cmd_source     = buf[4];
+    out.flags          = static_cast<uint8_t>(buf[5] & FB_FLAGS_MASK);
     return DECODE_OK;
 }
 
