@@ -47,7 +47,7 @@ static const uint32_t LINK_DEGRADED_HOLD_MS = 1000;
 // telemetry because a late command can hurt the rover and late telemetry only
 // annoys an operator. 0x000-0x0FF is left free for a future e-stop frame.
 //
-// Telemetry is five frames rather than one: see the snapshot-tearing note in
+// Telemetry is six frames rather than one: see the snapshot-tearing note in
 // rover_protocol.h, which is about what the split MEANS and so stays there.
 enum : uint32_t {
     CAN_ID_CONTROL        = 0x100,  // Jetson -> Teensy, highest priority in use
@@ -59,11 +59,11 @@ enum : uint32_t {
     CAN_ID_TELEM_FEEDBACK = 0x205,  // feedback ages, staleness, command source
 };
 
-// Bus load, so nobody has to recompute it when adding the sixth frame: one
-// CONTROL plus five telemetry frames at 20 Hz is 120 frames/s. A Classic CAN
+// Bus load, so nobody has to recompute it when adding the seventh frame: one
+// CONTROL plus six telemetry frames at 20 Hz is 140 frames/s. A Classic CAN
 // frame with an 11-bit id and 8 data bytes is ~128 bits once stuffing is
-// allowed for, so ~15.4 kbit/s of 500 kbit/s -- about 3%. There is room, but
-// it is no longer free: a sixth telemetry frame is a decision, not a detail.
+// allowed for, so ~17.9 kbit/s of 500 kbit/s -- about 3.6%. There is room, but
+// it is no longer free: a seventh telemetry frame is a decision, not a detail.
 
 // --- Frame sizes -----------------------------------------------------------
 // Every frame is 8 bytes ON PURPOSE: that is Classic CAN's limit, so this

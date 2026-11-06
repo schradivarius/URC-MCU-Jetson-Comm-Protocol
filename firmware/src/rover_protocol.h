@@ -82,9 +82,9 @@
 
 namespace rover {
 
-// SNAPSHOT TEARING, on the four telemetry ids in rover_config.h: every frame
+// SNAPSHOT TEARING, on the six telemetry ids in rover_config.h: every frame
 // of one control cycle carries the SAME sequence number. The Jetson can
-// therefore tell whether the four frames it holds came from one cycle or
+// therefore tell whether the six frames it holds came from one cycle or
 // straddle two, and discard or flag a torn snapshot rather than silently
 // mixing a fresh encoder reading with a stale fault word. A single CAN FD
 // frame would be atomic and avoid this entirely; that is the main argument
@@ -421,7 +421,7 @@ struct ControlMsg {
     uint8_t seq;               // increments once per frame, wraps 255->0
 };
 
-// Controller -> Jetson, five frames, all 20 Hz, all sharing one cycle's seq.
+// Controller -> Jetson, six frames, all 20 Hz, all sharing one cycle's seq.
 
 struct TelemetryDriveL {
     int32_t enc_left;      // cumulative ticks, WRAPS -- treat as relative

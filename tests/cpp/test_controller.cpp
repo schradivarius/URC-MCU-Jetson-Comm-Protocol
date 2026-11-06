@@ -767,7 +767,7 @@ static void telemetry_paces_at_the_configured_period() {
 }
 
 static void the_telemetry_sequence_advances_once_per_cycle() {
-    // All four frames of a cycle must share one sequence number -- that is how
+    // All six frames of a cycle must share one sequence number -- that is how
     // the Jetson tells a coherent snapshot from one torn across two cycles.
     RoverController ctl = freshController();
     CHECK(ctl.telemetryDue());

@@ -176,8 +176,8 @@ Every frame, both directions, has the same shape:
 | `seq` | uint8 | frames | 0–255, **wraps** | Increments once per transmitted cycle. Receiver uses the delta: 1 healthy, 0 duplicate, >1 frames lost. |
 | `crc8` | uint8 | — | 0–255 | CRC-8/SAE-J1850 over the CAN id then bytes 0–6. See section 4. |
 
-**Why five telemetry frames and not one CAN FD frame.** 6 payload bytes × 5
-frames = 30 bytes, which is what the field list needs. One 64-byte FD frame
+**Why six telemetry frames and not one CAN FD frame.** 6 payload bytes × 6
+frames = 36 bytes, which is what the field list needs. One 64-byte FD frame
 would hold it all atomically, but would require FD-capable transceivers on
 every node of the bus including Classic-only motor controllers. The field
 definitions would not change if you later move telemetry to FD.
@@ -1261,7 +1261,7 @@ in `rover_protocol.h` beside the structs they describe.
 | Constant | Value | Notes |
 |---|---|---|
 | `CONTROL` rate | 20 Hz | 1 frame per cycle (`CONTROL_RATE_HZ`, Jetson side) |
-| `TELEMETRY` rate | 20 Hz | 5 frames per cycle |
+| `TELEMETRY` rate | 20 Hz | 6 frames per cycle |
 | `WATCHDOG_TIMEOUT_MS` | 300 | 6× the control period. `DEFAULT_WATCHDOG_TIMEOUT_MS` in C++ |
 | `TELEMETRY_PERIOD_MS` | 50 | `DEFAULT_TELEMETRY_PERIOD_MS` in C++ |
 | `LINK_DEGRADED_HOLD_MS` | 1000 | How long a gap or CRC error keeps the link `DEGRADED` |
