@@ -173,6 +173,28 @@ def fault_clear(bit, name):
     return check
 
 
+def feedback_is_fresh():
+    """Both feedback channels have reported recently and plausibly.
+
+    The ages are the point of v0.8: a reading the Jetson can see is not the
+    same as a reading the Jetson should believe. This asserts the controller
+    is vouching for both channels while the plant is healthy, which is what
+    makes a later stale flag mean something.
+    """
+    def check(s):
+        problems = []
+        for field in ("encoder_age_ms", "steer_age_ms"):
+            if s[field] == rp.FEEDBACK_AGE_UNKNOWN:
+                problems.append("%s never reported" % field)
+            elif s[field] >= rp.FEEDBACK_STALE_MS:
+                problems.append("%s=%dms is stale" % (field, s[field]))
+        if s["feedback_flags"]:
+            problems.append("flags=%s"
+                            % ",".join(rp.feedback_flag_names(s["feedback_flags"])))
+        return ", ".join(problems) if problems else None
+    return check
+
+
 def steer_feedback_within(target, tolerance):
     """The steering actuator has actually moved, not just been commanded.
 
@@ -347,9 +369,11 @@ class SequenceRecorder:
     Open it in a spreadsheet and it reads as the mission, in order."""
 
     COLUMNS = ("t_s", "step", "seq", "mode", "light", "cmd_status",
+               "cmd_source",
                "drive_applied", "steer_applied", "speed_cps",
                "enc_left", "enc_right", "steer_fb",
-               "cmd_age_ms", "controller_health", "faults")
+               "cmd_age_ms", "enc_age_ms", "steer_age_ms",
+               "controller_health", "feedback_flags", "faults")
 
     def __init__(self, path):
         self.path = path
@@ -376,6 +400,7 @@ class SequenceRecorder:
             rp.MODE_NAMES.get(s["mode"], "?"),
             INDICATOR_COLORS.get(s["indicator_state"], "?"),
             rp.CMD_STATUS_NAMES.get(s["cmd_status"], "?"),
+            rp.CMD_SOURCE_NAMES.get(s["cmd_source"], "?"),
             s["drive_applied"],
             s["steer_applied"],
             "" if speed is None else "%.0f" % speed,
@@ -383,7 +408,10 @@ class SequenceRecorder:
             s["enc_right"],
             s["steer_fb"],
             s["cmd_age_ms"],
+            s["encoder_age_ms"],
+            s["steer_age_ms"],
             rp.CTRL_HEALTH_NAMES.get(s["controller_health"], "?"),
+            "|".join(rp.feedback_flag_names(s["feedback_flags"])) or "none",
             "|".join(rp.fault_names(s["fault_status"])) or "none",
         ))
         self.rows += 1
@@ -439,17 +467,23 @@ def build_mission():
 
         Step("2. receive AUTONOMOUS",
              dict(drive_cmd=0, steer_cmd=0, **auto),
-             expect(mode=rp.MODE_AUTONOMOUS,
-                    cmd_status=rp.CMD_STATUS_APPLIED,
-                    # Red, per rule 1.e.ii, the moment the rover is
-                    # autonomous -- not once it starts moving.
-                    indicator_state=rp.INDICATOR_AUTONOMOUS)),
+             all_of(expect(mode=rp.MODE_AUTONOMOUS,
+                           cmd_status=rp.CMD_STATUS_APPLIED,
+                           # Red, per rule 1.e.ii, the moment the rover is
+                           # autonomous -- not once it starts moving.
+                           indicator_state=rp.INDICATOR_AUTONOMOUS,
+                           # v0.8: the controller names the producer it is
+                           # taking orders from, rather than the Jetson only
+                           # being able to assert it on the way out.
+                           cmd_source=rp.CMD_SOURCE_AUTONOMY),
+                    feedback_is_fresh())),
 
         Step("3. forward: speed rises, settles",
              dict(drive_cmd=FAST, steer_cmd=0, **auto),
              all_of(expect(cmd_status=rp.CMD_STATUS_APPLIED,
                            drive_applied=FAST, steer_applied=0),
-                    cruise_speed(cruise))),
+                    cruise_speed(cruise),
+                    feedback_is_fresh())),
 
         Step("4. change steering",
              dict(drive_cmd=FAST, steer_cmd=TURN, **auto),
@@ -498,13 +532,19 @@ def build_mission():
 # Every field the task's feedback loop requires, and where it rides.
 FEEDBACK_FIELDS = (
     "mode",               # current mode              (TELEM_STATE)
-    "drive_applied",      # accepted drive command    (TELEM_CMD_ECHO)
-    "steer_applied",      # accepted steering command (TELEM_CMD_ECHO)
-    "controller_health",  # controller-health state   (TELEM_STATE)
+    "cmd_source",         # active command source     (TELEM_FEEDBACK)
+    "drive_applied",      # commanded drive value     (TELEM_CMD_ECHO)
+    "enc_left",           # measured drive/encoder    (TELEM_DRIVE_L)
+    "enc_right",          # measured drive/encoder    (TELEM_DRIVE_R)
+    "steer_applied",      # commanded steering value  (TELEM_CMD_ECHO)
+    "steer_fb",           # measured steering value   (TELEM_DRIVE_L)
     "cmd_age_ms",         # command age               (TELEM_DRIVE_R)
+    "encoder_age_ms",     # encoder feedback age      (TELEM_FEEDBACK)
+    "steer_age_ms",       # steering feedback age     (TELEM_FEEDBACK)
+    "controller_health",  # controller-health state   (TELEM_STATE)
+    "cmd_status",         # STOP/abort state          (TELEM_CMD_ECHO)
     "fault_status",       # fault state               (TELEM_POWER)
-    "enc_left",           # measured drive            (TELEM_DRIVE_L)
-    "enc_right",          # measured drive            (TELEM_DRIVE_R)
+    "feedback_flags",     # stale-data state          (TELEM_FEEDBACK)
     "indicator_state",    # rear status light         (TELEM_STATE)
 )
 
@@ -627,6 +667,11 @@ def main():
                  rp.CTRL_HEALTH_NAMES.get(last["controller_health"], "?"),
                  last["cmd_age_ms"],
                  ",".join(rp.fault_names(last["fault_status"])) or "none"))
+        print("  source=%s  feedback age enc=%sms steer=%sms  flags=%s"
+              % (rp.CMD_SOURCE_NAMES.get(last["cmd_source"], "?"),
+                 last["encoder_age_ms"], last["steer_age_ms"],
+                 ",".join(rp.feedback_flag_names(last["feedback_flags"]))
+                 or "none"))
     print("snapshots assembled: %d" % report.snapshots_seen)
     print("recorded %d snapshots to %s" % (recorder.rows, recorder.path))
     print()

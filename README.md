@@ -16,7 +16,7 @@ autonomy and teleop commands are refused in each other's modes.
 
 | | |
 |---|---|
-| Protocol, safety logic, firmware | Implemented, **268 tests** passing |
+| Protocol, safety logic, firmware | Implemented, **327 tests** passing |
 | Cross-language codec | Pinned byte-for-byte, plus every validation predicate |
 | Autonomy → drive-stage loop (Task 4) | Closed and verified end to end (`make autonomy`) |
 | **Validated on real hardware** | **Not yet — see [Known gaps](#known-gaps)** |
@@ -33,7 +33,7 @@ than mocking them, so there is no dependency to manage.
 git clone https://github.com/schradivarius/URC-MCU-Jetson-Comm-Protocol.git
 cd URC-MCU-Jetson-Comm-Protocol
 
-make test      # 168 C++ tests + 100 host tests
+make test      # 214 C++ tests + 113 host tests
 make demo      # no-hardware message-exchange demonstration (Task 3)
 make autonomy  # mock autonomy stack driving the firmware (Task 4)
 ```
@@ -50,9 +50,13 @@ Two languages, because the two ends of the link are different machines:
 firmware/                    C++ — runs on the Teensy 4.1
   rover_firmware.cpp           hardware wiring ONLY (CAN, watchdog, pins)
   src/rover_config.h           every protocol + timing constant ─┐
-  src/rover_protocol.*         message definitions + codec      ─┤ pure C++,
-  src/rover_controller.*       command/safety state machine      │ no Arduino
-  src/rover_drive.*            drive/steering output stage      ─┘
+  src/rover_protocol.*         message definitions + codec       │
+  src/rover_controller.*       command/safety state machine      │ pure C++,
+  src/rover_drive.*            drive/steering output stage       │ no Arduino
+  src/rover_drive_sim.*        simulated drivetrain (lags)       │
+  src/rover_encoder.*          simulated wheel encoders          │
+  src/rover_steer_sim.*        simulated steering actuator       │
+  src/rover_feedback_faults.*  controlled failures of the above ─┘
 
 host/                        Python — runs on the Jetson
   rover_config.py              constants (pinned to rover_config.h)
@@ -68,9 +72,9 @@ tools/
   rover_sim.cpp                simulator: REAL controller + drive stage, fake plant
   golden_vectors.cpp           emits vectors for cross-language pinning
 
-tests/cpp/                   126 tests — firmware core
-tests/host/                  98 tests — config sync, golden vectors, integration,
-                                        the autonomy mission
+tests/cpp/                   214 tests — firmware core
+tests/host/                  113 tests — config sync, golden vectors, integration,
+                                        the autonomy mission, feedback failures
 ```
 
 The files under `firmware/src/` have **no Arduino dependency and no hardware
@@ -96,13 +100,18 @@ make test-host   # host side only — compiles the C++ core
 
 | Suite | Tests | Answers |
 |---|---:|---|
-| `tests/cpp/test_protocol.cpp` | 41 | Wire format, CRC-8, and every validation predicate |
-| `tests/cpp/test_controller.cpp` | 68 | **Does the rover stop when it should?** And: does it refuse a command from the wrong half of the stack? |
+| `tests/cpp/test_protocol.cpp` | 43 | Wire format, CRC-8, and every validation predicate |
+| `tests/cpp/test_controller.cpp` | 106 | **Does the rover stop when it should?** And: does it refuse a command from the wrong half of the stack? Does it report feedback it can no longer trust? |
 | `tests/cpp/test_drive.cpp` | 17 | Does a command become the right motor output — and never one it was told not to? |
-| `tests/host/test_config_sync.py` | 14 | Do the C++ and Python configs hold the same constants? |
-| `tests/host/test_golden_vectors.py` | 30 | Do C++ and Python agree byte-for-byte? |
-| `tests/host/test_integration.py` | 44 | Do both ends actually talk to each other? |
+| `tests/cpp/test_drive_sim.cpp` | 9 | Does the fake drivetrain lag the way a real one does, instead of teleporting? |
+| `tests/cpp/test_encoder.cpp` | 9 | Do the fake encoders count, wrap and go stale correctly? |
+| `tests/cpp/test_steer_sim.cpp` | 14 | Does simulated steering move *through* its range, and is the error signed the way a controller expects? |
+| `tests/cpp/test_feedback_faults.cpp` | 16 | When a sensor freezes, lies or runs late, is each one told from the others? |
+| `tests/host/test_config_sync.py` | 15 | Do the C++ and Python configs hold the same constants? |
+| `tests/host/test_golden_vectors.py` | 33 | Do C++ and Python agree byte-for-byte? |
+| `tests/host/test_integration.py` | 46 | Do both ends actually talk to each other? |
 | `tests/host/test_autonomy_mission.py` | 10 | Does an autonomy decision reach the drive stage — and would we notice if it stopped? |
+| `tests/host/test_feedback_failures.py` | 9 | Does a broken sensor reach the *Jetson* as the right fault — and does the rover keep driving, as Task 5 says it must for now? |
 
 Every test is named for the failure it prevents, so the reason it exists
 outlives anyone's memory of writing it. **Start a safety review at
@@ -144,6 +153,35 @@ implementation, rather than merely assumed to work:
 CI additionally builds with **clang** as a second toolchain and runs the suite
 under **UBSan + ASan**, because signed overflow in the encoder accumulators
 would be undefined behaviour rather than a wrap.
+
+### Breaking the sensors on purpose
+
+The simulator can run with one of its fake sensors broken, which is how the
+feedback-fault reporting is demonstrated rather than merely asserted:
+
+```bash
+make test-host                                   # builds tests/cpp/build/rover_sim
+tests/cpp/build/rover_sim --inject encoder-frozen
+```
+
+| `--inject` | What breaks |
+|---|---|
+| `encoder-frozen` | The left encoder repeats one plausible reading forever |
+| `steer-frozen` | Steering feedback stops moving |
+| `encoder-impossible` | A wheel RPM an order of magnitude past full scale |
+| `steer-impossible` | A steering position the actuator cannot reach |
+| `delayed` | Both channels report real readings 250 ms late |
+
+The injection is on the **simulated** side (`firmware/src/rover_feedback_faults.*`)
+and sits at the sensor boundary, so the firmware is identical either way and is
+told nothing — a fault it can only detect from the readings themselves, which
+is the only version of the test worth having. On the Teensy the equivalent is
+the `SIMULATED_FEEDBACK_FAULT` constant in `firmware/rover_firmware.cpp`, a
+build-time choice on purpose: nothing on the wire can break the rover's own
+sensors.
+
+Per Task 5 the rover **keeps driving** through all five — the condition is
+detected and reported, and choosing a safe state for it is Task 6.
 
 ---
 

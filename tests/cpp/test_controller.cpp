@@ -767,7 +767,7 @@ static void telemetry_paces_at_the_configured_period() {
 }
 
 static void the_telemetry_sequence_advances_once_per_cycle() {
-    // All four frames of a cycle must share one sequence number -- that is how
+    // All six frames of a cycle must share one sequence number -- that is how
     // the Jetson tells a coherent snapshot from one torn across two cycles.
     RoverController ctl = freshController();
     CHECK(ctl.telemetryDue());
@@ -1451,6 +1451,221 @@ static void a_stalled_drivetrain_leaves_the_gap_open() {
     CHECK(gap(ctl.getCommandedSteer(), ctl.getMeasuredSteer()) == 200);
 }
 
+
+// ---------------------------------------------------------------------------
+// v0.8: feedback age, staleness and the active command source.
+//
+// Task 5 asks for three things here and NOT a fourth: detect a stale or
+// impossible feedback value, flag it, and report it. Acting on it -- the safe
+// state -- is explicitly deferred to Task 6, so every test below checks that
+// effectiveStop() is unmoved.
+// ---------------------------------------------------------------------------
+
+// Refresh both channels at the current time, the way a healthy plant does.
+static void freshFeedback(RoverController& ctl) {
+    ctl.updateFeedback(g_now, true, g_now, true);
+}
+
+static void a_channel_that_never_reported_is_unknown_not_zero() {
+    RoverController ctl = freshController();
+    // Zero would read as "updated this instant", which is the one answer that
+    // is certainly wrong before anything has reported.
+    CHECK_EQ(ctl.encoderAgeMs(), FEEDBACK_AGE_UNKNOWN);
+    CHECK_EQ(ctl.steerAgeMs(), FEEDBACK_AGE_UNKNOWN);
+    CHECK(ctl.encoderStale());
+    CHECK(ctl.steerStale());
+    // Nothing to call impossible yet, so it is stale and not invalid.
+    CHECK(!ctl.encoderInvalid());
+    CHECK(!ctl.steerInvalid());
+}
+
+static void the_age_is_measured_from_the_last_update() {
+    RoverController ctl = freshController(1000);
+    freshFeedback(ctl);
+    CHECK_EQ(ctl.encoderAgeMs(), static_cast<uint16_t>(0));
+    advance(40);
+    CHECK_EQ(ctl.encoderAgeMs(), static_cast<uint16_t>(40));
+    CHECK_EQ(ctl.steerAgeMs(), static_cast<uint16_t>(40));
+    CHECK(!ctl.encoderStale());
+    CHECK(!ctl.steerStale());
+}
+
+// This is how a stuck sensor actually presents: the plant keeps being polled
+// and keeps handing back the SAME timestamp. The reading is still there and
+// still plausible; only its age gives it away.
+static void a_frozen_channel_goes_stale_while_the_other_stays_fresh() {
+    RoverController ctl = freshController(1000);
+    const uint32_t frozen_at = g_now;
+    freshFeedback(ctl);
+    for (uint32_t i = 0; i < 20; ++i) {
+        advance(10);
+        ctl.updateFeedback(frozen_at, true, g_now, true);
+    }
+    CHECK(ctl.encoderStale());
+    CHECK(!ctl.steerStale());
+    CHECK_EQ(ctl.encoderAgeMs(), static_cast<uint16_t>(200));
+    CHECK_EQ(ctl.steerAgeMs(), static_cast<uint16_t>(0));
+}
+
+static void staleness_trips_exactly_at_the_boundary() {
+    RoverController ctl = freshController(1000);
+    const uint32_t at = g_now;
+    freshFeedback(ctl);
+    advance(FEEDBACK_STALE_MS - 1);
+    CHECK(!ctl.encoderStale());
+    advance(1);
+    CHECK(ctl.encoderStale());
+    // And it clears the moment the channel reports again.
+    ctl.updateFeedback(g_now, true, g_now, true);
+    CHECK(!ctl.encoderStale());
+    (void)at;
+}
+
+static void the_age_is_correct_across_millis_wraparound() {
+    RoverController ctl = freshController(0xFFFFFFF0u);
+    freshFeedback(ctl);
+    advance(40);                       // wraps past zero
+    CHECK_EQ(ctl.encoderAgeMs(), static_cast<uint16_t>(40));
+    CHECK(!ctl.encoderStale());
+}
+
+static void a_very_old_reading_saturates_without_colliding_with_unknown() {
+    RoverController ctl = freshController(1000);
+    const uint32_t at = g_now;
+    freshFeedback(ctl);
+    advance(300000);                   // five minutes
+    ctl.updateFeedback(at, true, at, true);
+    CHECK_EQ(ctl.encoderAgeMs(), FEEDBACK_AGE_MAX);
+    // MAX, not UNKNOWN: "stopped reporting five minutes ago" and "never
+    // reported" are different faults and must not share a value.
+    CHECK(ctl.encoderAgeMs() != FEEDBACK_AGE_UNKNOWN);
+}
+
+static void an_impossible_reading_is_invalid_but_not_stale() {
+    RoverController ctl = freshController(1000);
+    ctl.updateFeedback(g_now, false, g_now, true);
+    CHECK(ctl.encoderInvalid());
+    CHECK(!ctl.encoderStale());        // perfectly fresh, and perfectly wrong
+    CHECK(!ctl.steerInvalid());
+}
+
+static void stale_and_invalid_reach_the_fault_word() {
+    RoverController ctl = freshController(1000);
+    sendControl(ctl, 400, 0, MODE_TELEOP, false);
+    freshFeedback(ctl);
+    CHECK((ctl.faultWord() & FAULT_STALE_FEEDBACK) == 0);
+    CHECK((ctl.faultWord() & FAULT_ENCODER_FAULT) == 0);
+    CHECK((ctl.faultWord() & FAULT_STEERING_FAULT) == 0);
+
+    const uint32_t at = g_now;
+    advance(FEEDBACK_STALE_MS);
+    ctl.updateFeedback(at, false, at, false);
+    CHECK((ctl.faultWord() & FAULT_STALE_FEEDBACK) != 0);
+    CHECK((ctl.faultWord() & FAULT_ENCODER_FAULT) != 0);
+    CHECK((ctl.faultWord() & FAULT_STEERING_FAULT) != 0);
+}
+
+// Task 5: "For now, only detect and report the stale condition." Task 6 owns
+// the response. If this test ever fails, someone has moved that line early.
+static void stale_feedback_does_not_stop_the_rover() {
+    RoverController ctl = freshController(1000);
+    sendControl(ctl, 400, 0, MODE_TELEOP, false);
+    freshFeedback(ctl);
+    CHECK(!ctl.effectiveStop());
+    const uint32_t at = g_now;
+    advance(FEEDBACK_STALE_MS + 50);
+    ctl.updateFeedback(at, false, at, false);
+    CHECK(!ctl.effectiveStop());
+    int16_t drive, steer;
+    ctl.commandedOutputs(drive, steer);
+    CHECK_EQ(drive, static_cast<int16_t>(400));
+    CHECK_EQ(ctl.activeMode(), MODE_TELEOP);
+}
+
+static void the_source_is_none_before_anybody_has_spoken() {
+    RoverController ctl = freshController();
+    CHECK_EQ(ctl.commandSource(), CMD_SOURCE_NONE);
+}
+
+static void the_source_names_the_producer_that_is_driving() {
+    RoverController ctl = freshController(1000);
+    sendControl(ctl, 400, 0, MODE_TELEOP, false, false, false, INDICATOR_OFF,
+                false, SRC_TELEOP);
+    CHECK_EQ(ctl.commandSource(), CMD_SOURCE_OPERATOR);
+    sendControl(ctl, 400, 0, MODE_AUTONOMOUS, false, false, false,
+                INDICATOR_OFF, false, SRC_AUTONOMY);
+    CHECK_EQ(ctl.commandSource(), CMD_SOURCE_AUTONOMY);
+}
+
+// The whole reason this is not just an echo of the from_autonomy bit.
+static void a_refused_source_is_not_an_active_source() {
+    RoverController ctl = freshController(1000);
+    sendControl(ctl, 400, 0, MODE_TELEOP, false, false, false, INDICATOR_OFF,
+                false, SRC_AUTONOMY);
+    CHECK_EQ(ctl.commandStatus(), CMD_STATUS_WRONG_SOURCE);
+    CHECK_EQ(ctl.commandSource(), CMD_SOURCE_NONE);
+}
+
+static void safe_has_no_owner_so_it_has_no_source() {
+    RoverController ctl = freshController(1000);
+    sendControl(ctl, 0, 0, MODE_SAFE, false, false, false, INDICATOR_OFF,
+                false, SRC_TELEOP);
+    CHECK_EQ(ctl.activeMode(), MODE_SAFE);
+    CHECK_EQ(ctl.commandSource(), CMD_SOURCE_NONE);
+}
+
+// A stale frame's source is as stale as the rest of it -- the same rule that
+// keeps c2LinkState() from vouching for a value it can no longer see.
+static void a_stale_source_is_not_reported() {
+    RoverController ctl = freshController(1000);
+    sendControl(ctl, 400, 0, MODE_TELEOP, false, false, false, INDICATOR_OFF,
+                false, SRC_TELEOP);
+    CHECK_EQ(ctl.commandSource(), CMD_SOURCE_OPERATOR);
+    advance(301);
+    CHECK(ctl.watchdogTripped());
+    CHECK_EQ(ctl.commandSource(), CMD_SOURCE_NONE);
+}
+
+static void the_feedback_frame_carries_what_the_accessors_say() {
+    RoverController ctl = freshController(1000);
+    sendControl(ctl, 400, 0, MODE_AUTONOMOUS, false, false, false,
+                INDICATOR_OFF, false, SRC_AUTONOMY);
+    const uint32_t at = g_now;
+    ctl.updateFeedback(at, true, at, false);
+    advance(FEEDBACK_STALE_MS + 10);
+    ctl.updateFeedback(at, true, g_now, false);
+
+    const TelemetryFeedback m = ctl.buildFeedback();
+    CHECK_EQ(m.encoder_age_ms, ctl.encoderAgeMs());
+    CHECK_EQ(m.steer_age_ms, ctl.steerAgeMs());
+    CHECK_EQ(m.cmd_source, ctl.commandSource());
+    CHECK((m.flags & FB_FLAG_ENCODER_STALE) != 0);
+    CHECK((m.flags & FB_FLAG_STEER_STALE) == 0);
+    CHECK((m.flags & FB_FLAG_STEER_INVALID) != 0);
+    CHECK((m.flags & FB_FLAGS_RESERVED_MASK) == 0);
+}
+
+static void the_feedback_frame_round_trips_on_the_wire() {
+    RoverController ctl = freshController(1000);
+    sendControl(ctl, 400, 0, MODE_AUTONOMOUS, false, false, false,
+                INDICATOR_OFF, false, SRC_AUTONOMY);
+    ctl.updateFeedback(g_now, true, g_now, true);
+    const TelemetryFeedback sent = ctl.buildFeedback();
+
+    uint8_t buf[8] = {0};
+    const uint8_t n = encodeTelemetryFeedback(sent, 77, buf);
+    CHECK_EQ(n, static_cast<uint8_t>(FRAME_DLC));
+
+    TelemetryFeedback got; uint8_t seq = 0;
+    CHECK_EQ(decodeTelemetryFeedback(CAN_ID_TELEM_FEEDBACK, buf, n, got, seq),
+             DECODE_OK);
+    CHECK_EQ(seq, static_cast<uint8_t>(77));
+    CHECK_EQ(got.encoder_age_ms, sent.encoder_age_ms);
+    CHECK_EQ(got.steer_age_ms, sent.steer_age_ms);
+    CHECK_EQ(got.cmd_source, sent.cmd_source);
+    CHECK_EQ(got.flags, sent.flags);
+}
+
 int main() {
     std::printf("test_controller\n");
     RUN_TEST(boots_stopped_and_safe);
@@ -1543,5 +1758,21 @@ int main() {
     RUN_TEST(measured_is_whatever_the_plant_last_reported);
     RUN_TEST(measured_follows_commanded_in_the_closed_loop);
     RUN_TEST(a_stalled_drivetrain_leaves_the_gap_open);
+    RUN_TEST(a_channel_that_never_reported_is_unknown_not_zero);
+    RUN_TEST(the_age_is_measured_from_the_last_update);
+    RUN_TEST(a_frozen_channel_goes_stale_while_the_other_stays_fresh);
+    RUN_TEST(staleness_trips_exactly_at_the_boundary);
+    RUN_TEST(the_age_is_correct_across_millis_wraparound);
+    RUN_TEST(a_very_old_reading_saturates_without_colliding_with_unknown);
+    RUN_TEST(an_impossible_reading_is_invalid_but_not_stale);
+    RUN_TEST(stale_and_invalid_reach_the_fault_word);
+    RUN_TEST(stale_feedback_does_not_stop_the_rover);
+    RUN_TEST(the_source_is_none_before_anybody_has_spoken);
+    RUN_TEST(the_source_names_the_producer_that_is_driving);
+    RUN_TEST(a_refused_source_is_not_an_active_source);
+    RUN_TEST(safe_has_no_owner_so_it_has_no_source);
+    RUN_TEST(a_stale_source_is_not_reported);
+    RUN_TEST(the_feedback_frame_carries_what_the_accessors_say);
+    RUN_TEST(the_feedback_frame_round_trips_on_the_wire);
     return testing::summary("test_controller");
 }

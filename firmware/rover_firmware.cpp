@@ -62,6 +62,8 @@
 #include "src/rover_drive.h"
 #include "src/rover_drive_sim.h"
 #include "src/rover_encoder.h"
+#include "src/rover_steer_sim.h"
+#include "src/rover_feedback_faults.h"
 #include "src/rover_protocol.h"
 
 using namespace rover;
@@ -139,13 +141,30 @@ static uint16_t g_boot_faults = 0;
 
 static DriveSim sim_plant;
 static SimulatedEncoder sim_enc_l, sim_enc_r;
-static int16_t sim_steer_fb  = 0;
+static SteerSim sim_steer;
+static FeedbackFaultInjector sim_faults;
+
+// Task 5's controlled feedback failures, for bench demonstrations. Set
+// this to FB_FAULT_ENCODER_FROZEN, FB_FAULT_STEER_FROZEN,
+// FB_FAULT_ENCODER_IMPOSSIBLE, FB_FAULT_STEER_IMPOSSIBLE or
+// FB_FAULT_DELAYED and reflash to watch the rover report it.
+//
+// A build-time constant, not a CONTROL field, ON PURPOSE: a way to break
+// the rover's own sensors from the Jetson is a weapon, not a feature, and
+// nothing on the competition course should be able to reach it. The host
+// simulator takes --inject instead, which is where the automated tests
+// drive it from.
+static const uint8_t SIMULATED_FEEDBACK_FAULT = FB_FAULT_NONE;
 
 struct SensorReading {
     int32_t  enc_left;
     int32_t  enc_right;
     int16_t  steer_fb;
     int16_t  measured_drive;  // mean wheel speed, CMD_MIN..CMD_MAX scale
+    uint32_t encoder_update_ms;  // clock at the last encoder change
+    uint32_t steer_update_ms;    // clock at the last steering change
+    bool     encoder_sane;       // the reading is one the hardware could give
+    bool     steer_sane;
     int16_t  current_ca;   // SIGNED centiamps  (1 cA = 10 mA)
     int16_t  voltage_cv;   // SIGNED centivolts (1 cV = 10 mV)
     uint16_t fault_bits;
@@ -171,13 +190,15 @@ static SensorReading readSensors(const DriveOutputs& out) {
         //   controller_health : CTRL_HEALTH_* from motor-driver telemetry,
         //                 which on a CAN bus arrives as its own messages
         r.enc_left = 0; r.enc_right = 0; r.steer_fb = 0; r.measured_drive = 0;
+        // No reading yet, so no timestamp to vouch for: the controller
+        // reports FEEDBACK_AGE_UNKNOWN until real sensors fill these in.
+        r.encoder_update_ms = millis(); r.steer_update_ms = millis();
+        r.encoder_sane = true; r.steer_sane = true;
         r.current_ca = 0; r.voltage_cv = 0; r.fault_bits = 0;
         r.controller_health = drive_stage.health();
         r.drive_applied = 0; r.steer_applied = 0;   // filled in by loop()
         return r;
     }
-
-    const int16_t target = out.steer_effort;
 
     // wrapI32 takes int64 and wraps explicitly. Letting an int32 counter
     // overflow would be UNDEFINED BEHAVIOUR in C++ -- not a wrap, not an
@@ -186,20 +207,40 @@ static SensorReading readSensors(const DriveOutputs& out) {
     sim_plant.update(out.left_effort, out.right_effort, out.energized, now_ms);
     sim_enc_l.update(scaledFromMps(sim_plant.left().measured_mps), now_ms);
     sim_enc_r.update(scaledFromMps(sim_plant.right().measured_mps), now_ms);
-
-    if (sim_steer_fb < target)      sim_steer_fb = min(target, (int16_t)(sim_steer_fb + 25));
-    else if (sim_steer_fb > target) sim_steer_fb = max(target, (int16_t)(sim_steer_fb - 25));
+    // Fed the STEERING STAGE's output, the same place the drive plant is
+    // fed from, so a real actuator replaces the module and nothing else.
+    sim_steer.update(out.steer_effort, now_ms);
 
     const int32_t effort_mag =
         (abs(out.left_effort) + abs(out.right_effort)) / 2;
 
-    r.enc_left   = sim_enc_l.feedback(now_ms).count;
+    // THE SENSOR BOUNDARY. Everything below reads ef/sf and nothing else,
+    // so an injected fault is wrong EVERYWHERE a real broken sensor would
+    // be -- in the echoed telemetry and the measured-vs-commanded feed too,
+    // not only in the freshness report. A no-op while
+    // SIMULATED_FEEDBACK_FAULT is FB_FAULT_NONE.
+    EncoderFeedback ef = sim_enc_l.feedback(now_ms);
+    SteerFeedback   sf = sim_steer.feedback(now_ms);
+    sim_faults.arm(SIMULATED_FEEDBACK_FAULT);
+    sim_faults.apply(ef, sf, now_ms);
+
+    r.enc_left   = ef.count;
+    // The right encoder is NOT injected: a wheel sensor dies on its own
+    // wheel, and the asymmetry against a healthy right encoder is part of
+    // what makes the fault recognisable on a dashboard.
     r.enc_right  = sim_enc_r.feedback(now_ms).count;
-    r.steer_fb   = sim_steer_fb;
+    r.steer_fb   = sf.measured;
     // The mean of the two wheels is the drive the rover actually delivered:
     // the mix is left = drive + steer, right = drive - steer.
     r.measured_drive = scaledFromMps(
         (sim_plant.left().measured_mps + sim_plant.right().measured_mps) / 2.0f);
+
+    r.encoder_update_ms = ef.last_update_ms;
+    r.steer_update_ms   = sf.last_update_ms;
+    // What the plant knows and the controller cannot: the range each of
+    // these units can physically take.
+    r.encoder_sane = ef.rpm >= -ENCODER_MAX_RPM && ef.rpm <= ENCODER_MAX_RPM;
+    r.steer_sane   = isValidCommand(sf.measured);
     r.current_ca = out.energized ? static_cast<int16_t>(effort_mag * 3 / 2) : 0;
     // Fake 24 V pack sagging a little under load.
     r.voltage_cv = static_cast<int16_t>(2400 - effort_mag / 40);
@@ -265,8 +306,8 @@ static uint16_t detectBootFault() {
 // Telemetry
 // ---------------------------------------------------------------------------
 
-// Four frames per cycle, because each must fit Classic CAN's 8 bytes once the
-// per-frame sequence number and CRC are accounted for. All four carry the SAME
+// Six frames per cycle, because each must fit Classic CAN's 8 bytes once the
+// per-frame sequence number and CRC are accounted for. All six carry the SAME
 // sequence number, which is how the Jetson tells a coherent snapshot from one
 // torn across two cycles. See rover_protocol.h for why not one CAN FD frame.
 static void sendTelemetry(const SensorReading& s) {
@@ -305,6 +346,15 @@ static void sendTelemetry(const SensorReading& s) {
     TelemetryCmdEcho ce = ctl->buildCmdEcho(s.drive_applied, s.steer_applied);
     frame.id  = CAN_ID_TELEM_CMD_ECHO;
     frame.len = encodeTelemetryCmdEcho(ce, seq, frame.buf);
+    Can.write(frame);
+
+    // v0.8: how old each feedback channel is, whether the controller still
+    // believes it, and which producer owns the live command. The echo above
+    // says what the rover was TOLD; this says how much to trust what it is
+    // reporting back.
+    TelemetryFeedback fb = ctl->buildFeedback();
+    frame.id  = CAN_ID_TELEM_FEEDBACK;
+    frame.len = encodeTelemetryFeedback(fb, seq, frame.buf);
     Can.write(frame);
 }
 
@@ -375,6 +425,8 @@ void loop() {
     SensorReading s = readSensors(out);
     ctl->updateFaults(s.fault_bits, s.controller_health);
     ctl->updateMeasured(s.measured_drive, s.steer_fb);
+    ctl->updateFeedback(s.encoder_update_ms, s.encoder_sane,
+                        s.steer_update_ms,   s.steer_sane);
     // Not sensor readings, so they are filled in here rather than inside
     // readSensors(): they are what the controller AUTHORISED, which is what
     // the acknowledgement frame is about.

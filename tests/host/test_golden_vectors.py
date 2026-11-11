@@ -208,9 +208,13 @@ class TestFrameAgreement(GoldenBase):
             return p.encode_telemetry_cmd_echo(
                 n[0], n[1], n[2],
                 p.pack_cmd_status(n[3], n[4], bool(n[5])), seq=n[6])
+        if kind == "FEEDBACK":
+            return p.encode_telemetry_feedback(n[0], n[1], n[2], n[3],
+                                               seq=n[4])
         self.fail("unknown vector kind %r" % kind)
 
-    FRAME_KINDS = ("CONTROL", "DRIVE_L", "DRIVE_R", "POWER", "STATE", "CMD_ECHO")
+    FRAME_KINDS = ("CONTROL", "DRIVE_L", "DRIVE_R", "POWER", "STATE",
+                   "CMD_ECHO", "FEEDBACK")
 
     def test_every_frame_encodes_identically(self):
         checked = 0
@@ -233,6 +237,7 @@ class TestFrameAgreement(GoldenBase):
             "POWER":   lambda f: p.decode_telemetry_power(f),
             "STATE":   lambda f: p.decode_telemetry_state(f),
             "CMD_ECHO": lambda f: p.decode_telemetry_cmd_echo(f),
+            "FEEDBACK": lambda f: p.decode_telemetry_feedback(f),
         }
         for kind in self.FRAME_KINDS:
             for _, args, frame_hex in self.rowsOf(kind):
@@ -241,6 +246,32 @@ class TestFrameAgreement(GoldenBase):
                                  "Python rejected a valid C++ %s frame (%s): %s"
                                  % (kind, args, p.DECODE_NAMES[result]))
                 self.assertIsNotNone(decoded)
+
+    def test_the_feedback_frame_unpacks_to_what_cpp_packed(self):
+        sources, flagsets = set(), set()
+        for _, args, frame_hex in self.rowsOf("FEEDBACK"):
+            n = [int(a) for a in args.split(",")]
+            _, decoded = p.decode_telemetry_feedback(bytes.fromhex(frame_hex))
+            self.assertEqual(decoded["encoder_age_ms"], n[0])
+            self.assertEqual(decoded["steer_age_ms"], n[1])
+            self.assertEqual(decoded["cmd_source"], n[2])
+            self.assertEqual(decoded["feedback_flags"], n[3])
+            self.assertEqual(decoded["seq"], n[4])
+            self.assertEqual(decoded["encoder_stale"],
+                             bool(n[3] & p.FB_FLAG_ENCODER_STALE))
+            self.assertEqual(decoded["steer_stale"],
+                             bool(n[3] & p.FB_FLAG_STEER_STALE))
+            self.assertEqual(decoded["encoder_invalid"],
+                             bool(n[3] & p.FB_FLAG_ENCODER_INVALID))
+            self.assertEqual(decoded["steer_invalid"],
+                             bool(n[3] & p.FB_FLAG_STEER_INVALID))
+            sources.add(n[2])
+            flagsets.add(n[3])
+        # A vector set that never varies these proves nothing about them.
+        self.assertEqual(sources, {p.CMD_SOURCE_NONE, p.CMD_SOURCE_OPERATOR,
+                                   p.CMD_SOURCE_AUTONOMY})
+        self.assertIn(0, flagsets)
+        self.assertIn(p.FB_FLAGS_MASK, flagsets)
 
     def test_sequence_number_survives_the_round_trip(self):
         for _, args, frame_hex in self.rowsOf("CONTROL"):
