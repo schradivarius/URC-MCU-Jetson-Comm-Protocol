@@ -37,6 +37,7 @@ SIM_SOURCES = [
     protocol_root.firmware_src("rover_drive_sim.cpp"),
     protocol_root.firmware_src("rover_encoder.cpp"),
     protocol_root.firmware_src("rover_steer_sim.cpp"),
+    protocol_root.firmware_src("rover_feedback_faults.cpp"),
 ]
 # Headers count too: a constant changed only in rover_config.h must still
 # rebuild the simulator, or the tests run against stale message sizes.
@@ -44,7 +45,7 @@ SIM_HEADERS = [
     protocol_root.firmware_src(name)
     for name in ("rover_config.h", "rover_protocol.h", "rover_controller.h",
                  "rover_drive.h", "rover_drive_sim.h", "rover_encoder.h",
-                 "rover_steer_sim.h")
+                 "rover_steer_sim.h", "rover_feedback_faults.h")
 ]
 SIM_BINARY = os.path.join(protocol_root.build_dir(), "rover_sim")
 
@@ -87,9 +88,15 @@ class SimLink:
     sitting in userspace waiting. That silently drops telemetry.
     """
 
-    def __init__(self):
+    def __init__(self, inject=None):
+        # `inject` arms one of the simulated feedback failures in the
+        # PLANT (see firmware/src/rover_feedback_faults.h). The firmware
+        # is identical either way; only the fake sensors misbehave.
+        argv = [build_sim()]
+        if inject:
+            argv += ["--inject", inject]
         self.proc = subprocess.Popen(
-            [build_sim()], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             text=True, bufsize=1)
         self._frames = queue.Queue()
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
@@ -129,6 +136,13 @@ class SimLink:
         except subprocess.TimeoutExpired:
             self.proc.kill()
         self._reader.join(timeout=1)
+        # The reader thread is finished with stdout by now, so closing it here
+        # is safe -- and necessary: a process that opens a link per mission and
+        # only ever closed stdin leaks a file descriptor each time.
+        try:
+            self.proc.stdout.close()
+        except Exception:
+            pass
 
 
 class SocketCanLink:

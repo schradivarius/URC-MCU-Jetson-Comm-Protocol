@@ -63,6 +63,7 @@
 #include "src/rover_drive_sim.h"
 #include "src/rover_encoder.h"
 #include "src/rover_steer_sim.h"
+#include "src/rover_feedback_faults.h"
 #include "src/rover_protocol.h"
 
 using namespace rover;
@@ -141,6 +142,19 @@ static uint16_t g_boot_faults = 0;
 static DriveSim sim_plant;
 static SimulatedEncoder sim_enc_l, sim_enc_r;
 static SteerSim sim_steer;
+static FeedbackFaultInjector sim_faults;
+
+// Task 5's controlled feedback failures, for bench demonstrations. Set
+// this to FB_FAULT_ENCODER_FROZEN, FB_FAULT_STEER_FROZEN,
+// FB_FAULT_ENCODER_IMPOSSIBLE, FB_FAULT_STEER_IMPOSSIBLE or
+// FB_FAULT_DELAYED and reflash to watch the rover report it.
+//
+// A build-time constant, not a CONTROL field, ON PURPOSE: a way to break
+// the rover's own sensors from the Jetson is a weapon, not a feature, and
+// nothing on the competition course should be able to reach it. The host
+// simulator takes --inject instead, which is where the automated tests
+// drive it from.
+static const uint8_t SIMULATED_FEEDBACK_FAULT = FB_FAULT_NONE;
 
 struct SensorReading {
     int32_t  enc_left;
@@ -200,16 +214,27 @@ static SensorReading readSensors(const DriveOutputs& out) {
     const int32_t effort_mag =
         (abs(out.left_effort) + abs(out.right_effort)) / 2;
 
-    r.enc_left   = sim_enc_l.feedback(now_ms).count;
+    // THE SENSOR BOUNDARY. Everything below reads ef/sf and nothing else,
+    // so an injected fault is wrong EVERYWHERE a real broken sensor would
+    // be -- in the echoed telemetry and the measured-vs-commanded feed too,
+    // not only in the freshness report. A no-op while
+    // SIMULATED_FEEDBACK_FAULT is FB_FAULT_NONE.
+    EncoderFeedback ef = sim_enc_l.feedback(now_ms);
+    SteerFeedback   sf = sim_steer.feedback(now_ms);
+    sim_faults.arm(SIMULATED_FEEDBACK_FAULT);
+    sim_faults.apply(ef, sf, now_ms);
+
+    r.enc_left   = ef.count;
+    // The right encoder is NOT injected: a wheel sensor dies on its own
+    // wheel, and the asymmetry against a healthy right encoder is part of
+    // what makes the fault recognisable on a dashboard.
     r.enc_right  = sim_enc_r.feedback(now_ms).count;
-    r.steer_fb   = sim_steer.feedback(now_ms).measured;
+    r.steer_fb   = sf.measured;
     // The mean of the two wheels is the drive the rover actually delivered:
     // the mix is left = drive + steer, right = drive - steer.
     r.measured_drive = scaledFromMps(
         (sim_plant.left().measured_mps + sim_plant.right().measured_mps) / 2.0f);
 
-    const EncoderFeedback ef = sim_enc_l.feedback(now_ms);
-    const SteerFeedback   sf = sim_steer.feedback(now_ms);
     r.encoder_update_ms = ef.last_update_ms;
     r.steer_update_ms   = sf.last_update_ms;
     // What the plant knows and the controller cannot: the range each of
