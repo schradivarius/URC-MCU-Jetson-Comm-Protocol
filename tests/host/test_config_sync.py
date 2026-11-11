@@ -25,15 +25,15 @@ import rover_protocol as rp  # noqa: E402
 
 # Resolved, not derived from __file__: this test's whole job is to pin the
 # Python constants against the C++ ones, and it can only do that if it reads
-# the header belonging to the firmware can_link.py actually compiles. Deriving
-# it locally while can_link compiled an overridden checkout is how this suite
+# the header belonging to the firmware sim_link.py actually compiles. Deriving
+# it locally while sim_link compiled an overridden checkout is how this suite
 # once passed over a PROTOCOL_VERSION mismatch.
 HEADER_PATH = protocol_root.firmware_src("rover_config.h")
 
 # Python name -> C++ name, for every constant that exists on both sides.
 SHARED = {
     "PROTOCOL_VERSION":      "PROTOCOL_VERSION",
-    "CAN_BITRATE_HZ":        "CAN_BITRATE_HZ",
+    "SERIAL_BAUD_HZ":        "SERIAL_BAUD_HZ",
     "WATCHDOG_TIMEOUT_MS":   "DEFAULT_WATCHDOG_TIMEOUT_MS",
     "TELEMETRY_PERIOD_MS":   "DEFAULT_TELEMETRY_PERIOD_MS",
     "LINK_DEGRADED_HOLD_MS": "LINK_DEGRADED_HOLD_MS",

@@ -36,7 +36,7 @@ import unittest
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(REPO, "host"))
 
-import can_link  # noqa: E402
+import sim_link  # noqa: E402
 import rover_protocol as rp  # noqa: E402
 from jetson_test import JetsonLink  # noqa: E402
 
@@ -53,7 +53,7 @@ class InjectionFixture(unittest.TestCase):
 
     def snapshot_with(self, inject, run_s=RUN_S):
         try:
-            link = can_link.SimLink(inject=inject)
+            link = sim_link.SimLink(inject=inject)
         except RuntimeError as exc:
             self.skipTest(str(exc))
         try:
@@ -221,7 +221,7 @@ class TestInjectionIsFailClosed(unittest.TestCase):
 
     def test_an_unknown_injection_name_is_refused(self):
         try:
-            sim = can_link.build_sim()
+            sim = sim_link.build_sim()
         except RuntimeError as exc:
             self.skipTest(str(exc))
         done = subprocess.run([sim, "--inject", "encoder-frozzen"],
@@ -237,7 +237,7 @@ class TestInjectionIsFailClosed(unittest.TestCase):
         other way round, means a documented failure cannot actually be run.
         """
         try:
-            sim = can_link.build_sim()
+            sim = sim_link.build_sim()
         except RuntimeError as exc:
             self.skipTest(str(exc))
         header = os.path.join(REPO, "firmware", "src", "rover_feedback_faults.cpp")

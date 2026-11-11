@@ -55,7 +55,6 @@
 
 #include <Arduino.h>
 
-#include <FlexCAN_T4.h>
 #include <Watchdog_t4.h>
 
 #include "src/rover_controller.h"
@@ -65,6 +64,7 @@
 #include "src/rover_steer_sim.h"
 #include "src/rover_feedback_faults.h"
 #include "src/rover_protocol.h"
+#include "src/rover_serial.h"
 
 using namespace rover;
 
@@ -117,10 +117,7 @@ static const int PWM_RESOLUTION_BITS = 12;
 // wired in. See readSensors() for where the real code goes.
 static const bool SIMULATE_SENSORS = true;
 
-// CAN3 is the FD-capable bus on Teensy 4.1. Classic frames are used here so
-// the protocol also runs on CAN1/CAN2 and alongside Classic-only motor
-// controllers; switching this to CAN1 or CAN2 needs no other change.
-FlexCAN_T4<CAN3, RX_SIZE_256, TX_SIZE_16> Can;
+static SerialFrameReader link_reader;
 WDT_T4<WDT1> wdt;
 
 static RoverController* ctl = nullptr;
@@ -306,56 +303,48 @@ static uint16_t detectBootFault() {
 // Telemetry
 // ---------------------------------------------------------------------------
 
-// Six frames per cycle, because each must fit Classic CAN's 8 bytes once the
-// per-frame sequence number and CRC are accounted for. All six carry the SAME
-// sequence number, which is how the Jetson tells a coherent snapshot from one
-// torn across two cycles. See rover_protocol.h for why not one CAN FD frame.
+static void linkPoll() {
+    int pending = Serial.available();
+    while (pending-- > 0) {
+        const int in = Serial.read();
+        if (in < 0) break;
+        if (link_reader.feed(static_cast<uint8_t>(in))) {
+            ctl->ingestFrame(link_reader.frameId(), link_reader.framePayload(),
+                             static_cast<uint8_t>(link_reader.framePayloadLen()));
+        }
+    }
+}
+
+static void linkSend(uint32_t id, const uint8_t* buf, uint8_t len) {
+    uint8_t encoded[SERIAL_ENCODED_MAX];
+    const size_t n = encodeSerialFrame(id, buf, len, encoded, sizeof(encoded));
+    if (n == 0) return;
+    if (Serial.availableForWrite() < static_cast<int>(n)) return;
+    Serial.write(encoded, n);
+}
+
 static void sendTelemetry(const SensorReading& s) {
     const uint8_t seq = ctl->telemetrySeq();
-    CAN_message_t frame;
+    uint8_t buf[FRAME_DLC];
 
     TelemetryDriveL dl = ctl->buildDriveL(s.enc_left, s.steer_fb);
-    frame.id  = CAN_ID_TELEM_DRIVE_L;
-    frame.len = encodeTelemetryDriveL(dl, seq, frame.buf);
-    Can.write(frame);
+    linkSend(CAN_ID_TELEM_DRIVE_L, buf, encodeTelemetryDriveL(dl, seq, buf));
 
     TelemetryDriveR dr = ctl->buildDriveR(s.enc_right);
-    frame.id  = CAN_ID_TELEM_DRIVE_R;
-    frame.len = encodeTelemetryDriveR(dr, seq, frame.buf);
-    Can.write(frame);
+    linkSend(CAN_ID_TELEM_DRIVE_R, buf, encodeTelemetryDriveR(dr, seq, buf));
 
     TelemetryPower pw =
         ctl->buildPower(s.current_ca, s.voltage_cv, s.fault_bits, g_boot_faults);
-    frame.id  = CAN_ID_TELEM_POWER;
-    frame.len = encodeTelemetryPower(pw, seq, frame.buf);
-    Can.write(frame);
+    linkSend(CAN_ID_TELEM_POWER, buf, encodeTelemetryPower(pw, seq, buf));
 
-    // c2_link comes from the c2_lost bit the Jetson forwards, via
-    // c2LinkState(). It is deliberately NOT derived from the Jetson link --
-    // the two are separate links and must never be treated as equivalent --
-    // and it reads LINK_NOT_REPORTED while that bit is absent or stale, which
-    // is an honest "we do not know" rather than a misleading LINK_OK.
     TelemetryState st = ctl->buildState(s.controller_health);
-    frame.id  = CAN_ID_TELEM_STATE;
-    frame.len = encodeTelemetryState(st, seq, frame.buf);
-    Can.write(frame);
+    linkSend(CAN_ID_TELEM_STATE, buf, encodeTelemetryState(st, seq, buf));
 
-    // The acknowledgement: what the controller accepted, which frame it came
-    // from, and why it is or is not being acted on. This is what lets the
-    // Jetson tell "my command got through" from "the rover is moving".
     TelemetryCmdEcho ce = ctl->buildCmdEcho(s.drive_applied, s.steer_applied);
-    frame.id  = CAN_ID_TELEM_CMD_ECHO;
-    frame.len = encodeTelemetryCmdEcho(ce, seq, frame.buf);
-    Can.write(frame);
+    linkSend(CAN_ID_TELEM_CMD_ECHO, buf, encodeTelemetryCmdEcho(ce, seq, buf));
 
-    // v0.8: how old each feedback channel is, whether the controller still
-    // believes it, and which producer owns the live command. The echo above
-    // says what the rover was TOLD; this says how much to trust what it is
-    // reporting back.
     TelemetryFeedback fb = ctl->buildFeedback();
-    frame.id  = CAN_ID_TELEM_FEEDBACK;
-    frame.len = encodeTelemetryFeedback(fb, seq, frame.buf);
-    Can.write(frame);
+    linkSend(CAN_ID_TELEM_FEEDBACK, buf, encodeTelemetryFeedback(fb, seq, buf));
 }
 
 // ---------------------------------------------------------------------------
@@ -375,17 +364,8 @@ void setup() {
         analogWrite(pin, pulseToDuty(PWM_NEUTRAL_US));
     }
 
-    Serial.begin(115200);                   // USB console, for diagnostics only
+    Serial.begin(SERIAL_BAUD_HZ);
     g_boot_faults = detectBootFault();
-
-    Can.begin();
-    Can.setBaudRate(CAN_BITRATE_HZ);
-    // Accept only the Jetson's CONTROL id. Filtering in hardware keeps
-    // motor-controller and payload traffic on a shared bus from ever reaching
-    // the CPU, which matters far more at 1 Mbps than at 20 Hz.
-    Can.setMBFilter(REJECT_ALL);
-    Can.setMBFilter(MB0, CAN_ID_CONTROL);
-    Can.enableMBInterrupts();
 
     static RoverController controller(millis, DEFAULT_WATCHDOG_TIMEOUT_MS,
                                       DEFAULT_TELEMETRY_PERIOD_MS);
@@ -398,20 +378,12 @@ void setup() {
     wdt_config.trigger = (HW_WATCHDOG_MS / 1000.0) / 2.0;
     wdt_config.timeout = HW_WATCHDOG_MS / 1000.0;
     wdt.begin(wdt_config);
-
-    Serial.printf("rover firmware up: CAN3 @ %lu bps, hw watchdog %lu ms%s\n",
-                  (unsigned long)CAN_BITRATE_HZ, (unsigned long)HW_WATCHDOG_MS,
-                  g_boot_faults ? ", RECOVERED FROM WATCHDOG RESET" : "");
 }
 
 void loop() {
     wdt.feed();
 
-    // Drain everything waiting. read() returns false when the queue is empty.
-    CAN_message_t rx;
-    while (Can.read(rx)) {
-        ctl->ingestFrame(rx.id, rx.buf, rx.len);
-    }
+    linkPoll();
 
     // The Task 4 chain, in order: the frame has been validated and the mode
     // and authority checked above; the controller now says what may be
@@ -435,7 +407,7 @@ void loop() {
     setMotorOutputs(out);
 
     if (ctl->telemetryDue()) {
-        sendTelemetry(s);
+        if (Serial) sendTelemetry(s);
         digitalWriteFast(LED_PIN, !digitalReadFast(LED_PIN));
     }
 }

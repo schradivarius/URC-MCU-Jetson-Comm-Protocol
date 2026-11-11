@@ -3,8 +3,7 @@
 autonomy_sim.py -- a fake autonomy stack driving the real firmware.
 
     python3 host/autonomy_sim.py --mock            # against the C++ simulator
-    python3 host/autonomy_sim.py --channel vcan0   # against a virtual CAN bus
-    python3 host/autonomy_sim.py --channel can0    # against the real Teensy
+    python3 host/autonomy_sim.py --port /dev/ttyACM0 # against the real Teensy
 
 WHAT THIS IS FOR
     Task 3 proved a Jetson command can reach the controller intact. This
@@ -43,7 +42,7 @@ import os
 import sys
 import time
 
-# can_link, rover_protocol, jetson_test and rover_config belong to the protocol
+# sim_link, rover_protocol, jetson_test and rover_config belong to the protocol
 # repository, not to the autonomy program. In a shared checkout they sit right
 # beside this file; when the autonomy program lives in a repository of its own,
 # ROVER_PROTOCOL_ROOT names the protocol checkout they live in. Importing them
@@ -56,10 +55,10 @@ if _PROTOCOL_ROOT:
 else:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import can_link  # noqa: E402
+import sim_link  # noqa: E402
 import rover_protocol as rp  # noqa: E402
 from jetson_test import JetsonLink, open_link  # noqa: E402
-from rover_config import CONTROL_RATE_HZ  # noqa: E402
+from rover_config import CONTROL_RATE_HZ, SERIAL_BAUD_HZ  # noqa: E402
 
 # Half the sequence space. A snapshot's ack_seq counts as "at or after" the
 # step's first frame when it is within this distance ahead, which is correct
@@ -443,12 +442,12 @@ def main():
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--mock", action="store_true",
                     help="run against the compiled C++ simulator (no hardware)")
-    ap.add_argument("--channel", help="CAN interface, e.g. can0 or vcan0")
-    ap.add_argument("--bitrate", type=int, default=500000)
+    ap.add_argument("--port", help="serial port, e.g. /dev/ttyACM0 or COM5")
+    ap.add_argument("--baud", type=int, default=SERIAL_BAUD_HZ)
     args = ap.parse_args()
 
-    if not args.mock and not args.channel:
-        print("Specify --mock for the simulator, or --channel can0 for a real bus.",
+    if not args.mock and not args.port:
+        print("Specify --mock for the simulator, or --port /dev/ttyACM0 for the Teensy.",
               file=sys.stderr)
         return 1
 

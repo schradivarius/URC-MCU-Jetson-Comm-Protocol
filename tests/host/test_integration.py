@@ -24,7 +24,7 @@ import unittest
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(REPO, "host"))
 
-import can_link  # noqa: E402
+import sim_link  # noqa: E402
 import rover_protocol as rp  # noqa: E402
 from jetson_test import JetsonLink  # noqa: E402
 
@@ -32,7 +32,7 @@ from jetson_test import JetsonLink  # noqa: E402
 class RoverFixture(unittest.TestCase):
     def setUp(self):
         try:
-            self.link = can_link.SimLink()
+            self.link = sim_link.SimLink()
         except RuntimeError as exc:
             self.skipTest(str(exc))
         self.jl = JetsonLink(self.link)
@@ -591,7 +591,7 @@ class TestDriveStage(RoverFixture):
 
 
 class TestProtocolRootOverride(unittest.TestCase):
-    """Where can_link looks for the firmware it compiles.
+    """Where sim_link looks for the firmware it compiles.
 
     The autonomy program is going to live in its own repository, so the Jetson
     code has to be able to point at a checkout of the protocol repository
@@ -601,7 +601,7 @@ class TestProtocolRootOverride(unittest.TestCase):
     """
 
     SNIPPET = ("import sys; sys.path.insert(0, %r);"
-               " import can_link; print(can_link.REPO)")
+               " import sim_link; print(sim_link.REPO)")
 
     def _run(self, snippet, env_root=None, cwd=None, argv=None):
         env = dict(os.environ)
@@ -623,7 +623,7 @@ class TestProtocolRootOverride(unittest.TestCase):
         # has the right shape, which is also what a protocol checkout inside a
         # separate autonomy repository looks like.
         snippet = (self.SNIPPET % os.path.join(REPO, "host")) + \
-            "; print(can_link.build_sim())"
+            "; print(sim_link.build_sim())"
         with tempfile.TemporaryDirectory() as elsewhere:
             for name in ("firmware", "tools"):
                 os.symlink(os.path.join(REPO, name),
@@ -644,7 +644,7 @@ class TestProtocolRootOverride(unittest.TestCase):
         # pointed at. The message has to name the file AND the variable, or the
         # next person edits the wrong thing.
         snippet = (self.SNIPPET % os.path.join(REPO, "host")) + \
-            "; can_link.build_sim()"
+            "; sim_link.build_sim()"
         with tempfile.TemporaryDirectory() as empty:
             done = self._run(snippet, env_root=empty, cwd="/")
         self.assertNotEqual(done.returncode, 0)
@@ -653,7 +653,7 @@ class TestProtocolRootOverride(unittest.TestCase):
         self.assertIn("ROVER_PROTOCOL_ROOT", done.stderr)
 
     def test_the_pinning_follows_the_firmware_that_is_actually_compiled(self):
-        # The regression test for a real bug. When only can_link.py honoured the
+        # The regression test for a real bug. When only sim_link.py honoured the
         # override, the integration suite drove the FOREIGN firmware while
         # test_config_sync.py and test_golden_vectors.py read the LOCAL headers.
         # The whole host suite then reported OK against a firmware declaring a
@@ -688,7 +688,7 @@ class TestProtocolRootOverride(unittest.TestCase):
         # looks perfectly good, so the sources are checked BEFORE the staleness
         # comparison rather than after it.
         snippet = (self.SNIPPET % os.path.join(REPO, "host")) + \
-            "; can_link.build_sim()"
+            "; sim_link.build_sim()"
         with tempfile.TemporaryDirectory() as fake:
             build = os.path.join(fake, "tests", "cpp", "build")
             os.makedirs(build)

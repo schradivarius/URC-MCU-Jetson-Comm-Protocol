@@ -1,16 +1,13 @@
 """
-can_link.py -- the Jetson's CAN interface, with two backends.
+sim_link.py -- the firmware simulator backend.
 
-  SimLink  : spawns tools/rover_sim, the REAL C++ controller compiled natively,
-             and exchanges frames over a pipe. No hardware, no CAN drivers, and
-             crucially no second implementation of the safety logic.
-  SocketCanLink : python-can on a real interface (can0, or vcan0 for a Linux
-             virtual bus). Imported lazily so the sim path needs no install.
-
-Both expose the same two calls, so jetson_test.py does not know or care which
-it is talking to:
-    send(can_id, payload_bytes)
-    recv() -> list of (can_id, payload_bytes) received since the last call
+SimLink spawns tools/rover_sim, the REAL C++ controller compiled natively, and
+exchanges frames over a pipe. No hardware, and crucially no second
+implementation of the safety logic. The real-hardware backend is
+serial_link.SerialLink; both expose the same calls:
+    send(msg_id, payload_bytes)
+    recv() -> list of (msg_id, payload_bytes) received since the last call
+    close()
 """
 
 import os
@@ -22,7 +19,6 @@ import threading
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import protocol_root  # noqa: E402
-from rover_config import CAN_BITRATE_HZ  # noqa: E402
 
 # Resolved through protocol_root so that every reader of firmware/src -- this
 # module, the config-sync test and the golden-vector test -- agrees on which
@@ -143,27 +139,3 @@ class SimLink:
             self.proc.stdout.close()
         except Exception:
             pass
-
-
-class SocketCanLink:
-    """python-can on a real (or virtual) CAN interface."""
-
-    def __init__(self, channel="can0", bitrate=CAN_BITRATE_HZ):
-        import can   # lazy: the sim path must not require python-can
-        self.bus = can.Bus(channel=channel, interface="socketcan", bitrate=bitrate)
-
-    def send(self, can_id, payload):
-        import can
-        self.bus.send(can.Message(arbitration_id=can_id, data=payload,
-                                  is_extended_id=False))
-
-    def recv(self):
-        frames = []
-        while True:
-            msg = self.bus.recv(timeout=0)
-            if msg is None:
-                return frames
-            frames.append((msg.arbitration_id, bytes(msg.data)))
-
-    def close(self):
-        self.bus.shutdown()

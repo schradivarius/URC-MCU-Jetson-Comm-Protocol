@@ -20,7 +20,7 @@ here anyway, because "one place to change a timeout" is the point of the file.
 PROTOCOL_VERSION = 8
 
 # --- link ---
-CAN_BITRATE_HZ = 500000       # 500 kbps; every node must match
+SERIAL_BAUD_HZ = 115200       # must match firmware/src/rover_config.h
 
 # --- timing ---
 WATCHDOG_TIMEOUT_MS = 300     # controller stops after this long without CONTROL

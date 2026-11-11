@@ -26,7 +26,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import can_link  # noqa: E402
+import sim_link  # noqa: E402
 import rover_protocol as rp  # noqa: E402
 from jetson_test import JetsonLink  # noqa: E402
 
@@ -72,7 +72,7 @@ def main():
     print("REAL compiled firmware safety logic from firmware/src/)")
     print("=" * 78)
 
-    link = can_link.SimLink()
+    link = sim_link.SimLink()
     jl = JetsonLink(link)
     t0 = time.monotonic()
     try:

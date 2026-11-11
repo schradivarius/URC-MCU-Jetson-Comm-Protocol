@@ -29,7 +29,7 @@ namespace rover {
 static const uint8_t PROTOCOL_VERSION = 8;
 
 // --- Link ------------------------------------------------------------------
-static const uint32_t CAN_BITRATE_HZ = 500000;   // 500 kbps; every node must match
+static const uint32_t SERIAL_BAUD_HZ = 115200;   // host must ask for the same
 
 // --- Timing ----------------------------------------------------------------
 static const uint32_t DEFAULT_WATCHDOG_TIMEOUT_MS = 300;   // no valid CONTROL -> stop

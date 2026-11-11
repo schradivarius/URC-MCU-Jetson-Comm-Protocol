@@ -30,14 +30,14 @@ if _OVERRIDE:
 sys.path.insert(0, os.path.join(REPO, "host"))
 
 import autonomy_sim as mission  # noqa: E402
-import can_link  # noqa: E402
+import sim_link  # noqa: E402
 import rover_protocol as rp  # noqa: E402
 
 
 class MissionFixture(unittest.TestCase):
     def setUp(self):
         try:
-            self.link = can_link.SimLink()
+            self.link = sim_link.SimLink()
         except RuntimeError as exc:
             self.skipTest(str(exc))
 

@@ -1,7 +1,7 @@
 """protocol_root.py -- where the firmware sources live, resolved in one place.
 
 One function, in one file, because the alternative is what actually happened:
-can_link.py honoured ROVER_PROTOCOL_ROOT while test_config_sync.py and
+sim_link.py honoured ROVER_PROTOCOL_ROOT while test_config_sync.py and
 test_golden_vectors.py each derived the root from their own __file__. Point the
 variable at a second checkout and the integration suite drove THAT firmware
 while the pinning suite pinned the LOCAL C++/Python pair -- so the whole host
