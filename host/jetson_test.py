@@ -14,7 +14,7 @@ jetson_test.py -- Jetson-side test harness for the rover CAN link.
     python3 host/jetson_test.py --channel can0 --bitrate 500000
 
 Sends CONTROL at 20 Hz with an incrementing sequence number, and reassembles
-the four telemetry frames into coherent snapshots.
+the six telemetry frames into coherent snapshots.
 
 Declares the LINK down if no telemetry has arrived within LINK_TIMEOUT_S --
 separate from, and no substitute for, the controller's own command-age
@@ -38,9 +38,9 @@ from rover_config import (  # noqa: E402
 
 
 class TelemetryAssembler:
-    """Collects the five telemetry frames of one cycle into one snapshot.
+    """Collects the six telemetry frames of one cycle into one snapshot.
 
-    All five frames of a cycle carry the SAME sequence number, which is how a
+    All six frames of a cycle carry the SAME sequence number, which is how a
     coherent snapshot is told from one torn across two cycles. A torn snapshot
     is counted rather than silently published, because mixing a fresh encoder
     reading with a stale fault word is exactly the kind of quiet wrongness

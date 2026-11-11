@@ -43,6 +43,8 @@ SHARED = {
     "CAN_ID_TELEM_POWER":    "CAN_ID_TELEM_POWER",
     "CAN_ID_TELEM_STATE":    "CAN_ID_TELEM_STATE",
     "CAN_ID_TELEM_CMD_ECHO": "CAN_ID_TELEM_CMD_ECHO",
+    "CAN_ID_TELEM_FEEDBACK": "CAN_ID_TELEM_FEEDBACK",
+    "FEEDBACK_STALE_MS":     "FEEDBACK_STALE_MS",
     "MODE_SAFE":             "MODE_SAFE",
     "MODE_TELEOP":           "MODE_TELEOP",
     "MODE_AUTONOMOUS":       "MODE_AUTONOMOUS",
@@ -144,6 +146,14 @@ class TestConfigSync(unittest.TestCase):
         # A gap or CRC error must stay visible for more than one frame, or an
         # operator watching at 20 Hz would never see it.
         self.assertGreater(cfg.LINK_DEGRADED_HOLD_MS, cfg.TELEMETRY_PERIOD_MS)
+
+    def test_feedback_staleness_sits_between_the_two_timeouts(self):
+        # Shorter than a telemetry period would flag a channel stale
+        # between two perfectly normal updates; longer than the command
+        # watchdog would mean the rover had already stopped for a comm
+        # timeout before the feedback it is reporting was ever doubted.
+        self.assertGreater(cfg.FEEDBACK_STALE_MS, cfg.TELEMETRY_PERIOD_MS)
+        self.assertLess(cfg.FEEDBACK_STALE_MS, cfg.WATCHDOG_TIMEOUT_MS)
 
     def test_command_range_is_symmetric_and_nonzero(self):
         self.assertEqual(cfg.CMD_MIN, -cfg.CMD_MAX)
