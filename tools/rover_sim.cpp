@@ -33,6 +33,7 @@
 #include "../firmware/src/rover_drive.h"
 #include "../firmware/src/rover_drive_sim.h"
 #include "../firmware/src/rover_encoder.h"
+#include "../firmware/src/rover_steer_sim.h"
 
 using namespace rover;
 
@@ -70,8 +71,7 @@ int main(int argc, char** argv) {
     DriveModule drv;
     DriveSim feedback(seed);
     SimulatedEncoder enc_l, enc_r;
-
-    int16_t steer_fb = 0;
+    SteerSim steer_plant;
     std::string pending;
     char chunk[512];
 
@@ -122,13 +122,8 @@ int main(int argc, char** argv) {
         enc_r.update(scaledFromMps(feedback.right().measured_mps), now_ms);
         const int32_t enc_left  = enc_l.feedback(now_ms).count;
         const int32_t enc_right = enc_r.feedback(now_ms).count;
-        if (steer_fb < out.steer_effort) {
-            steer_fb = static_cast<int16_t>((steer_fb + 25 < out.steer_effort)
-                                            ? steer_fb + 25 : out.steer_effort);
-        } else if (steer_fb > out.steer_effort) {
-            steer_fb = static_cast<int16_t>((steer_fb - 25 > out.steer_effort)
-                                            ? steer_fb - 25 : out.steer_effort);
-        }
+        steer_plant.update(out.steer_effort, now_ms);
+        const int16_t steer_fb = steer_plant.feedback(now_ms).measured;
         const int32_t effort_mag =
             (std::abs(out.left_effort) + std::abs(out.right_effort)) / 2;
         const int16_t current_ca =

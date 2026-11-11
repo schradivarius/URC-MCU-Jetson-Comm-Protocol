@@ -62,6 +62,7 @@
 #include "src/rover_drive.h"
 #include "src/rover_drive_sim.h"
 #include "src/rover_encoder.h"
+#include "src/rover_steer_sim.h"
 #include "src/rover_protocol.h"
 
 using namespace rover;
@@ -139,7 +140,7 @@ static uint16_t g_boot_faults = 0;
 
 static DriveSim sim_plant;
 static SimulatedEncoder sim_enc_l, sim_enc_r;
-static int16_t sim_steer_fb  = 0;
+static SteerSim sim_steer;
 
 struct SensorReading {
     int32_t  enc_left;
@@ -177,8 +178,6 @@ static SensorReading readSensors(const DriveOutputs& out) {
         return r;
     }
 
-    const int16_t target = out.steer_effort;
-
     // wrapI32 takes int64 and wraps explicitly. Letting an int32 counter
     // overflow would be UNDEFINED BEHAVIOUR in C++ -- not a wrap, not an
     // exception, but a compiler free to do anything at all.
@@ -186,16 +185,16 @@ static SensorReading readSensors(const DriveOutputs& out) {
     sim_plant.update(out.left_effort, out.right_effort, out.energized, now_ms);
     sim_enc_l.update(scaledFromMps(sim_plant.left().measured_mps), now_ms);
     sim_enc_r.update(scaledFromMps(sim_plant.right().measured_mps), now_ms);
-
-    if (sim_steer_fb < target)      sim_steer_fb = min(target, (int16_t)(sim_steer_fb + 25));
-    else if (sim_steer_fb > target) sim_steer_fb = max(target, (int16_t)(sim_steer_fb - 25));
+    // Fed the STEERING STAGE's output, the same place the drive plant is
+    // fed from, so a real actuator replaces the module and nothing else.
+    sim_steer.update(out.steer_effort, now_ms);
 
     const int32_t effort_mag =
         (abs(out.left_effort) + abs(out.right_effort)) / 2;
 
     r.enc_left   = sim_enc_l.feedback(now_ms).count;
     r.enc_right  = sim_enc_r.feedback(now_ms).count;
-    r.steer_fb   = sim_steer_fb;
+    r.steer_fb   = sim_steer.feedback(now_ms).measured;
     // The mean of the two wheels is the drive the rover actually delivered:
     // the mix is left = drive + steer, right = drive - steer.
     r.measured_drive = scaledFromMps(
