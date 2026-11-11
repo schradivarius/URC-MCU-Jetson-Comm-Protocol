@@ -145,6 +145,7 @@ struct SensorReading {
     int32_t  enc_left;
     int32_t  enc_right;
     int16_t  steer_fb;
+    int16_t  measured_drive;  // mean wheel speed, CMD_MIN..CMD_MAX scale
     int16_t  current_ca;   // SIGNED centiamps  (1 cA = 10 mA)
     int16_t  voltage_cv;   // SIGNED centivolts (1 cV = 10 mV)
     uint16_t fault_bits;
@@ -162,12 +163,14 @@ static SensorReading readSensors(const DriveOutputs& out) {
         // --- real sensor reads go here ---
         //   enc_*       : i.MX RT quadrature encoder peripherals, or CAN
         //   steer_fb    : analogRead() scaled into -1000..1000
+        //   measured_drive : mean of the two wheel speeds, scaled into
+        //                 -1000..1000 (full scale = speed at CMD_MAX)
         //   current_ca  : analogRead() scaled to SIGNED centiamps (1 cA=10 mA)
         //   voltage_cv  : analogRead() on the pack divider, SIGNED centivolts
         //   fault_bits  : FAULT_OVER_CURRENT / FAULT_ENCODER_FAULT / etc.
         //   controller_health : CTRL_HEALTH_* from motor-driver telemetry,
         //                 which on a CAN bus arrives as its own messages
-        r.enc_left = 0; r.enc_right = 0; r.steer_fb = 0;
+        r.enc_left = 0; r.enc_right = 0; r.steer_fb = 0; r.measured_drive = 0;
         r.current_ca = 0; r.voltage_cv = 0; r.fault_bits = 0;
         r.controller_health = drive_stage.health();
         r.drive_applied = 0; r.steer_applied = 0;   // filled in by loop()
@@ -193,6 +196,10 @@ static SensorReading readSensors(const DriveOutputs& out) {
     r.enc_left   = sim_enc_l.feedback(now_ms).count;
     r.enc_right  = sim_enc_r.feedback(now_ms).count;
     r.steer_fb   = sim_steer_fb;
+    // The mean of the two wheels is the drive the rover actually delivered:
+    // the mix is left = drive + steer, right = drive - steer.
+    r.measured_drive = scaledFromMps(
+        (sim_plant.left().measured_mps + sim_plant.right().measured_mps) / 2.0f);
     r.current_ca = out.energized ? static_cast<int16_t>(effort_mag * 3 / 2) : 0;
     // Fake 24 V pack sagging a little under load.
     r.voltage_cv = static_cast<int16_t>(2400 - effort_mag / 40);
@@ -367,6 +374,7 @@ void loop() {
 
     SensorReading s = readSensors(out);
     ctl->updateFaults(s.fault_bits, s.controller_health);
+    ctl->updateMeasured(s.measured_drive, s.steer_fb);
     // Not sensor readings, so they are filled in here rather than inside
     // readSensors(): they are what the controller AUTHORISED, which is what
     // the acknowledgement frame is about.

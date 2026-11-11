@@ -212,6 +212,31 @@ public:
     // DECODE_OK if it was accepted.
     DecodeResult lastDecodeResult() const { return last_decode_; }
 
+    // --- commanded vs. measured ----------------------------------------
+    //
+    // What the controller told the drive stage to do, beside what the wheels
+    // and steering actually did, on the same CMD_MIN..CMD_MAX scale so the
+    // two can be compared directly. A gap that does not close is a stalled or
+    // slipping wheel, a jammed steering actuator, or a wiring fault.
+    //
+    // COMMANDED is derived live from commandedOutputs(), never stored, so it
+    // cannot drift from what the drive stage is really being handed: it is
+    // zero under any stop and under an authority mismatch or a refused mode.
+    // The mode and the source of authority are deliberately not duplicated
+    // here -- activeMode() and commandAuthorized() own those.
+    int16_t getCommandedDrive() const;
+    int16_t getCommandedSteer() const;
+
+    // MEASURED is whatever the plant last reported through updateMeasured():
+    // the mean of the two wheel speeds for drive, steering feedback for
+    // steer. Both read 0 until the first report.
+    int16_t getMeasuredDrive() const { return measured_drive_; }
+    int16_t getMeasuredSteer() const { return measured_steering_; }
+
+    // Called once per loop with the latest plant feedback, after the drive
+    // stage has run. Feedback only: it never changes a command or a mode.
+    void updateMeasured(int16_t drive, int16_t steer);
+
 private:
     uint32_t elapsedSinceControl() const;
     bool recentlyDegraded() const;
@@ -252,6 +277,9 @@ private:
     uint32_t   seq_gaps_seen_;
     uint32_t   crc_errors_seen_;
     uint32_t   frames_lost_estimate_;
+
+    int16_t    measured_drive_;
+    int16_t    measured_steering_;
 };
 
 }  // namespace rover

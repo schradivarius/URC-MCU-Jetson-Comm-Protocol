@@ -143,6 +143,12 @@ int main(int argc, char** argv) {
         if (current_ca > OVER_CURRENT_CA) hw_faults |= FAULT_OVER_CURRENT;
         if (voltage_cv < UNDERVOLTAGE_CV) hw_faults |= FAULT_UNDERVOLTAGE;
         ctl.updateFaults(hw_faults, drv.health());
+        // The same measured-vs-commanded feed as rover_firmware.cpp: the mean
+        // of the two wheels for drive, steering feedback for steer.
+        ctl.updateMeasured(
+            scaledFromMps((feedback.left().measured_mps +
+                           feedback.right().measured_mps) / 2.0f),
+            steer_fb);
 
         if (ctl.telemetryDue()) {
             const uint8_t seq = ctl.telemetrySeq();   // one seq for all four
