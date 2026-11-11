@@ -1,9 +1,7 @@
 #include "rover_serial.h"
 
 namespace rover {
-
 namespace {
-
 bool putStuffed(uint8_t byte, uint8_t* out, size_t cap, size_t& at) {
     if (byte == SLIP_END || byte == SLIP_ESC) {
         if (at + 2 > cap) return false;
@@ -15,8 +13,7 @@ bool putStuffed(uint8_t byte, uint8_t* out, size_t cap, size_t& at) {
     out[at++] = byte;
     return true;
 }
-
-}  // namespace
+}
 
 size_t encodeSerialFrame(uint32_t id, const uint8_t* payload, size_t len,
                          uint8_t* out, size_t cap) {
@@ -105,5 +102,4 @@ bool SerialFrameReader::feed(uint8_t byte) {
     body_[body_len_++] = byte;
     return false;
 }
-
-}  // namespace rover
+}

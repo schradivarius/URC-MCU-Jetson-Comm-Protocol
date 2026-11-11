@@ -1,20 +1,16 @@
-// test_drive_sim.cpp -- simulated drive feedback.
-
 #include "../../firmware/src/rover_drive_sim.h"
 #include "test_framework.h"
 
 using namespace rover;
 
-static const int16_t HALF = 500;   // 0.50 m/s with SIM_MAX_SPEED_MPS = 1.0
+static const int16_t HALF = 500;
 
-// Runs `ms` updates 1 ms apart starting after `t`; returns the new time.
 static uint32_t run(DriveSim& sim, uint32_t t, uint32_t ms, int16_t l, int16_t r,
                     bool energized = true) {
     for (uint32_t i = 0; i < ms; ++i) sim.update(l, r, energized, ++t);
     return t;
 }
 
-// True if a and b differ by at most tol.
 static bool near(float a, float b, float tol) {
     return (a > b ? a - b : b - a) <= tol;
 }

@@ -42,12 +42,6 @@ import os
 import sys
 import time
 
-# sim_link, rover_protocol, jetson_test and rover_config belong to the protocol
-# repository, not to the autonomy program. In a shared checkout they sit right
-# beside this file; when the autonomy program lives in a repository of its own,
-# ROVER_PROTOCOL_ROOT names the protocol checkout they live in. Importing them
-# either way is deliberate: this program must speak the protocol the firmware
-# was compiled from, never a second copy of it.
 _PROTOCOL_ROOT = os.environ.get("ROVER_PROTOCOL_ROOT")
 if _PROTOCOL_ROOT:
     sys.path.insert(0, os.path.join(
@@ -60,33 +54,18 @@ import rover_protocol as rp  # noqa: E402
 from jetson_test import JetsonLink, open_link  # noqa: E402
 from rover_config import CONTROL_RATE_HZ, SERIAL_BAUD_HZ  # noqa: E402
 
-# Half the sequence space. A snapshot's ack_seq counts as "at or after" the
-# step's first frame when it is within this distance ahead, which is correct
-# across the 255->0 wrap and cannot mistake an old frame for a new one.
 SEQ_LOOKAHEAD = 128
 
-# Mission speeds, in tenths of a percent of full effort. Modest on purpose:
-# this runs against a simulator today and a real rover later, and a script
-# nobody is afraid of is a script that gets run.
 CRUISE = 400
 TURN = 300
 FAST = 500
 
 
 def seq_at_or_after(ack_seq, first_seq):
-    """Has `ack_seq` reached `first_seq`? Correct across the 255->0 wrap."""
     return rp.seq_delta(first_seq, ack_seq) < SEQ_LOOKAHEAD
 
 
 class Step:
-    """One decision: a command to hold, and what must become true because of it.
-
-    `command` is whatever JetsonLink.send_control takes. `check` is given the
-    snapshot and returns None when satisfied, or a string saying what is still
-    wrong -- which becomes the failure message, so it is worth writing as the
-    thing a human would want to read at 2 a.m.
-    """
-
     def __init__(self, name, command, check, timeout_s=2.0):
         self.name = name
         self.command = command
@@ -131,13 +110,7 @@ class MissionReport:
         return "\n".join(str(r) for r in self.results)
 
 
-# ---------------------------------------------------------------------------
-# Checks. Each is a closure over what the step expects, so a failure message
-# names the actual numbers rather than "assertion failed".
-# ---------------------------------------------------------------------------
-
 def expect(**wanted):
-    """Every named snapshot field must equal the given value."""
     def check(s):
         wrong = ["%s=%r (wanted %r)" % (k, s.get(k), v)
                  for k, v in wanted.items() if s.get(k) != v]
@@ -168,12 +141,6 @@ def fault_clear(bit, name):
 
 
 def steer_feedback_within(target, tolerance):
-    """The steering actuator has actually moved, not just been commanded.
-
-    `steer_applied` says the controller accepted the command; `steer_fb` is the
-    plant answering. Both matter, and only together do they say the command
-    reached the hardware.
-    """
     def check(s):
         if abs(s["steer_fb"] - target) <= tolerance:
             return None
@@ -182,12 +149,6 @@ def steer_feedback_within(target, tolerance):
 
 
 def moving(previous_enc):
-    """The encoders are advancing past a baseline an earlier step recorded.
-
-    The baseline is checked for rather than assumed: an unrecorded one would
-    make `enc_left != None` vacuously true and pass this step without checking
-    anything, which is the failure mode a reordered mission would hit.
-    """
     def check(s):
         if previous_enc[0] is None:
             return "no encoder baseline was recorded by an earlier step"
@@ -197,19 +158,7 @@ def moving(previous_enc):
     return check
 
 
-# ---------------------------------------------------------------------------
-# The mission
-# ---------------------------------------------------------------------------
-
 def build_mission():
-    """The Task 4 command sequence, then the mode-separation demonstration.
-
-    c2_lost is False on every step and that is not decoration: a lost C2 link
-    stops a TELEOP rover, which would mask the WRONG_SOURCE verdict the
-    separation steps exist to show with an ordinary STOPPED.
-    """
-    # Captured by the `moving` check so a later step can compare against an
-    # earlier reading rather than a constant.
     enc_at_launch = [None]
 
     def remember_enc(s):
@@ -225,7 +174,6 @@ def build_mission():
 
 
     return [
-        # --- the autonomous command sequence from the task ------------------
         Step("1. start in SAFE",
              dict(drive_cmd=0, steer_cmd=0, mode=rp.MODE_SAFE,
                   c2_lost=False, from_autonomy=False),
@@ -237,8 +185,6 @@ def build_mission():
 
         Step("2. autonomy cannot put itself in charge",
              dict(drive_cmd=CRUISE, steer_cmd=0, **auto),
-             # The spec's "explicit C2 operator command" to enter AUTONOMOUS.
-             # The request is refused and the rover stays in SAFE.
              expect(mode=rp.MODE_SAFE,
                     cmd_status=rp.CMD_STATUS_MODE_REFUSED,
                     drive_applied=0)),
@@ -247,11 +193,7 @@ def build_mission():
              grant_auto,
              all_of(expect(mode=rp.MODE_AUTONOMOUS,
                            cmd_status=rp.CMD_STATUS_STOPPED,
-                           # Red, per rule 1.e.ii, the moment the rover is
-                           # autonomous -- not once it starts moving.
                            indicator_state=rp.INDICATOR_AUTONOMOUS),
-                           # The operator's frame in autonomy's mode, but asking for
-                    # nothing to move: not a source mismatch.
                     fault_clear(rp.FAULT_CMD_SOURCE, "CMD_SOURCE"))),
 
         Step("4. autonomy takes over",
@@ -274,9 +216,6 @@ def build_mission():
 
         Step("7. stop",
              dict(drive_cmd=CRUISE, steer_cmd=TURN, stop=True, **auto),
-             # Full throttle still commanded, and nothing applied. Note the
-             # light stays red: a paused autonomous rover is still under
-             # autonomous operation.
              expect(cmd_status=rp.CMD_STATUS_STOPPED,
                     drive_applied=0, steer_applied=0,
                     indicator_state=rp.INDICATOR_AUTONOMOUS)),
@@ -284,9 +223,6 @@ def build_mission():
         Step("8. report TARGET_REACHED",
              dict(drive_cmd=0, steer_cmd=0, stop=True,
                   indicator_request=rp.INDICATOR_ARRIVED, **auto),
-             # Flashing green. Rule 1.e.xvii scores a target only on stopping
-             # within 1 m AND indicating arrival, so this step is worth points
-             # rather than just being tidy.
              expect(indicator_state=rp.INDICATOR_ARRIVED,
                     cmd_status=rp.CMD_STATUS_STOPPED,
                     drive_applied=0)),
@@ -294,12 +230,8 @@ def build_mission():
         Step("9. request autonomous return",
              dict(drive_cmd=0, steer_cmd=0, return_request=True,
                   indicator_request=rp.INDICATOR_ARRIVED, **auto),
-             # Acknowledged, not obeyed: driving back is route planning, which
-             # is the autonomy stack's job. The controller's part is to prove
-             # the request arrived. See PROTOCOL.md section 9.
              expect(return_active=True, mode=rp.MODE_AUTONOMOUS)),
 
-        # --- manual and autonomous commands must not get mixed up -----------
         Step("10. operator takes back TELEOP",
              grant_teleop,
              expect(mode=rp.MODE_TELEOP, cmd_status=rp.CMD_STATUS_STOPPED)),
@@ -310,9 +242,6 @@ def build_mission():
              all_of(expect(mode=rp.MODE_TELEOP,
                            cmd_status=rp.CMD_STATUS_WRONG_SOURCE,
                            drive_applied=0, steer_applied=0),
-                    # Refused, NOT stopped: the rover is perfectly able to
-                    # drive, it is just not taking orders from that half of
-                    # the stack. Reporting it as a stop would hide the cause.
                     fault_set(rp.FAULT_CMD_SOURCE, "CMD_SOURCE"))),
         Step("12. operator grants AUTONOMOUS again",
              grant_auto,
@@ -320,7 +249,6 @@ def build_mission():
 
         Step("13. AUTONOMOUS accepts the same command",
              dict(drive_cmd=FAST, steer_cmd=0, **auto),
-             # Identical drive_cmd to step 11. Only the mode changed.
              all_of(expect(mode=rp.MODE_AUTONOMOUS,
                            cmd_status=rp.CMD_STATUS_APPLIED,
                            drive_applied=FAST),
@@ -329,8 +257,6 @@ def build_mission():
         Step("14. AUTONOMOUS refuses a teleop command",
              dict(drive_cmd=FAST, steer_cmd=0, mode=rp.MODE_AUTONOMOUS,
                   c2_lost=False, from_autonomy=False),
-             # The mirror of step 11, so the rule is symmetric rather than a
-             # special case aimed at autonomy.
              all_of(expect(cmd_status=rp.CMD_STATUS_WRONG_SOURCE,
                            drive_applied=0),
                     fault_set(rp.FAULT_CMD_SOURCE, "CMD_SOURCE"))),
@@ -339,9 +265,6 @@ def build_mission():
              dict(drive_cmd=0, steer_cmd=0, mode=rp.MODE_AUTONOMOUS,
                   c2_lost=False, from_autonomy=False,
                   indicator_request=rp.INDICATOR_ARRIVED),
-             # Flashing green is worth 25 points. A teleop-path frame claiming
-             # it during an autonomous run is the one mix-up that could light
-             # it on a rover that has arrived nowhere.
              expect(indicator_state=rp.INDICATOR_AUTONOMOUS)),
 
         Step("16. stop overrides an authorised command",
@@ -354,10 +277,6 @@ def build_mission():
 
         Step("18. teleop drives again afterwards",
              dict(drive_cmd=CRUISE, steer_cmd=0, **teleop),
-             # The last word: none of the above left the rover latched into a
-             # refusing state. A safety gate that cannot be left is a rover
-             # that has to be power-cycled at a competition. The operator may
-             # go straight from AUTONOMOUS to TELEOP, so no grant is needed.
              all_of(expect(mode=rp.MODE_TELEOP,
                            cmd_status=rp.CMD_STATUS_APPLIED,
                            drive_applied=CRUISE,
@@ -366,31 +285,22 @@ def build_mission():
     ]
 
 
-# Every field the task's feedback loop requires, and where it rides.
 FEEDBACK_FIELDS = (
-    "mode",               # current mode              (TELEM_STATE)
-    "drive_applied",      # accepted drive command    (TELEM_CMD_ECHO)
-    "steer_applied",      # accepted steering command (TELEM_CMD_ECHO)
-    "controller_health",  # controller-health state   (TELEM_STATE)
-    "cmd_age_ms",         # command age               (TELEM_DRIVE_R)
-    "fault_status",       # fault state               (TELEM_POWER)
+    "mode",
+    "drive_applied",
+    "steer_applied",
+    "controller_health",
+    "cmd_age_ms",
+    "fault_status",
 )
 
 
 def run_mission(link, steps=None, verbose=True, settle_s=0.4):
-    """Drive `steps` to completion against `link`. Returns a MissionReport.
-
-    Stops at the first failure: once a step's precondition never arrived, the
-    ones after it would be testing something other than what they claim.
-    """
     jl = JetsonLink(link)
     report = MissionReport()
     period = 1.0 / CONTROL_RATE_HZ
     steps = build_mission() if steps is None else steps
 
-    # Let the controller come up and the first snapshot assemble before the
-    # first step starts timing. Without it, step 1 spends its budget waiting
-    # for the simulator to launch and fails for a reason that is not its own.
     deadline = time.monotonic() + settle_s
     while time.monotonic() < deadline:
         jl.send_control(drive_cmd=0, steer_cmd=0, mode=rp.MODE_SAFE,
@@ -414,9 +324,6 @@ def run_mission(link, steps=None, verbose=True, settle_s=0.4):
             snapshot = jl.snapshot
             if snapshot is not None:
                 report.snapshots_seen = jl.tele.complete_count
-                # Only a snapshot acknowledging a frame from THIS step can say
-                # anything about this step. Anything older is the previous
-                # command still echoing back.
                 if (snapshot.get("cmd_status") == rp.CMD_STATUS_NO_COMMAND
                         or not seq_at_or_after(snapshot["ack_seq"], first_seq)):
                     detail = "still waiting for the controller to acknowledge"

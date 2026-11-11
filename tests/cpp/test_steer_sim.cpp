@@ -1,5 +1,3 @@
-// test_steer_sim.cpp -- simulated steering feedback.
-
 #include "../../firmware/src/rover_steer_sim.h"
 #include "test_framework.h"
 
@@ -7,7 +5,6 @@ using namespace rover;
 
 static const int16_t TURN = 300;
 
-// Runs `ms` updates 1 ms apart starting after `t`; returns the new time.
 static uint32_t run(SteerSim& sim, uint32_t t, uint32_t ms, int16_t target) {
     for (uint32_t i = 0; i < ms; ++i) sim.update(target, ++t);
     return t;
@@ -22,7 +19,6 @@ static void nothing_is_valid_before_the_first_update() {
     CHECK_EQ(f.error, static_cast<int16_t>(0));
 }
 
-// The whole point of the module: the actuator must not teleport.
 static void measured_does_not_jump_to_the_command() {
     SteerSim sim;
     uint32_t t = run(sim, 0, 1, 0);
@@ -43,9 +39,6 @@ static void measured_moves_through_the_range_and_arrives() {
         if (sim.measured() != prev) distinct++;
         prev = sim.measured();
     }
-    // The task asks for feedback that visibly passes through intermediate
-    // values rather than snapping, so several distinct readings is the
-    // requirement, not an implementation detail.
     CHECK(distinct >= 3);
     t = run(sim, t, 500, TURN);
     CHECK_EQ(sim.measured(), TURN);
@@ -83,7 +76,6 @@ static void it_reverses_when_the_target_crosses_the_centre() {
     CHECK_EQ(sim.measured(), static_cast<int16_t>(-TURN));
 }
 
-// Task 5's "steering error" minimum-track item.
 static void error_is_the_gap_and_closes_to_zero() {
     SteerSim sim;
     uint32_t t = run(sim, 0, 1, 0);
@@ -103,7 +95,6 @@ static void error_is_signed_the_way_a_controller_expects() {
     CHECK(sim.feedback(t).error < 0);
 }
 
-// Task 5's "feedback update time" minimum-track item.
 static void the_update_time_is_recorded() {
     SteerSim sim;
     sim.update(0, 1234);
@@ -121,7 +112,6 @@ static void feedback_goes_invalid_once_it_stops_being_refreshed() {
     CHECK(sim.feedback(1000 + STEER_STALE_MS + 1).valid);
 }
 
-// millis() wraps every ~49.7 days; unsigned subtraction has to carry it.
 static void timing_is_correct_across_millis_wraparound() {
     SteerSim sim;
     const uint32_t before = 0xFFFFFFF0u;
@@ -131,12 +121,11 @@ static void timing_is_correct_across_millis_wraparound() {
 
     SteerSim moving;
     moving.update(TURN, before);
-    moving.update(TURN, before + 50);   // wraps past 0 inside the window
+    moving.update(TURN, before + 50);
     CHECK(moving.measured() > 0);
     CHECK_EQ(moving.lastUpdateMs(), static_cast<uint32_t>(before + 50));
 }
 
-// A stalled loop did not steer for the length of the stall.
 static void a_long_gap_is_clamped_to_one_step() {
     SteerSim sim;
     sim.update(CMD_MAX, 0);
@@ -157,8 +146,6 @@ static void a_zero_length_step_moves_nothing() {
     CHECK_EQ(sim.measured(), first);
 }
 
-// With the default rate one millisecond is two whole units, but the module
-// must not depend on that: a sub-unit step has to accumulate, not vanish.
 static void a_sub_unit_step_accumulates_instead_of_vanishing() {
     SteerSim sim;
     uint32_t t = 0;

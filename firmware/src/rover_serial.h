@@ -7,7 +7,6 @@
 #include "rover_config.h"
 
 namespace rover {
-
 enum : uint8_t {
     SLIP_END     = 0xC0,
     SLIP_ESC     = 0xDB,
@@ -52,7 +51,6 @@ private:
     uint32_t accepted_;
     uint32_t dropped_;
 };
+}
 
-}  // namespace rover
-
-#endif  // ROVER_SERIAL_H
+#endif

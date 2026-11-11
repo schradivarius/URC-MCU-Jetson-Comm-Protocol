@@ -1,9 +1,7 @@
 #include "rover_feedback_faults.h"
 
 namespace rover {
-
 namespace {
-
 struct FaultName { uint8_t fault; const char* name; };
 
 const FaultName FAULT_NAMES[] = {
@@ -19,8 +17,7 @@ bool sameName(const char* a, const char* b) {
     while (*a && *b) { if (*a++ != *b++) return false; }
     return *a == *b;
 }
-
-}  // namespace
+}
 
 const char* feedbackFaultName(uint8_t fault) {
     for (const FaultName& f : FAULT_NAMES) {
@@ -56,9 +53,6 @@ FeedbackFaultInjector::FeedbackFaultInjector()
 void FeedbackFaultInjector::arm(uint8_t fault) {
     if (fault == fault_) return;
     fault_ = (fault > FB_FAULT_MAX) ? static_cast<uint8_t>(FB_FAULT_NONE) : fault;
-    // The frozen snapshot belongs to one arming. Dropping it here is what
-    // makes clearing a fault and re-arming it freeze the CURRENT reading
-    // rather than resurrect one from minutes ago.
     have_frozen_ = false;
 }
 
@@ -67,7 +61,6 @@ void FeedbackFaultInjector::record(const EncoderFeedback& e,
     if (count_ > 0) {
         const uint8_t last =
             static_cast<uint8_t>((next_ + FB_FAULT_HISTORY - 1) % FB_FAULT_HISTORY);
-        // Elapsed-time subtraction, so this survives the millis() wrap.
         if ((now_ms - history_[last].taken_ms) < FB_FAULT_SAMPLE_MS) return;
     }
     history_[next_].taken_ms = now_ms;
@@ -79,21 +72,14 @@ void FeedbackFaultInjector::record(const EncoderFeedback& e,
 
 const FeedbackFaultInjector::Sample*
 FeedbackFaultInjector::due(uint32_t now_ms) const {
-    // Newest sample at least FB_FAULT_DELAY_MS old. Walking backwards from
-    // the most recent means the first match is the newest one, so the delayed
-    // channel runs exactly FB_FAULT_DELAY_MS behind rather than further.
     const Sample* oldest = nullptr;
     for (uint8_t i = 0; i < count_; ++i) {
         const uint8_t idx =
             static_cast<uint8_t>((next_ + FB_FAULT_HISTORY - 1 - i) % FB_FAULT_HISTORY);
         const Sample& s = history_[idx];
-        // Elapsed-time subtraction, never a timestamp comparison, so this
-        // survives the millis() wrap like everything else here.
         if ((now_ms - s.taken_ms) >= FB_FAULT_DELAY_MS) return &s;
         oldest = &s;
     }
-    // Nothing that old yet: the oldest we have is the most delayed answer
-    // available, which is what a real delay line does while it fills.
     return oldest;
 }
 
@@ -110,9 +96,6 @@ void FeedbackFaultInjector::apply(EncoderFeedback& encoder, SteerFeedback& steer
                 frozen_encoder_ = encoder;
                 have_frozen_ = true;
             }
-            // The timestamp freezes with the value. That is the whole point:
-            // the reading stays perfectly plausible and only its age shows
-            // that the channel died.
             encoder = frozen_encoder_;
             return;
 
@@ -125,11 +108,6 @@ void FeedbackFaultInjector::apply(EncoderFeedback& encoder, SteerFeedback& steer
             return;
 
         case FB_FAULT_ENCODER_IMPOSSIBLE:
-            // An order of magnitude past full scale -- not a plausible
-            // overspeed, but a number the wheel could not produce at all,
-            // which is what a disconnected sensor or a lost decode looks
-            // like. The timestamp stays current: this value is fresh and
-            // wrong, which is why invalid is a separate flag from stale.
             encoder.rpm = static_cast<int16_t>(ENCODER_MAX_RPM * 10);
             return;
 
@@ -151,5 +129,4 @@ void FeedbackFaultInjector::apply(EncoderFeedback& encoder, SteerFeedback& steer
             return;
     }
 }
-
-}  // namespace rover
+}

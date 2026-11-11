@@ -13,7 +13,7 @@ static void starts_at_zero_and_not_valid() {
     EncoderFeedback f = enc.feedback(0);
     CHECK_EQ(f.count, 0);
     CHECK_EQ(f.rpm, 0);
-    CHECK(!f.valid); 
+    CHECK(!f.valid);
 }
 
 static void full_forward_for_one_second_turns_max_rpm_worth_of_ticks() {
@@ -41,7 +41,6 @@ static void zero_effort_holds_the_count() {
 }
 
 static void a_slow_wheel_still_moves() {
-
     SimulatedEncoder enc;
     run(enc, 1, 0, 10000);
     CHECK(enc.feedback(10000).count > 0);
@@ -58,15 +57,15 @@ static void feedback_goes_stale_when_updates_stop() {
     enc.update(300, 0);
     CHECK(enc.feedback(ENCODER_STALE_MS).valid);
     CHECK(!enc.feedback(ENCODER_STALE_MS + 1).valid);
-    enc.update(300, ENCODER_STALE_MS + 1);  
+    enc.update(300, ENCODER_STALE_MS + 1);
     CHECK(enc.feedback(ENCODER_STALE_MS + 1).valid);
 }
 
 static void counting_survives_millis_wraparound() {
     SimulatedEncoder enc;
-    const uint32_t start = 0xFFFFFFFFu - 499;   
+    const uint32_t start = 0xFFFFFFFFu - 499;
     run(enc, CMD_MAX, start, 1000);
-    const uint32_t end = start + 1000;  
+    const uint32_t end = start + 1000;
     CHECK_EQ(enc.feedback(end).count, ENCODER_MAX_RPM * ENCODER_TICKS_PER_REV / 60);
     CHECK(enc.feedback(end).valid);
 }

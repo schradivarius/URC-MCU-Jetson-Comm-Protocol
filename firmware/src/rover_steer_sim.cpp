@@ -1,7 +1,6 @@
 #include "rover_steer_sim.h"
 
 namespace rover {
-
 SteerSim::SteerSim()
     : has_update_(false),
       commanded_(0),
@@ -13,9 +12,6 @@ void SteerSim::update(int16_t steer_effort, uint32_t now_ms) {
     commanded_ = steer_effort;
 
     const uint32_t gap_ms = has_update_ ? (now_ms - last_update_ms_) : 0;
-    // A stalled loop did not move the actuator for the length of the stall,
-    // so only the freshest window of it is travelled. Same rule as
-    // SimulatedEncoder::update().
     const uint32_t dt_ms = gap_ms < STEER_SIM_MAX_STEP_MS ? gap_ms
                                                           : STEER_SIM_MAX_STEP_MS;
 
@@ -28,10 +24,6 @@ void SteerSim::update(int16_t steer_effort, uint32_t now_ms) {
         return;
     }
 
-    // Counted in thousandths of a unit, so a rate slower than one unit per
-    // millisecond accumulates instead of rounding away to nothing every
-    // cycle. rate units/s over dt ms is rate*dt thousandths of a unit, and
-    // dt is capped at STEER_SIM_MAX_STEP_MS so this cannot overflow.
     remainder_ += static_cast<int32_t>(STEER_SIM_RATE_PER_S *
                                        static_cast<int64_t>(dt_ms));
     const int32_t step = remainder_ / 1000;
@@ -52,5 +44,4 @@ SteerFeedback SteerSim::feedback(uint32_t now_ms) const {
     f.valid          = has_update_ && (now_ms - last_update_ms_) <= STEER_STALE_MS;
     return f;
 }
-
-}  // namespace rover
+}

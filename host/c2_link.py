@@ -18,7 +18,7 @@ class SimC2Link:
 
     def is_connected(self):
         return self.connected
-    
+
     def recv(self):
         frames = []
         if self.connected:

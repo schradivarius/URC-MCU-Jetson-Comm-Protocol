@@ -1,22 +1,3 @@
-"""
-test_serial_framing.py -- pin host/serial_link.py to firmware/src/rover_serial.*
-
-The framing exists twice, in Python on the laptop and in C++ on the Teensy,
-for the same reason the protocol codec does. This file is what stops the two
-drifting:
-
-  * PINNED_FRAME_HEX is the same literal as PINNED_HEX in
-    tests/cpp/test_serial.cpp. Both sides encode the same (id, payload) and
-    must produce those exact bytes, so neither can change the wire format
-    alone.
-  * The SLIP byte values and buffer sizes are read out of the C++ header as
-    text, the way test_config_sync.py reads rover_config.h, so no toolchain is
-    needed to catch a one-sided edit.
-  * A CONTROL frame built by host/rover_protocol.py is pushed through the
-    framer and decoded again, which proves the two layers compose: framing
-    does not disturb the payload the CRC is computed over.
-"""
-
 import os
 import re
 import sys
@@ -66,7 +47,6 @@ class TestFramingMatchesTheFirmware(unittest.TestCase):
         self.assertEqual(sl.SERIAL_ENCODED_MAX, 2 + 2 * sl.SERIAL_BODY_MAX)
 
     def test_the_escape_codes_are_distinct_from_the_bytes_they_escape(self):
-        """Otherwise a link works until a payload happens to hold one byte."""
         self.assertEqual(len({sl.SLIP_END, sl.SLIP_ESC, sl.SLIP_ESC_END,
                               sl.SLIP_ESC_ESC}), 4)
 

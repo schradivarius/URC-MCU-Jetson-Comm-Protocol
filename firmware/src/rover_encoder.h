@@ -1,47 +1,38 @@
-// rover_encoder.h -- wheel encoder feedback, simulated until real encoders exist.
- 
 #ifndef ROVER_ENCODER_H
 #define ROVER_ENCODER_H
- 
+
 #include <stdint.h>
- 
+
 #include "rover_protocol.h"
- 
+
 namespace rover {
- 
-// PLACEHOLDERS
-static const int32_t  ENCODER_TICKS_PER_REV = 2048;  // ticks per wheel turn
-static const int32_t  ENCODER_MAX_RPM       = 120;   // wheel RPM at CMD_MAX
-static const uint32_t ENCODER_STALE_MS      = 100;   // older than this = not current
-static const uint32_t ENCODER_MAX_STEP_MS   = 100;   // longest gap counted in one update
- 
+static const int32_t  ENCODER_TICKS_PER_REV = 2048;
+static const int32_t  ENCODER_MAX_RPM       = 120;
+static const uint32_t ENCODER_STALE_MS      = 100;
+static const uint32_t ENCODER_MAX_STEP_MS   = 100;
 
 struct EncoderFeedback {
-    int32_t  count;           // cumulative tics
-    int16_t  rpm;             // wheel speed, positive = forward
-    uint32_t last_update_ms;  // millis() at the most recent update()
-    bool     valid;           // updated at least once, and recently
+    int32_t  count;
+    int16_t  rpm;
+    uint32_t last_update_ms;
+    bool     valid;
 };
- 
+
 class SimulatedEncoder {
 public:
     SimulatedEncoder();
 
-    // speed_scaled is the MEASURED wheel speed as a fraction of full speed,
-    // CMD_MIN..CMD_MAX. Never a drive command: the whole point of this module
-    // is to report what the wheel did.
     void update(int16_t speed_scaled, uint32_t now_ms);
- 
+
     EncoderFeedback feedback(uint32_t now_ms) const;
- 
+
 private:
     bool     has_update_;
     int32_t  count_;
     int16_t  rpm_;
     uint32_t last_update_ms_;
-    int64_t  tick_remainder_;  // fractions of a tick carried between updates
+    int64_t  tick_remainder_;
 };
- 
-}  // namespace rover
- 
-#endif  // ROVER_ENCODER_H
+}
+
+#endif

@@ -1,26 +1,3 @@
-// rover_sim.cpp -- a simulated rover controller for host-side testing.
-//
-// WHY THIS IS C++ AND NOT PYTHON
-//   The obvious thing would be a Python mock of the controller. That would
-//   recreate the exact problem this project already fixed once: two
-//   hand-maintained copies of a safety rule, where the simulator can pass
-//   while the real firmware misbehaves, and the tests check the wrong copy.
-//
-//   So this links the REAL rover_controller.cpp -- the same source the Teensy
-//   compiles. Only the plant (fake encoders, fake current and voltage) and the
-//   transport (a pipe instead of a CAN bus) are simulated.
-//
-// PIPE PROTOCOL (stands in for the CAN bus)
-//   stdin :  "<id_hex> <frame_hex>\n"   one received frame per line
-//   stdout:  "<id_hex> <frame_hex>\n"   one transmitted frame per line
-//   stdin closing ends the run.
-//
-// PRINTED DRIVE OUTPUT
-//   `rover_sim -v` additionally prints what the drive stage is doing, one line
-//   per telemetry cycle, TO STDERR. Task 4 lists a printed output as one
-//   acceptable form for the drive/steering module, and stderr is the only
-//   place it can go: stdout is the bus.
-
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -49,7 +26,7 @@ static void emitFrame(uint32_t id, const uint8_t* buf, uint8_t len) {
     std::printf("%03x ", id);
     for (uint8_t i = 0; i < len; ++i) std::printf("%02x", buf[i]);
     std::printf("\n");
-    std::fflush(stdout);        // unbuffered: the host reads these live
+    std::fflush(stdout);
 }
 
 int main(int argc, char** argv) {
@@ -61,10 +38,6 @@ int main(int argc, char** argv) {
         if (std::strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
             seed = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
         }
-        // --inject breaks the SIMULATED sensors, never the firmware: see
-        // rover_feedback_faults.h. An unknown name exits rather than running
-        // a healthy plant, because a typo that silently passes is worse than
-        // no fault injection at all.
         if (std::strcmp(argv[i], "--inject") == 0 && i + 1 < argc) {
             if (!parseFeedbackFault(argv[++i], injected_fault)) {
                 std::fprintf(stderr, "rover_sim: unknown --inject %s\n", argv[i]);
@@ -76,10 +49,6 @@ int main(int argc, char** argv) {
     g_start = std::chrono::steady_clock::now();
     RoverController ctl(realMillis, DEFAULT_WATCHDOG_TIMEOUT_MS,
                         DEFAULT_TELEMETRY_PERIOD_MS);
-    // The REAL drive stage, not a stand-in: tools/rover_sim links the same
-    // rover_drive.cpp the Teensy compiles, so the host tests exercise the
-    // actual mixing, clamping and stop behaviour rather than a Python idea of
-    // them. Only the pins at the far end are missing.
     DriveModule drv;
     DriveSim feedback(seed);
     SimulatedEncoder enc_l, enc_r;
@@ -90,13 +59,10 @@ int main(int argc, char** argv) {
     char chunk[512];
 
     for (;;) {
-        // Non-blocking stdin so the telemetry timer keeps running while the
-        // host is quiet -- precisely the condition the command watchdog exists
-        // to detect.
         struct pollfd pfd = {STDIN_FILENO, POLLIN, 0};
         if (poll(&pfd, 1, 2) > 0 && (pfd.revents & (POLLIN | POLLHUP))) {
             ssize_t n = read(STDIN_FILENO, chunk, sizeof(chunk));
-            if (n <= 0) break;                       // host closed the pipe
+            if (n <= 0) break;
             pending.append(chunk, static_cast<size_t>(n));
             size_t nl;
             while ((nl = pending.find('\n')) != std::string::npos) {
@@ -117,61 +83,38 @@ int main(int argc, char** argv) {
             }
         }
 
-        // The Task 4 chain, in order: the controller has already validated the
-        // frame and checked the mode; it now says what may be driven, and the
-        // drive module turns that into outputs.
         int16_t drive, steer;
-        ctl.commandedOutputs(drive, steer);          // zeroed under stop or
-                                                     // an authority mismatch
+        ctl.commandedOutputs(drive, steer);
         const bool stopped = ctl.effectiveStop();
         const DriveOutputs& out = drv.update(drive, steer, !stopped);
 
-        // Fake plant, driven by the DRIVE MODULE's output rather than by the
-        // raw command, so the mix is part of what the host tests observe. The
-        // fail-safe has already been applied twice over, so there is no third
-        // copy of the stop rule here. Encoders come from the lagging measured speed.
         const uint32_t now_ms = realMillis();
         feedback.update(out.left_effort, out.right_effort, out.energized, now_ms);
         enc_l.update(scaledFromMps(feedback.left().measured_mps), now_ms);
         enc_r.update(scaledFromMps(feedback.right().measured_mps), now_ms);
         steer_plant.update(out.steer_effort, now_ms);
 
-        // THE SENSOR BOUNDARY. Everything below reads ef/sf and nothing
-        // else, so an injected fault is wrong EVERYWHERE a real broken
-        // sensor would be, not only in the freshness report. Same order as
-        // rover_firmware.cpp. A no-op unless --inject armed something.
         EncoderFeedback ef = enc_l.feedback(now_ms);
         SteerFeedback   sf = steer_plant.feedback(now_ms);
         injector.apply(ef, sf, now_ms);
 
         const int32_t enc_left  = ef.count;
-        // The right encoder is not injected: a wheel sensor dies on its own
-        // wheel. See the same note in rover_firmware.cpp.
         const int32_t enc_right = enc_r.feedback(now_ms).count;
         const int16_t steer_fb  = sf.measured;
         const int32_t effort_mag =
             (std::abs(out.left_effort) + std::abs(out.right_effort)) / 2;
         const int16_t current_ca =
             out.energized ? static_cast<int16_t>(effort_mag * 3 / 2) : 0;
-        // Fake pack voltage: 24.00 V nominal, sagging a little under load.
         const int16_t voltage_cv = static_cast<int16_t>(2400 - effort_mag / 40);
 
-        // The same thresholds and the same every-cycle call as
-        // rover_firmware.cpp, so a critical fault latches FAULT here exactly
-        // as it would on the rover.
         uint16_t hw_faults = 0;
         if (current_ca > OVER_CURRENT_CA) hw_faults |= FAULT_OVER_CURRENT;
         if (voltage_cv < UNDERVOLTAGE_CV) hw_faults |= FAULT_UNDERVOLTAGE;
         ctl.updateFaults(hw_faults, drv.health());
-        // The same measured-vs-commanded feed as rover_firmware.cpp: the mean
-        // of the two wheels for drive, steering feedback for steer.
         ctl.updateMeasured(
             scaledFromMps((feedback.left().measured_mps +
                            feedback.right().measured_mps) / 2.0f),
             steer_fb);
-        // The same feedback-freshness feed as rover_firmware.cpp. The plant
-        // owns the sane range for its own units; the controller owns the
-        // staleness rule, because that is a time rule.
         ctl.updateFeedback(
             ef.last_update_ms,
             ef.rpm >= -ENCODER_MAX_RPM && ef.rpm <= ENCODER_MAX_RPM,
@@ -179,7 +122,7 @@ int main(int argc, char** argv) {
             isValidCommand(sf.measured));
 
         if (ctl.telemetryDue()) {
-            const uint8_t seq = ctl.telemetrySeq();   // one seq for all six
+            const uint8_t seq = ctl.telemetrySeq();
             uint8_t buf[8];
 
             TelemetryDriveL dl = ctl.buildDriveL(enc_left, steer_fb);
@@ -191,16 +134,9 @@ int main(int argc, char** argv) {
             TelemetryPower pw = ctl.buildPower(current_ca, voltage_cv, hw_faults);
             emitFrame(CAN_ID_TELEM_POWER, buf, encodeTelemetryPower(pw, seq, buf));
 
-            // controller_health now comes from the drive stage, which is the
-            // layer that actually knows. Still not real ESC telemetry -- it
-            // reports the module's own state -- but it is no longer a constant
-            // NOT_REPORTED. c2_link the controller derives itself from the
-            // c2_lost bit the Jetson forwards; see c2LinkState().
             TelemetryState st = ctl.buildState(drv.health());
             emitFrame(CAN_ID_TELEM_STATE, buf, encodeTelemetryState(st, seq, buf));
 
-            // The acknowledgement: what was accepted, which frame it came
-            // from, and why it is or is not being acted on.
             TelemetryCmdEcho ce = ctl.buildCmdEcho(drive, steer);
             emitFrame(CAN_ID_TELEM_CMD_ECHO, buf, encodeTelemetryCmdEcho(ce, seq, buf));
 
@@ -208,7 +144,6 @@ int main(int argc, char** argv) {
             emitFrame(CAN_ID_TELEM_FEEDBACK, buf, encodeTelemetryFeedback(fb, seq, buf));
 
             if (verbose) {
-                // Printed drive output, on stderr because stdout is the bus.
                 std::fprintf(stderr,
                              "drive: %-12s ack=%3u cmd=(%+5d,%+5d) "
                              "out=(L%+5d R%+5d S%+5d) pwm=(%4u %4u %4u) %s\n",

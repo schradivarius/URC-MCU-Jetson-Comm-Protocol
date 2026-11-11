@@ -1,25 +1,3 @@
-"""
-serial_link.py -- the host's USB-serial / UART interface to the MCU.
-
-Same three calls as sim_link.py's backends, so anything written against one
-works against the other:
-
-    send(can_id, payload_bytes)
-    recv() -> list of (can_id, payload_bytes) received since the last call
-    close()
-
-The wire format is SLIP (RFC 1055) framing around a body of
-`id_low, id_high, <protocol frame bytes>`. The protocol's own sequence number
-and CRC-8 are inside those bytes and are not duplicated here, so a frame that
-survives framing is still checked by rover_protocol exactly as it would be off
-a CAN bus. SLIP is used rather than a length-prefixed header because it
-resynchronises on its own: any amount of noise, a half-written frame or a board
-reset mid-transmission costs one frame, not the rest of the session.
-
-Mirrors firmware/src/rover_serial.h. tests/host/test_serial_framing.py fails if
-the two disagree.
-"""
-
 import glob
 import os
 import queue
@@ -43,7 +21,6 @@ MAX_CAN_ID = 0x7FF
 
 
 def encode_frame(can_id, payload):
-    """SLIP-encode one (id, payload) pair. Raises on anything unsendable."""
     if not 0 <= can_id <= MAX_CAN_ID:
         raise ValueError("can_id %r is not an 11-bit identifier" % (can_id,))
     if len(payload) > FRAME_DLC:
@@ -62,16 +39,6 @@ def encode_frame(can_id, payload):
 
 
 class FrameReader:
-    """Byte-stream decoder. feed() returns the frames completed by this chunk.
-
-    A body that is too short to hold an id plus one payload byte, one that
-    overruns SERIAL_BODY_MAX, one whose id is not an 11-bit identifier, or an
-    escape followed by a byte that is not a defined escape code, is counted in
-    `dropped` and discarded. An empty body
-    is not a drop: the encoder emits a leading END precisely so that whatever
-    preceded a frame is flushed, which shows up here as an empty body.
-    """
-
     def __init__(self):
         self._body = bytearray()
         self._escaped = False
@@ -123,12 +90,6 @@ class FrameReader:
 
 
 def list_ports():
-    """Candidate serial ports, best-effort and never raising.
-
-    pyserial's enumeration is the good answer and is tried first. The glob
-    fallback exists because a Linux or macOS user without pyserial installed
-    still deserves to be told what to pass to --port.
-    """
     try:
         from serial.tools import list_ports as pyserial_ports
         return [(p.device, p.description or "") for p in pyserial_ports.comports()]
@@ -141,19 +102,6 @@ def list_ports():
 
 
 class SerialLink:
-    """pyserial on a USB-serial or UART port.
-
-    Reading happens on a thread rather than by polling in recv(), for the same
-    reason sim_link.SimLink does it: pyserial buffers in userspace, so a poll
-    that asks the OS whether bytes are waiting can report nothing while whole
-    frames sit in the library's buffer.
-
-    DTR is asserted explicitly on open. The firmware only transmits while the
-    host has the port open, which it reads off DTR; pyserial asserts it on
-    open, but a driver or a previous program can leave it low, and the symptom
-    is a link that accepts commands and sends nothing back.
-    """
-
     def __init__(self, port, baud=SERIAL_BAUD_HZ, timeout=0.05):
         import serial
         self.port = port

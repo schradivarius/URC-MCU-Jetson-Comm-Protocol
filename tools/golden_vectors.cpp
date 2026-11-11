@@ -1,27 +1,3 @@
-// golden_vectors.cpp -- emit encoded frames and predicate tables as text, for
-// cross-language pinning.
-//
-// The codec is the one thing that must exist in both C++ (Teensy) and Python
-// (Jetson), because neither can import the other. This program prints what the
-// C++ side produces; tests/host/test_golden_vectors.py computes the same in
-// Python and asserts they are identical.
-//
-// That turns "we were careful to keep them in sync" into a CI failure the
-// moment someone changes a field width, order, endianness, CRC or predicate on
-// one side only.
-//
-// Line formats:
-//   CRC8|<ascii>|<hex>                   known-answer CRC
-//   FRAMECRC|<can_id>|<payload hex>|<hex>
-//   SEQDELTA|<prev>,<cur>|<delta>
-//   MODE|<value>|<known><motion>         two 0/1 digits
-//   INDICATOR|<value>|<known>
-//   RANGE|<value>|<valid>
-//   AUTHORITY|<from_autonomy>,<mode>|<owns>
-//   TRANSITION|<from>,<to>,<from_autonomy>|<allowed>
-//   CMDSTATUS|<status>,<decode>,<return>|<packed hex>
-//   <NAME>|<args>|<frame hex>            encoded frames
-
 #include <cstdio>
 #include "../firmware/src/rover_protocol.h"
 
@@ -38,7 +14,6 @@ int main() {
     uint8_t buf[8];
     char args[160];
 
-    // --- CRC known-answer and id seeding --------------------------------
     const char* kav = "123456789";
     std::printf("CRC8|%s|%02x\n", kav, crc8(reinterpret_cast<const uint8_t*>(kav), 9));
 
@@ -52,13 +27,11 @@ int main() {
                     static_cast<unsigned>(id), frameCrc8(id, sample, 6));
     }
 
-    // --- sequence arithmetic across the wrap -----------------------------
     const uint8_t seq_pairs[][2] = {{0,1},{1,1},{254,255},{255,0},{254,1},{0,255},{200,10}};
     for (const auto& sp : seq_pairs) {
         std::printf("SEQDELTA|%u,%u|%u\n", sp[0], sp[1], seqDelta(sp[0], sp[1]));
     }
 
-    // --- validation predicates, exhaustive over the byte -----------------
     for (int m = 0; m <= 255; ++m) {
         std::printf("MODE|%d|%d%d\n", m,
                     isCommandableMode(static_cast<uint8_t>(m)) ? 1 : 0,
@@ -68,18 +41,12 @@ int main() {
         std::printf("INDICATOR|%d|%d\n", i,
                     isKnownIndicator(static_cast<uint8_t>(i)) ? 1 : 0);
     }
-    // Command range at and around the boundaries, so the Jetson cannot think
-    // a value is sendable while the controller rejects it. Not exhaustive --
-    // the field is 16 bits -- but off by one is the whole bug here.
     const int16_t range_cases[] = {-32768, -32767, -1002, -1001, -1000, -999,
                                    -1, 0, 1, 999, 1000, 1001, 1002, 32766, 32767};
     for (int16_t v : range_cases) {
         std::printf("RANGE|%d|%d\n", v, isValidCommand(v) ? 1 : 0);
     }
 
-    // Command authority, exhaustive over the mode byte for both sources. The
-    // failure this pins is an undefined mode reading as owned by whoever
-    // asked -- a whitelist that quietly became a blacklist on one side only.
     for (int src = 0; src <= 1; ++src) {
         for (int m = 0; m <= 255; ++m) {
             std::printf("AUTHORITY|%d,%d|%d\n", src, m,
@@ -87,9 +54,6 @@ int main() {
         }
     }
 
-        // Mode transitions, exhaustive over every controller state the table
-    // knows plus one undefined value each side, for both sources. The host
-    // copy exists so the Jetson can predict a refusal before it reads one.
     for (int from = 0; from <= MODE_FAULT + 1; ++from) {
         for (int to = 0; to <= MODE_MAX + 1; ++to) {
             for (int src = 0; src <= 1; ++src) {
@@ -101,8 +65,6 @@ int main() {
         }
     }
 
-    // The command-status byte. Two 3-bit fields and a flag sharing one byte is
-    // exactly the kind of packing that goes wrong on one side only.
     const uint8_t statuses[] = {CMD_STATUS_APPLIED, CMD_STATUS_STOPPED,
                                 CMD_STATUS_WRONG_SOURCE, CMD_STATUS_NO_COMMAND,
                                 CMD_STATUS_MODE_REFUSED};
@@ -119,25 +81,16 @@ int main() {
         }
     }
 
-    // --- CONTROL ---------------------------------------------------------
     struct Ctl { int16_t d, s; uint8_t m; bool stop, abort, ret, c2, aut; uint8_t ind, seq; };
     const Ctl ctls[] = {
         {     0,     0, MODE_SAFE,   true,  false, false, false, false, INDICATOR_OFF,        0},
         {   500,  -200, MODE_TELEOP,     false, false, false, false, false, INDICATOR_TELEOP,     1},
         {  1000, -1000, MODE_AUTONOMOUS, false, false, false, false, true,  INDICATOR_AUTONOMOUS, 42},
         { -1000,  1000, MODE_TELEOP,     true,  true,  true,  true,  false, INDICATOR_ARRIVED,  255},
-        // These two were -32768,32767 and -21846,170 before command-range
-        // validation. Both are outside CMD_MIN..CMD_MAX, so they no longer
-        // decode; the boundary itself is pinned by the RANGE table above and
-        // the extreme-int16 ENCODING by the_encoder_still_writes_any_int16.
         {  -999,   999, MODE_TELEOP,     false, false, true,  false, false, INDICATOR_FAULT,    128},
         {  -846,   170, MODE_AUTONOMOUS, false, true,  false, true,  true,  INDICATOR_OFF,        7},
         {   250,   -50, MODE_AUTONOMOUS, false, false, false, true,  true,  INDICATOR_AUTONOMOUS, 64},
         {     0,     0, MODE_TELEOP,     false, false, false, true,  false, INDICATOR_TELEOP,    65},
-        // Both mismatched combinations, which are legal on the wire and
-        // refused by the controller rather than by the codec. If either side
-        // ever started rejecting them at decode, these two rows would be the
-        // first thing to fail.
         {   700,   100, MODE_TELEOP,     false, false, false, false, true,  INDICATOR_TELEOP,    66},
         {   700,   100, MODE_AUTONOMOUS, false, false, false, false, false, INDICATOR_ARRIVED,   67},
     };
@@ -154,7 +107,6 @@ int main() {
         emitHex("CONTROL", args, buf, n);
     }
 
-    // --- TELEM_DRIVE_L ---------------------------------------------------
     struct DL { long long enc; int16_t fb; uint8_t seq; };
     const DL dls[] = {{0,0,0}, {123456,-1000,1}, {INT32_MAX_V,1000,250},
                       {INT32_MIN_V,-1,251}, {2147483648LL,0,9}};
@@ -165,7 +117,6 @@ int main() {
         emitHex("DRIVE_L", args, buf, n);
     }
 
-    // --- TELEM_DRIVE_R ---------------------------------------------------
     struct DR { long long enc; uint16_t age; uint8_t seq; };
     const DR drs[] = {{0,0,0}, {-123456,400,3}, {INT32_MAX_V,CMD_AGE_MAX,4},
                       {0,CMD_AGE_UNKNOWN,5}};
@@ -176,7 +127,6 @@ int main() {
         emitHex("DRIVE_R", args, buf, n);
     }
 
-    // --- TELEM_POWER -----------------------------------------------------
     struct PW { int16_t ca, cv; uint16_t f; uint8_t seq; };
     const PW pws[] = {
         {0, 0, 0, 0},
@@ -193,7 +143,6 @@ int main() {
         emitHex("POWER", args, buf, n);
     }
 
-    // --- TELEM_STATE -----------------------------------------------------
     struct ST { uint8_t mode, jl, c2, h, ind, seq; };
     const ST sts[] = {
         {MODE_SAFE, LINK_LOST, LINK_NOT_REPORTED, CTRL_HEALTH_NOT_REPORTED,
@@ -213,7 +162,6 @@ int main() {
         emitHex("STATE", args, buf, n);
     }
 
-    // --- TELEM_CMD_ECHO --------------------------------------------------
     struct EC { int16_t d, s; uint8_t ack, st; DecodeResult dr; bool ret; uint8_t seq; };
     const EC ecs[] = {
         {    0,     0,   0, CMD_STATUS_NO_COMMAND,   DECODE_OK,        false,   0},
@@ -234,7 +182,6 @@ int main() {
         emitHex("CMD_ECHO", args, buf, n);
     }
 
-    // --- TELEM_FEEDBACK (v0.8) -------------------------------------------
     struct FB { uint16_t enc_age, steer_age; uint8_t src, flags, seq; };
     const FB fbs[] = {
         {                   0,                    0, CMD_SOURCE_NONE,     0, 0},
