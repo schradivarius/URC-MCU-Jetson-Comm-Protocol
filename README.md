@@ -2,9 +2,11 @@
 
 Communication link between the rover's **onboard computer** (Jetson Orin Nano,
 candidate) and its **embedded controller** (**Teensy 4.1**, C++ / Teensyduino),
-over **CAN** — and the autonomy-to-embedded interface built on top of it.
+over **USB serial (UART)** — and the autonomy-to-embedded interface built on top of it.
 
-Framed, prioritised CAN messages with watchdog-based fail-safes. Full
+Framed serial messages with watchdog-based fail-safes. The Teensy talks to the
+motor controllers over CAN; that side is not in this repository yet beyond
+`demo/`. Full
 specification: **[PROTOCOL.md](PROTOCOL.md)**.
 
 **Task 3** proved a Jetson command reaches the controller intact. **Task 4**
@@ -16,7 +18,7 @@ autonomy and teleop commands are refused in each other's modes.
 
 | | |
 |---|---|
-| Protocol, safety logic, firmware | Implemented, **327 tests** passing |
+| Protocol, safety logic, firmware | Implemented, **366 tests** passing |
 | Cross-language codec | Pinned byte-for-byte, plus every validation predicate |
 | Autonomy → drive-stage loop (Task 4) | Closed and verified end to end (`make autonomy`) |
 | **Validated on real hardware** | **Not yet — see [Known gaps](#known-gaps)** |
@@ -33,7 +35,7 @@ than mocking them, so there is no dependency to manage.
 git clone https://github.com/schradivarius/URC-MCU-Jetson-Comm-Protocol.git
 cd URC-MCU-Jetson-Comm-Protocol
 
-make test      # 214 C++ tests + 113 host tests
+make test      # 231 C++ tests + 135 host tests
 make demo      # no-hardware message-exchange demonstration (Task 3)
 make autonomy  # mock autonomy stack driving the firmware (Task 4)
 ```
@@ -48,7 +50,7 @@ Two languages, because the two ends of the link are different machines:
 
 ```
 firmware/                    C++ — runs on the Teensy 4.1
-  rover_firmware.cpp           hardware wiring ONLY (CAN, watchdog, pins)
+  rover_firmware.cpp           hardware wiring ONLY (serial, watchdog, pins)
   src/rover_config.h           every protocol + timing constant ─┐
   src/rover_protocol.*         message definitions + codec       │
   src/rover_controller.*       command/safety state machine      │ pure C++,
@@ -56,13 +58,15 @@ firmware/                    C++ — runs on the Teensy 4.1
   src/rover_drive_sim.*        simulated drivetrain (lags)       │
   src/rover_encoder.*          simulated wheel encoders          │
   src/rover_steer_sim.*        simulated steering actuator       │
-  src/rover_feedback_faults.*  controlled failures of the above ─┘
+  src/rover_feedback_faults.*  controlled failures of the above  │
+  src/rover_serial.*           SLIP framing for the serial link ─┘
 
 host/                        Python — runs on the Jetson
   rover_config.py              constants (pinned to rover_config.h)
   rover_protocol.py            codec (pinned to the C++ one)
   protocol_root.py             which checkout firmware/src comes from
-  can_link.py                  sim + python-can backends
+  sim_link.py                  simulator backend
+  serial_link.py               serial backend (pyserial)
   c2_link.py                   C2 (base-station) link-loss detection
   jetson_test.py               live harness
   demo.py                      the Task 3 demonstration
@@ -72,8 +76,8 @@ tools/
   rover_sim.cpp                simulator: REAL controller + drive stage, fake plant
   golden_vectors.cpp           emits vectors for cross-language pinning
 
-tests/cpp/                   214 tests — firmware core
-tests/host/                  113 tests — config sync, golden vectors, integration,
+tests/cpp/                   231 tests — firmware core
+tests/host/                  135 tests — config sync, golden vectors, integration,
                                         the autonomy mission, feedback failures
 ```
 
@@ -107,10 +111,12 @@ make test-host   # host side only — compiles the C++ core
 | `tests/cpp/test_encoder.cpp` | 9 | Do the fake encoders count, wrap and go stale correctly? |
 | `tests/cpp/test_steer_sim.cpp` | 14 | Does simulated steering move *through* its range, and is the error signed the way a controller expects? |
 | `tests/cpp/test_feedback_faults.cpp` | 16 | When a sensor freezes, lies or runs late, is each one told from the others? |
+| `tests/cpp/test_serial.cpp` | 17 | Does serial framing survive noise, resets and every byte value? |
 | `tests/host/test_config_sync.py` | 15 | Do the C++ and Python configs hold the same constants? |
 | `tests/host/test_golden_vectors.py` | 33 | Do C++ and Python agree byte-for-byte? |
 | `tests/host/test_integration.py` | 46 | Do both ends actually talk to each other? |
 | `tests/host/test_autonomy_mission.py` | 10 | Does an autonomy decision reach the drive stage — and would we notice if it stopped? |
+| `tests/host/test_serial_framing.py` | 22 | Do the C++ and Python framers produce the same bytes? |
 | `tests/host/test_feedback_failures.py` | 9 | Does a broken sensor reach the *Jetson* as the right fault — and does the rover keep driving, as Task 5 says it must for now? |
 
 Every test is named for the failure it prevents, so the reason it exists
@@ -126,7 +132,7 @@ implementation, rather than merely assumed to work:
   endianness flip
 - `wrong_dlc_does_not_refresh_the_watchdog` — the version-mismatch guard
 - `a_bad_crc_does_not_refresh_the_watchdog` — the application-layer CRC's whole
-  purpose: corruption in the software path, which CAN's own CRC cannot see
+  purpose: corruption in the software path, which no link-level check can see
 - `the_c2_link_is_never_derived_from_the_jetson_link` and
   `c2_loss_stops_a_teleoperated_rover_but_not_an_autonomous_one` — the 2027
   course has areas with no C2 line-of-sight while autonomy keeps working;
@@ -187,30 +193,21 @@ detected and reported, and choosing a safe state for it is Task 6.
 
 ## Running against hardware
 
-### A virtual CAN bus (no hardware, real CAN stack)
-
-```bash
-sudo modprobe vcan
-sudo ip link add dev vcan0 type vcan && sudo ip link set up vcan0
-pip install python-can
-python3 host/jetson_test.py --channel vcan0
-```
-
 ### The real Teensy
 
 **PlatformIO.** `platformio.ini` is in the repo root and names the board and
-both libraries, so there is nothing to install by hand:
+its one library, so there is nothing to install by hand:
 
 ```bash
 pio run              # compile for the Teensy 4.1
 pio run -t upload    # compile and flash
-pio device monitor   # the boot banner, 115200
 ```
 
 Then, from the Jetson side:
 
 ```bash
-python3 host/jetson_test.py --channel can0 --bitrate 500000
+pip install pyserial
+python3 host/jetson_test.py --port /dev/ttyACM0     # COM5 or similar on Windows
 ```
 
 > **Why not the Arduino IDE.** The entry point is `firmware/rover_firmware.cpp`,
@@ -223,26 +220,16 @@ python3 host/jetson_test.py --channel can0 --bitrate 500000
 > `#include "rover_firmware.cpp"` — but then keep both toolchains honest, because
 > only one of them is exercised here.
 
-First flash is worth doing with **nothing connected to the drive pins or the
-CAN bus** — the boot banner alone exercises the build, the boot-fault check and
-the watchdog arming, with nothing able to move.
+First flash is worth doing with **nothing connected to the drive pins**. The USB
+port carries binary frames only, so there is no boot banner; the onboard LED
+toggling once per telemetry period is the proof of life.
 
 > **Before powering anything.**
 > - Teensy 4.1 is **3.3 V and NOT 5 V tolerant.** A 5 V sensor on a pin
 >   destroys the board. Level-shift everything.
-> - Each CAN bus needs a **transceiver** — the MCU cannot drive a differential
->   bus directly.
-> - The bus needs **120 Ω termination at both physical ends.** Exactly one
->   resistor, or three, is the single most common CAN bring-up failure.
 
-The firmware prints a banner over USB serial on boot:
-
-```
-rover firmware up: CAN3 @ 500000 bps, hw watchdog 1000 ms
-```
-
-`RECOVERED FROM WATCHDOG RESET` appended means the previous run hung or
-crashed — see `PROTOCOL.md` §5.2.
+`FAULT_FIRMWARE_FAULT` in telemetry means the previous run hung or crashed —
+see `PROTOCOL.md` §5.2.
 
 ---
 
@@ -250,14 +237,10 @@ crashed — see `PROTOCOL.md` §5.2.
 
 Stated plainly, so nobody builds on an unchecked assumption:
 
-- **Never run on a real Teensy or a real CAN bus.** Every library call was
-  verified against the `FlexCAN_T4` and `WDT_T4` headers, and the whole
-  firmware — `rover_firmware.cpp` plus everything in `src/` — compiles *and
-  links* under a host compiler at `-Wall -Wextra -Werror` against stub
-  `Arduino.h`, `FlexCAN_T4.h` and `Watchdog_t4.h`. What that does not cover is
-  the real `arm-none-eabi` build against the actual Teensyduino and library
-  headers, which has never run, and the board, which has never been flashed.
-  Bench validation is owed.
+- **Never run on a real Teensy.** The firmware cross-compiles and links with
+  `arm-none-eabi-g++` against the real Teensy core at `-Wall -Wextra -Werror`,
+  and the laptop side of the serial link has run against the real controller
+  over a pty. The board itself has never been flashed. Bench validation is owed.
 - **`SRC_SRSR` watchdog bit mask is unverified.** It fails safe — an
   unrecognised reset cause reports nothing — but confirm it by deliberately
   hanging the loop once on the bench.
@@ -272,8 +255,8 @@ Stated plainly, so nobody builds on an unchecked assumption:
   `PROTOCOL.md` §9, because it changes `effectiveStop()`.
 - **Two encoders, one aggregate current reading.** Both need to grow, and both
   change the payload when they do.
-- **CAN FD, the second and third CAN buses, and a dedicated e-stop frame** are
-  all unused. The `0x000`–`0x0FF` id block is reserved for that e-stop.
+- **The frames are still 8 bytes with CAN-style ids**, inherited from the old
+  transport. Collapsing them into single serial packets is the next step.
 
 ## CI
 

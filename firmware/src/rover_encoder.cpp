@@ -1,8 +1,6 @@
 #include "rover_encoder.h"
 
 namespace rover {
-
-// One tick, expressed in the units tick_remainder_ counts in.
 static const int64_t TICK_UNITS = static_cast<int64_t>(CMD_MAX) * 60000;
 
 SimulatedEncoder::SimulatedEncoder()
@@ -14,8 +12,6 @@ SimulatedEncoder::SimulatedEncoder()
 
 void SimulatedEncoder::update(int16_t speed_scaled, uint32_t now_ms) {
     const uint32_t gap_ms = has_update_ ? (now_ms - last_update_ms_) : 0;
-    // A stalled loop did not drive the rover for the length of the stall, so
-    // only the freshest window of it is counted as travel.
     const uint32_t dt_ms = gap_ms < ENCODER_MAX_STEP_MS ? gap_ms
                                                         : ENCODER_MAX_STEP_MS;
 
@@ -38,5 +34,4 @@ EncoderFeedback SimulatedEncoder::feedback(uint32_t now_ms) const {
     f.valid = has_update_ && (now_ms - last_update_ms_) <= ENCODER_STALE_MS;
     return f;
 }
-
-} 
+}

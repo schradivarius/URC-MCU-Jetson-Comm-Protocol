@@ -1,9 +1,3 @@
-// test_framework.h -- ~60 lines of test harness, no dependencies.
-//
-// Deliberately not GoogleTest or Unity: the Python suite this replaces needed
-// no install step, and a firmware team should be able to run `make test` on a
-// fresh laptop with nothing but a compiler. Same bargain here.
-
 #ifndef TEST_FRAMEWORK_H
 #define TEST_FRAMEWORK_H
 
@@ -12,7 +6,6 @@
 #include <cstdint>
 
 namespace testing {
-
 inline int& passCount() { static int n = 0; return n; }
 inline int& failCount() { static int n = 0; return n; }
 inline const char*& currentTest() { static const char* s = ""; return s; }
@@ -40,8 +33,7 @@ inline int summary(const char* suite) {
     std::printf("\n%s: %d passed, %d failed\n", suite, passCount(), failCount());
     return failCount() == 0 ? 0 : 1;
 }
-
-}  // namespace testing
+}
 
 #define RUN_TEST(fn)  do { testing::beginTest(#fn); fn(); testing::endTest(); } while (0)
 
@@ -62,4 +54,4 @@ inline int summary(const char* suite) {
 #define CHECK_STREQ(a, b) \
     do { if (std::strcmp((a), (b)) != 0) testing::reportFailure(__FILE__, __LINE__, #a " == " #b); } while (0)
 
-#endif  // TEST_FRAMEWORK_H
+#endif

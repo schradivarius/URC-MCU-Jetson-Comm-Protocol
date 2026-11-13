@@ -1,17 +1,3 @@
-"""
-test_integration.py -- end-to-end Jetson <-> controller over the simulated bus.
-
-The "controller" here is tools/rover_sim, which links the REAL
-firmware/src/rover_controller.cpp. There is no Python reimplementation of the
-safety logic to drift from the firmware, which is the mistake this project
-already made once and fixed.
-
-These tests involve a real subprocess and real time, so they use generous
-margins (the watchdog is 300 ms; cuts are 700 ms+) and assert on eventual
-state rather than exact frame counts. A flaky safety test gets ignored, which
-is worse than no test.
-"""
-
 import os
 import shutil
 import struct
@@ -24,7 +10,7 @@ import unittest
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(REPO, "host"))
 
-import can_link  # noqa: E402
+import sim_link  # noqa: E402
 import rover_protocol as rp  # noqa: E402
 from jetson_test import JetsonLink  # noqa: E402
 
@@ -32,7 +18,7 @@ from jetson_test import JetsonLink  # noqa: E402
 class RoverFixture(unittest.TestCase):
     def setUp(self):
         try:
-            self.link = can_link.SimLink()
+            self.link = sim_link.SimLink()
         except RuntimeError as exc:
             self.skipTest(str(exc))
         self.jl = JetsonLink(self.link)
@@ -41,36 +27,25 @@ class RoverFixture(unittest.TestCase):
         self.link.close()
 
     def drive(self, seconds, send=True, **kw):
-        """Send CONTROL at 20 Hz (or stay silent) for `seconds`, polling."""
         kw.setdefault("drive_cmd", 400)
         kw.setdefault("steer_cmd", 100)
         kw.setdefault("mode", rp.MODE_TELEOP)
         kw.setdefault("c2_lost", False)
-        # Default to the producer that OWNS the mode being commanded, so a
-        # test that is not about authority does not have to think about it --
-        # and the ones that are say so explicitly.
         kw.setdefault("from_autonomy", kw["mode"] == rp.MODE_AUTONOMOUS)
-        # The same idea for mode changes (v0.7): only the operator may grant
-        # a motion mode, so entering one goes through the operator first. The
-        # tests that are ABOUT transitions call send_frames() instead.
         if send and kw["mode"] in rp.MOTION_MODES and self.mode() != kw["mode"]:
             self.grant(kw["mode"], c2_lost=kw["c2_lost"])
         self.send_frames(seconds, send=send, **kw)
 
     def grant(self, mode, c2_lost=False):
-        """The operator granting `mode`: stopped, operator-sourced frames
-        asking for it, which is what the Jetson sends when C2 says "go"."""
         self.send_frames(0.15, drive_cmd=0, steer_cmd=0, mode=mode, stop=True,
                          c2_lost=c2_lost, from_autonomy=False)
 
     def mode(self):
-        """The mode the controller last reported, SAFE before any report."""
         if self.jl.snapshot is None:
             return rp.MODE_SAFE
         return self.jl.snapshot["mode"]
 
     def send_frames(self, seconds, send=True, **kw):
-        """Send exactly these CONTROL frames at 20 Hz (or stay silent)."""
         end = time.monotonic() + seconds
         while time.monotonic() < end:
             if send:
@@ -80,8 +55,6 @@ class RoverFixture(unittest.TestCase):
         self.jl.poll()
 
     def send_raw(self, frame, seconds):
-        """Put arbitrary bytes on the CONTROL id, the way a faulty or
-        mismatched sender would."""
         end = time.monotonic() + seconds
         while time.monotonic() < end:
             self.link.send(rp.CAN_ID_CONTROL, frame)
@@ -99,8 +72,6 @@ class RoverFixture(unittest.TestCase):
 
 
 class TestSnapshotAssembly(RoverFixture):
-    """The six telemetry frames must reassemble into coherent snapshots."""
-
     def test_all_six_frames_arrive_and_assemble(self):
         self.drive(0.6)
         self.assertGreater(self.jl.tele.complete_count, 5)
@@ -111,8 +82,6 @@ class TestSnapshotAssembly(RoverFixture):
         self.assertEqual(self.jl.unknown_frames, 0)
 
     def test_snapshots_are_not_torn(self):
-        # All six frames of a cycle share one sequence number. Over a clean
-        # link every snapshot should be coherent.
         self.drive(1.0)
         self.assertEqual(self.jl.tele.torn_count, 0,
                          "snapshots were torn across cycles on a clean link")
@@ -124,32 +93,20 @@ class TestSnapshotAssembly(RoverFixture):
         self.assertNotEqual(self.snap()["seq"], first)
 
     def test_a_snapshot_carries_every_required_field(self):
-        # The task enumerates these; this is the end-to-end check that each one
-        # actually reaches the Jetson rather than merely being defined.
         self.drive(0.6)
         s = self.snap()
         for field in ("seq", "enc_left", "enc_right", "steer_fb", "current_ca",
                       "voltage_cv", "mode", "fault_status", "cmd_age_ms",
                       "jetson_link", "c2_link", "controller_health",
                       "indicator_state",
-                      # Task 4's feedback loop adds these three. The accepted
-                      # commands are what let the Jetson tell "my command got
-                      # through" from "the rover happens to be moving".
                       "drive_applied", "steer_applied", "ack_seq",
                       "cmd_status", "last_decode", "return_active",
-                      # Task 5's expanded feedback loop adds these. Before
-                      # v0.8 the Jetson could state a command source but
-                      # never read one back, and could not tell a fresh
-                      # feedback value from one that stopped changing.
                       "cmd_source", "encoder_age_ms", "steer_age_ms",
                       "feedback_flags", "encoder_stale", "steer_stale",
                       "encoder_invalid", "steer_invalid"):
             self.assertIn(field, s, "telemetry is missing %r" % field)
 
     def test_the_feedback_ages_are_real_measurements(self):
-        # Not a constant: the simulator refreshes both channels every loop,
-        # so the age must stay small and must not read UNKNOWN once the
-        # plant has reported at all.
         self.drive(0.6)
         s = self.snap()
         for field in ("encoder_age_ms", "steer_age_ms"):
@@ -164,13 +121,8 @@ class TestSnapshotAssembly(RoverFixture):
         self.assertNotIn("STALE_FEEDBACK", self.faults())
 
     def test_the_active_command_source_is_read_back(self):
-        # The Jetson states from_autonomy on the way out; v0.8 is the first
-        # revision where it can read back which producer the CONTROLLER
-        # settled on, which is not the same answer after a refusal.
         self.drive(0.6, mode=rp.MODE_TELEOP, from_autonomy=False)
         self.assertEqual(self.snap()["cmd_source"], rp.CMD_SOURCE_OPERATOR)
-        # An autonomy frame in TELEOP is refused, so nothing is driving
-        # from it and the source is NONE rather than AUTONOMY.
         self.drive(0.6, mode=rp.MODE_TELEOP, from_autonomy=True)
         self.assertEqual(self.snap()["cmd_source"], rp.CMD_SOURCE_NONE)
         self.assertEqual(self.snap()["cmd_status"], rp.CMD_STATUS_WRONG_SOURCE)
@@ -197,7 +149,6 @@ class TestEndToEnd(RoverFixture):
         self.assertIn("COMM_TIMEOUT", self.faults())
         self.assertEqual(self.snap()["current_ca"], 0)
         self.assertEqual(self.snap()["jetson_link"], rp.LINK_LOST)
-        # A faulted rover must not display a cheerful indicator.
         self.assertEqual(self.snap()["indicator_state"], rp.INDICATOR_FAULT)
         frozen = self.snap()["enc_left"]
         self.assertGreater(frozen, moving)
@@ -206,8 +157,6 @@ class TestEndToEnd(RoverFixture):
         self.assertEqual(self.snap()["enc_left"], frozen,
                          "kept moving while commands were stale")
 
-        # v0.7: the link coming back does NOT resume driving. FAULT latches,
-        # and the reason stays in the fault word while it does.
         self.drive(0.6)
         s = self.snap()
         self.assertEqual(s["mode"], rp.MODE_FAULT)
@@ -216,7 +165,6 @@ class TestEndToEnd(RoverFixture):
         self.assertIn("COMM_TIMEOUT", self.faults())
         self.assertEqual(s["enc_left"], frozen, "drove out of a latched fault")
 
-        # SAFE is the way out; then the operator can grant TELEOP again.
         self.drive(0.4, mode=rp.MODE_SAFE)
         self.assertEqual(self.snap()["mode"], rp.MODE_SAFE)
         self.assertEqual(self.faults(), [])
@@ -232,9 +180,6 @@ class TestEndToEnd(RoverFixture):
         self.drive(0.4, drive_cmd=1000, steer_cmd=500, stop=True)
         self.assertEqual(self.snap()["enc_left"], halted,
                          "moved while stop was asserted")
-        # Real subprocess, real latency: the previous command is still in
-        # effect for an iteration or two. Bounded coast then a full freeze is
-        # the property that matters, not a single-cycle stop.
         self.assertLess(halted - running, 500, "coasted far too long")
         self.drive(0.5)
         self.assertGreater(self.snap()["enc_left"], halted)
@@ -261,16 +206,11 @@ class TestNewCommandFields(RoverFixture):
         self.assertEqual(self.snap()["current_ca"], 0)
 
     def test_autonomy_abort_does_not_stop_a_teleoperated_rover(self):
-        # In TELEOP the operator is already driving; there is no autonomous
-        # task to abort, and stopping would surprise them mid-manoeuvre.
         self.drive(0.6, drive_cmd=600, mode=rp.MODE_TELEOP, autonomy_abort=True)
         self.assertGreater(self.snap()["enc_left"], 0)
         self.assertGreater(self.snap()["current_ca"], 0)
 
     def test_the_indicator_reports_what_the_rover_is_actually_doing(self):
-        # URC scores this light on the rover's real state, so the controller's
-        # own mode overrides the Jetson's request. Comparing request against
-        # state is how an operator sees whether it was honoured.
         for requested in (rp.INDICATOR_TELEOP, rp.INDICATOR_AUTONOMOUS,
                           rp.INDICATOR_ARRIVED):
             self.drive(0.4, mode=rp.MODE_TELEOP, indicator_request=requested)
@@ -281,7 +221,6 @@ class TestNewCommandFields(RoverFixture):
                    indicator_request=rp.INDICATOR_TELEOP)
         self.assertEqual(self.snap()["indicator_state"], rp.INDICATOR_AUTONOMOUS)
 
-        # ARRIVED is the one request the controller cannot derive itself.
         self.drive(0.4, mode=rp.MODE_AUTONOMOUS,
                    indicator_request=rp.INDICATOR_ARRIVED)
         self.assertEqual(self.snap()["indicator_state"], rp.INDICATOR_ARRIVED)
@@ -291,19 +230,13 @@ class TestNewCommandFields(RoverFixture):
         self.assertEqual(self.snap()["indicator_state"], rp.INDICATOR_OFF)
 
     def test_mode_is_echoed_back(self):
-        # Without the echo a dropped or misread mode change is invisible.
         for mode in (rp.MODE_TELEOP, rp.MODE_AUTONOMOUS, rp.MODE_SAFE):
             self.drive(0.4, mode=mode)
             self.assertEqual(self.snap()["mode"], mode)
 
 
 class TestLinkSeparation(RoverFixture):
-    """C2 loss and Jetson loss must never be treated as equivalent."""
-
     def test_c2_link_is_reported_not_reported_before_any_frame(self):
-        # Honest "nobody told us" rather than a misleading OK. The controller
-        # has no radio, so this is the only truthful answer until the Jetson
-        # forwards its verdict.
         self.drive(0.3, send=False)
         snap = self.snap()
         self.assertEqual(snap["c2_link"], rp.LINK_NOT_REPORTED)
@@ -323,14 +256,10 @@ class TestLinkSeparation(RoverFixture):
                          "C2 was reported OK purely because the Jetson link was")
 
     def test_c2_loss_stops_teleop_but_not_autonomy(self):
-        # The asymmetry the autonomy course requires: line of sight to the
-        # base station drops while onboard autonomy keeps running.
         self.drive(0.6, drive_cmd=800, mode=rp.MODE_AUTONOMOUS, c2_lost=True)
         self.assertNotEqual(self.snap()["current_a"], 0.0,
                             "an autonomous rover was stopped by C2 loss alone")
 
-        # A rover already teleoperated when C2 drops, which is the case that
-        # matters: v0.7 will not let TELEOP be entered with C2 lost at all.
         self.drive(0.4, drive_cmd=800, mode=rp.MODE_TELEOP, c2_lost=False)
         self.drive(0.6, drive_cmd=800, mode=rp.MODE_TELEOP, c2_lost=True)
         self.assertEqual(self.snap()["current_a"], 0.0,
@@ -338,11 +267,9 @@ class TestLinkSeparation(RoverFixture):
         self.assertEqual(self.snap()["mode"], rp.MODE_FAULT)
 
     def test_a_stale_c2_bit_is_reported_as_not_reported(self):
-        # Once the Jetson goes silent the last c2_lost value is stale. A clear
-        # bit from before the silence does not mean C2 is fine now.
         self.drive(0.4, mode=rp.MODE_AUTONOMOUS, c2_lost=False)
         self.assertEqual(self.snap()["c2_link"], rp.LINK_OK)
-        self.drive(0.6, send=False)              # past the 300 ms watchdog
+        self.drive(0.6, send=False)
         snap = self.snap()
         self.assertTrue(snap["fault_status"] & rp.FAULT_COMM_TIMEOUT)
         self.assertEqual(snap["c2_link"], rp.LINK_NOT_REPORTED)
@@ -375,8 +302,6 @@ class TestBusHygiene(RoverFixture):
         self.assertEqual(self.snap()["current_ca"], 0)
 
     def test_a_corrupted_frame_is_rejected_and_reported(self):
-        # Corrupted AFTER the CRC is computed -- exactly the software-path
-        # failure CAN's own CRC cannot see.
         self.drive(0.4)
         good = rp.encode_control(900, 0, rp.MODE_TELEOP, False, seq=50)
         bad = bytearray(good)
@@ -398,7 +323,7 @@ class TestBusHygiene(RoverFixture):
 
     def test_a_sequence_gap_is_detected_and_reported(self):
         self.drive(0.4)
-        for seq in (10, 60):          # a 50-frame jump
+        for seq in (10, 60):
             self.link.send(rp.CAN_ID_CONTROL,
                            rp.encode_control(400, 0, rp.MODE_TELEOP, False, seq=seq))
             time.sleep(0.08)
@@ -409,12 +334,6 @@ class TestBusHygiene(RoverFixture):
 
 
 class TestCommandAuthority(RoverFixture):
-    """Task 4's core claim: manual and autonomous commands do not get mixed up.
-
-    These run against the real compiled controller over a real pipe, so what
-    they check is the behaviour a rover would show, not a predicate.
-    """
-
     def test_an_autonomy_command_is_not_acted_on_while_teleoperated(self):
         self.drive(0.6, drive_cmd=600, steer_cmd=0, mode=rp.MODE_TELEOP,
                    from_autonomy=True)
@@ -423,13 +342,10 @@ class TestCommandAuthority(RoverFixture):
         self.assertEqual(s["drive_applied"], 0)
         self.assertEqual(s["cmd_status"], rp.CMD_STATUS_WRONG_SOURCE)
         self.assertIn("CMD_SOURCE", self.faults())
-        # Refused, not disconnected: the frame was valid and the link is fine.
         self.assertNotIn("COMM_TIMEOUT", self.faults())
         self.assertEqual(s["jetson_link"], rp.LINK_OK)
 
     def test_the_same_command_drives_once_the_mode_matches(self):
-        # The demonstration the task asks for, end to end: identical command,
-        # only the mode differs.
         self.drive(0.6, drive_cmd=600, steer_cmd=0, mode=rp.MODE_TELEOP,
                    from_autonomy=True)
         refused = self.snap()["enc_left"]
@@ -460,8 +376,6 @@ class TestCommandAuthority(RoverFixture):
         self.assertEqual(self.snap()["cmd_status"], rp.CMD_STATUS_STOPPED)
 
     def test_a_stop_from_the_unauthorised_source_still_stops_the_rover(self):
-        # Safety flags are never gated by authority: an operator who can see
-        # the rover must be able to stop it even while autonomy owns the mode.
         self.drive(0.5, drive_cmd=800, mode=rp.MODE_AUTONOMOUS)
         self.assertGreater(self.snap()["enc_left"], 0)
         self.drive(0.5, drive_cmd=800, mode=rp.MODE_AUTONOMOUS,
@@ -473,8 +387,6 @@ class TestCommandAuthority(RoverFixture):
         self.assertEqual(self.snap()["cmd_status"], rp.CMD_STATUS_STOPPED)
 
     def test_the_refusal_does_not_latch(self):
-        # A safety gate that cannot be left is a rover that has to be
-        # power-cycled at a competition.
         self.drive(0.5, drive_cmd=600, mode=rp.MODE_TELEOP, from_autonomy=True)
         self.assertIn("CMD_SOURCE", self.faults())
         self.drive(0.5, drive_cmd=600, mode=rp.MODE_TELEOP, from_autonomy=False)
@@ -483,7 +395,6 @@ class TestCommandAuthority(RoverFixture):
         self.assertGreater(self.snap()["enc_left"], 0)
 
     def test_an_unauthorised_arrival_claim_does_not_light_the_indicator(self):
-        # Flashing green is worth 25 points under rule 1.e.xvii.
         self.drive(0.5, drive_cmd=0, mode=rp.MODE_AUTONOMOUS,
                    from_autonomy=False, indicator_request=rp.INDICATOR_ARRIVED)
         self.assertEqual(self.snap()["indicator_state"], rp.INDICATOR_AUTONOMOUS)
@@ -492,8 +403,6 @@ class TestCommandAuthority(RoverFixture):
         self.assertEqual(self.snap()["indicator_state"], rp.INDICATOR_ARRIVED)
 
     def test_a_stale_source_mismatch_is_not_reported(self):
-        # Once the watchdog trips, the controller cannot vouch for who sent
-        # the last frame any more than for what it said.
         self.drive(0.5, drive_cmd=600, mode=rp.MODE_TELEOP, from_autonomy=True)
         self.assertIn("CMD_SOURCE", self.faults())
         self.drive(0.7, send=False)
@@ -502,21 +411,15 @@ class TestCommandAuthority(RoverFixture):
 
 
 class TestAcknowledgement(RoverFixture):
-    """TELEM_CMD_ECHO: the Jetson has to be able to prove a command landed."""
-
     def test_the_controller_acknowledges_the_sequence_it_acted_on(self):
         self.drive(0.6, drive_cmd=400)
         s = self.snap()
-        # The ack has to name a frame we actually sent, and a recent one --
-        # 20 Hz commands and 20 Hz telemetry should never be far apart.
         self.assertLessEqual(rp.seq_delta(s["ack_seq"], self.jl.tx_seq), 10,
                              "the acknowledged sequence number is far behind")
         self.assertEqual(s["cmd_status"], rp.CMD_STATUS_APPLIED)
         self.assertEqual(s["last_decode"], rp.DECODE_OK)
 
     def test_the_echo_reports_why_the_last_frame_was_rejected(self):
-        # A rejected frame and an applied command can coexist: the reason the
-        # last frame bounced is its own field, not a verdict on the command.
         self.drive(0.4, drive_cmd=400)
         good = rp.encode_control(400, 0, rp.MODE_TELEOP, False, seq=90)
         bad = bytearray(good)
@@ -532,8 +435,6 @@ class TestAcknowledgement(RoverFixture):
             self.assertEqual(s["steer_applied"], steer_cmd)
 
     def test_a_return_request_is_acknowledged_without_stopping_the_rover(self):
-        # Reported, not obeyed: driving back is route planning, and
-        # PROTOCOL.md section 9 leaves the semantics as a team decision.
         self.drive(0.5, drive_cmd=500, mode=rp.MODE_AUTONOMOUS,
                    return_request=True)
         s = self.snap()
@@ -544,28 +445,19 @@ class TestAcknowledgement(RoverFixture):
         self.assertEqual(s["indicator_state"], rp.INDICATOR_AUTONOMOUS)
 
     def test_controller_health_is_no_longer_a_constant(self):
-        # The drive module reports its own state, so this field finally
-        # carries something. OK while driving normally.
         self.drive(0.6, drive_cmd=400, steer_cmd=0)
         self.assertEqual(self.snap()["controller_health"], rp.CTRL_HEALTH_OK)
 
     def test_a_saturating_mix_is_reported_as_degraded(self):
-        # drive 800 + steer 400 asks for 1200 on one side. The module scales
-        # the pair down to keep the turn, and says it could not deliver both.
         self.drive(0.6, drive_cmd=800, steer_cmd=400, mode=rp.MODE_AUTONOMOUS)
         self.assertEqual(self.snap()["controller_health"],
                          rp.CTRL_HEALTH_DEGRADED)
-        # Still driving -- DEGRADED is information, not a fault.
         self.assertGreater(self.snap()["enc_left"], 0)
         self.assertEqual(self.faults(), [])
 
 
 class TestDriveStage(RoverFixture):
-    """The mixing actually reaches the plant, rather than stopping at a struct."""
-
     def test_steering_splits_the_two_encoders(self):
-        # Straight ahead: both sides equal. Turning: they diverge, and in the
-        # commanded direction.
         self.drive(0.6, drive_cmd=400, steer_cmd=0)
         s = self.snap()
         self.assertEqual(s["enc_left"], s["enc_right"],
@@ -591,17 +483,8 @@ class TestDriveStage(RoverFixture):
 
 
 class TestProtocolRootOverride(unittest.TestCase):
-    """Where can_link looks for the firmware it compiles.
-
-    The autonomy program is going to live in its own repository, so the Jetson
-    code has to be able to point at a checkout of the protocol repository
-    rather than assume the firmware sits one directory above it. These run in
-    subprocesses because the root is resolved at import time, and a reload
-    would leave the module pointing somewhere else for every test after it.
-    """
-
     SNIPPET = ("import sys; sys.path.insert(0, %r);"
-               " import can_link; print(can_link.REPO)")
+               " import sim_link; print(sim_link.REPO)")
 
     def _run(self, snippet, env_root=None, cwd=None, argv=None):
         env = dict(os.environ)
@@ -617,13 +500,8 @@ class TestProtocolRootOverride(unittest.TestCase):
         self.assertEqual(done.stdout.strip(), os.path.realpath(REPO))
 
     def test_the_variable_moves_the_root_somewhere_else_entirely(self):
-        # Pointing the variable AT this repository would prove nothing: the
-        # default derivation lands on the same path, so the assertion would
-        # pass either way. So the root here is a foreign directory that merely
-        # has the right shape, which is also what a protocol checkout inside a
-        # separate autonomy repository looks like.
         snippet = (self.SNIPPET % os.path.join(REPO, "host")) + \
-            "; print(can_link.build_sim())"
+            "; print(sim_link.build_sim())"
         with tempfile.TemporaryDirectory() as elsewhere:
             for name in ("firmware", "tools"):
                 os.symlink(os.path.join(REPO, name),
@@ -633,18 +511,12 @@ class TestProtocolRootOverride(unittest.TestCase):
             root, binary = done.stdout.split()
             self.assertEqual(root, elsewhere)
             self.assertNotEqual(root, REPO)
-            # Compiled from the foreign root, into the foreign root -- so a
-            # read-only protocol checkout is the one layout this cannot serve,
-            # and it fails loudly rather than reusing the wrong binary.
             self.assertTrue(binary.startswith(elsewhere), binary)
             self.assertTrue(os.access(binary, os.X_OK))
 
     def test_a_wrong_root_fails_by_name_and_says_which_variable_is_wrong(self):
-        # The symptom to avoid is a compiler error about a header nobody
-        # pointed at. The message has to name the file AND the variable, or the
-        # next person edits the wrong thing.
         snippet = (self.SNIPPET % os.path.join(REPO, "host")) + \
-            "; can_link.build_sim()"
+            "; sim_link.build_sim()"
         with tempfile.TemporaryDirectory() as empty:
             done = self._run(snippet, env_root=empty, cwd="/")
         self.assertNotEqual(done.returncode, 0)
@@ -653,13 +525,6 @@ class TestProtocolRootOverride(unittest.TestCase):
         self.assertIn("ROVER_PROTOCOL_ROOT", done.stderr)
 
     def test_the_pinning_follows_the_firmware_that_is_actually_compiled(self):
-        # The regression test for a real bug. When only can_link.py honoured the
-        # override, the integration suite drove the FOREIGN firmware while
-        # test_config_sync.py and test_golden_vectors.py read the LOCAL headers.
-        # The whole host suite then reported OK against a firmware declaring a
-        # different PROTOCOL_VERSION than the Python codec talking to it -- the
-        # one failure section 8 of PROTOCOL.md exists to catch, hidden by the
-        # very flag added to keep the two honest across checkouts.
         with tempfile.TemporaryDirectory() as foreign:
             for name in ("firmware", "tools"):
                 shutil.copytree(os.path.join(REPO, name),
@@ -684,11 +549,8 @@ class TestProtocolRootOverride(unittest.TestCase):
         self.assertIn("PROTOCOL_VERSION differs", done.stderr)
 
     def test_an_already_built_binary_cannot_mask_a_wrong_root(self):
-        # The nastiest version of the mistake: a stale binary left in place
-        # looks perfectly good, so the sources are checked BEFORE the staleness
-        # comparison rather than after it.
         snippet = (self.SNIPPET % os.path.join(REPO, "host")) + \
-            "; can_link.build_sim()"
+            "; sim_link.build_sim()"
         with tempfile.TemporaryDirectory() as fake:
             build = os.path.join(fake, "tests", "cpp", "build")
             os.makedirs(build)

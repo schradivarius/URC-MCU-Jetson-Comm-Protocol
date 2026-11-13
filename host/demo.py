@@ -1,24 +1,4 @@
 #!/usr/bin/env python3
-"""
-demo.py -- Jetson <-> controller message-exchange demonstration, no hardware.
-
-Runs against tools/rover_sim: the REAL C++ rover_controller.cpp compiled
-natively, with only the plant and the transport simulated. So what you see
-below is the actual safety logic that gets flashed to the Teensy.
-
-A: normal 20 Hz operation, six telemetry frames reassembled per cycle.
-B: a deliberate 800 ms silence (well past the 300 ms command watchdog).
-C: the explicit stop flag at full throttle.
-D: autonomy abort while in AUTONOMOUS.
-E: a corrupted frame -- the application-layer CRC rejects it and the rover
-   reports CRC_ERROR rather than acting on it.
-F: a sequence gap -- detected and reported as SEQ_GAP.
-
-This is the TASK 3 demonstration and stays focused on the link. The Task 4
-demonstration -- an autonomy decision reaching the drive stage, and autonomy
-and teleop commands being refused in each other's modes -- is
-host/autonomy_sim.py (`make autonomy`).
-"""
 
 import os
 import sys
@@ -26,7 +6,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import can_link  # noqa: E402
+import sim_link  # noqa: E402
 import rover_protocol as rp  # noqa: E402
 from jetson_test import JetsonLink  # noqa: E402
 
@@ -72,7 +52,7 @@ def main():
     print("REAL compiled firmware safety logic from firmware/src/)")
     print("=" * 78)
 
-    link = can_link.SimLink()
+    link = sim_link.SimLink()
     jl = JetsonLink(link)
     t0 = time.monotonic()
     try:
@@ -111,10 +91,6 @@ def main():
               drive_cmd=800, steer_cmd=0, mode=rp.MODE_AUTONOMOUS, c2_lost=True,
               indicator_request=rp.INDICATOR_AUTONOMOUS, from_autonomy=True)
 
-        # The two link failures are NOT equivalent, and these two phases are
-        # the demonstration of it. C2 loss with a healthy Jetson is expected on
-        # the autonomy course, where line of sight to the base station drops
-        # while onboard autonomy keeps running.
         phase(jl, t0, 0.3, "D3: operator takes back TELEOP",
               drive_cmd=800, steer_cmd=0, mode=rp.MODE_TELEOP, c2_lost=False,
               indicator_request=rp.INDICATOR_TELEOP)
@@ -122,9 +98,6 @@ def main():
         phase(jl, t0, 0.5, "D3: C2 lost while TELEOP -- latches FAULT, nobody can reach it",
               drive_cmd=800, steer_cmd=0, mode=rp.MODE_TELEOP, c2_lost=True,
               indicator_request=rp.INDICATOR_TELEOP)
-        # E: corrupt a frame AFTER the CRC is computed. CAN's own CRC would not
-        # see this -- it is exactly the software-path corruption the
-        # application-layer CRC exists to catch.
         print("-- E: corrupted payload (app-layer CRC must reject it) --")
         good = rp.encode_control(900, 0, rp.MODE_TELEOP, False, seq=99)
         bad = bytearray(good)
@@ -138,7 +111,6 @@ def main():
         if txt:
             print(txt)
 
-        # F: jump the sequence number so frames look lost.
         print("-- F: sequence gap (frames 100 -> 140) --")
         link.send(rp.CAN_ID_CONTROL,
                   rp.encode_control(400, 0, rp.MODE_TELEOP, False, seq=100))

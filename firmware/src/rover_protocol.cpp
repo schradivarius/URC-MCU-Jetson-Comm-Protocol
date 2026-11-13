@@ -1,15 +1,7 @@
-// rover_protocol.cpp -- little-endian serialization, CRC-8 and validation for
-// the rover CAN messages. See rover_protocol.h for the design rationale.
-
 #include "rover_protocol.h"
 
 namespace rover {
 namespace {
-
-// Explicit little-endian put/get. Byte-at-a-time rather than memcpy of a
-// packed struct, so nothing here depends on compiler padding or host
-// endianness. This is the C++ counterpart of Python's '<' struct prefix.
-
 inline void putU16(uint8_t* b, uint16_t v) {
     b[0] = static_cast<uint8_t>(v & 0xFF);
     b[1] = static_cast<uint8_t>((v >> 8) & 0xFF);
@@ -33,9 +25,6 @@ inline uint32_t getU32(const uint8_t* b) {
          | (static_cast<uint32_t>(b[3]) << 24);
 }
 
-// Signed values go over the wire as two's-complement bit patterns. Converting
-// through the unsigned type is the defined way to do this: casting a too-large
-// unsigned straight to a signed type is implementation-defined before C++20.
 inline void putI16(uint8_t* b, int16_t v) { putU16(b, static_cast<uint16_t>(v)); }
 inline void putI32(uint8_t* b, int32_t v) { putU32(b, static_cast<uint32_t>(v)); }
 
@@ -52,15 +41,12 @@ inline int32_t getI32(const uint8_t* b) {
         : static_cast<int32_t>(u);
 }
 
-// Append the sequence number and CRC to a 6-byte payload, producing DLC 8.
 inline uint8_t sealFrame(uint32_t can_id, uint8_t seq, uint8_t* buf) {
     buf[FRAME_SEQ_OFFSET] = seq;
     buf[FRAME_CRC_OFFSET] = frameCrc8(can_id, buf, FRAME_SEQ_OFFSET + 1);
     return FRAME_DLC;
 }
 
-// Shared front half of every decode: length, then CRC. Returns DECODE_OK and
-// writes the sequence number out, or the reason it failed.
 inline DecodeResult openFrame(uint32_t can_id, const uint8_t* buf, uint8_t len,
                               uint8_t& seq_out) {
     if (len != FRAME_DLC) return DECODE_BAD_DLC;
@@ -70,18 +56,7 @@ inline DecodeResult openFrame(uint32_t can_id, const uint8_t* buf, uint8_t len,
     seq_out = buf[FRAME_SEQ_OFFSET];
     return DECODE_OK;
 }
-
-} // namespace
-
-// ---------------------------------------------------------------------------
-// CRC-8 / SAE-J1850: poly 0x1D, init 0xFF, MSB-first, final XOR 0xFF.
-//
-// NOTE FOR ANYONE PORTING THIS: for a CRC-8 the data byte is XORed into the
-// WHOLE register (`crc ^= byte`). For a CRC-16 you would XOR it into the high
-// byte (`crc ^= byte << 8`). Copying a CRC-16 loop and changing the width is
-// the classic way to get a plausible-looking wrong answer. The known-answer
-// test in tests/cpp/test_protocol.cpp exists to catch exactly that.
-// ---------------------------------------------------------------------------
+}
 
 uint8_t crc8Update(uint8_t crc, const uint8_t* data, size_t len) {
     for (size_t i = 0; i < len; ++i) {
@@ -99,9 +74,6 @@ uint8_t crc8(const uint8_t* data, size_t len) {
 }
 
 uint8_t frameCrc8(uint32_t can_id, const uint8_t* payload, size_t len) {
-    // The id is chained low byte first, matching the protocol's little-endian
-    // convention. All four bytes are included so an 11-bit and a 29-bit id
-    // with the same low bits cannot collide.
     const uint8_t id_bytes[4] = {
         static_cast<uint8_t>(can_id & 0xFF),
         static_cast<uint8_t>((can_id >> 8) & 0xFF),
@@ -113,24 +85,15 @@ uint8_t frameCrc8(uint32_t can_id, const uint8_t* payload, size_t len) {
     return static_cast<uint8_t>(crc ^ 0xFF);
 }
 
-// ---------------------------------------------------------------------------
-// Validation predicates
-// ---------------------------------------------------------------------------
-
 bool isCommandableMode(uint8_t mode) {
     return mode == MODE_SAFE || mode == MODE_TELEOP || mode == MODE_AUTONOMOUS;
 }
 
 bool modePermitsMotion(uint8_t mode) {
-    // Whitelist. Every value not named here -- including SAFE and every
-    // undefined value -- means stop. A safety predicate must fail CLOSED.
     return mode == MODE_TELEOP || mode == MODE_AUTONOMOUS;
 }
 
 bool sourceOwnsMode(bool from_autonomy, uint8_t mode) {
-    // Only modes that permit motion have an owner -- in SAFE nothing may
-    // move, so there is nothing for a source to be wrong about and a caller
-    // asking the question gets "yes" rather than a spurious mismatch.
     if (!modePermitsMotion(mode)) return true;
     return from_autonomy == (mode == MODE_AUTONOMOUS);
 }
@@ -139,18 +102,14 @@ namespace {
     enum Rule : uint8_t {DENY, ANYONE, OPERATOR};
 
     const Rule TRANSITIONS[MODE_FAULT + 1][MODE_MAX + 1] = {
-        //             {TO SAFE,  TO TELEOP, TO AUTONOMOUS}
-        /*SAFE*/       {ANYONE,   OPERATOR,  OPERATOR},
-        /*TELEOP*/     {ANYONE,   ANYONE,    OPERATOR},
-        /*AUTONOMOUS*/ {ANYONE,   OPERATOR,  ANYONE},
-        /*FAULT*/      {ANYONE,   DENY,      DENY},
+               {ANYONE,   OPERATOR,  OPERATOR},
+             {ANYONE,   ANYONE,    OPERATOR},
+         {ANYONE,   OPERATOR,  ANYONE},
+              {ANYONE,   DENY,      DENY},
 };
-} // NAMESPACE
+}
 
 bool transitionAllowed(uint8_t from, uint8_t to, bool from_autonomy) {
-    // Both indices are range-checked before they touch the table: `from` and
-    // `to` are uint8, so 256 values fit where 4 and 3 are defined, and reading
-    // past the end of an array is undefined behaviour, not a refusal.
     if (from > MODE_FAULT || !isCommandableMode(to)) return false;
     switch (TRANSITIONS[from][to]) {
         case ANYONE:   return true;
@@ -168,15 +127,8 @@ bool isKnownIndicator(uint8_t indicator) {
     return indicator <= INDICATOR_FAULT;
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
 int32_t wrapI32(int64_t value) {
-    // Shift into unsigned range, wrap with a modulo well defined for
-    // negatives, then shift back. Avoids signed overflow entirely, which in
-    // C++ is undefined behaviour rather than a wrap.
-    const int64_t span = 4294967296LL;  // 2^32
+    const int64_t span = 4294967296LL;
     int64_t shifted = (value - INT32_MIN_V) % span;
     if (shifted < 0) shifted += span;
     return static_cast<int32_t>(shifted + INT32_MIN_V);
@@ -204,9 +156,6 @@ const char* cmdSourceName(uint8_t source) {
 }
 
 uint8_t seqDelta(uint8_t previous, uint8_t current) {
-    // Unsigned subtraction, so this is correct across the 255->0 wrap without
-    // any special case. Same reasoning as the millis() handling in
-    // rover_controller.cpp: subtract, never compare.
     return static_cast<uint8_t>(current - previous);
 }
 
@@ -243,10 +192,6 @@ const char* decodeResultName(DecodeResult r) {
     return "UNKNOWN";
 }
 
-// ---------------------------------------------------------------------------
-// CONTROL
-// ---------------------------------------------------------------------------
-
 uint8_t encodeControl(const ControlMsg& msg, uint8_t* buf) {
     putI16(buf + 0, msg.drive_cmd);
     putI16(buf + 2, msg.steer_cmd);
@@ -272,25 +217,12 @@ DecodeResult decodeControl(uint32_t can_id, const uint8_t* buf, uint8_t len,
     const uint8_t mode  = buf[4];
     const uint8_t flags = buf[5];
 
-    // A mode the Jetson may not send (undefined, or FAULT, which only the
-    // controller enters) means the sender disagrees with us about the
-    // protocol. Reject the whole frame rather than storing a value we cannot reason
-    // about. Deliberately NOT forward-compatible: a newer peer sending a mode
-    // this firmware does not implement must stop this rover.
     if (!isCommandableMode(mode)) return DECODE_BAD_MODE;
-
-    // No reserved-bit check remains: v0.6 took bit 7 for from_autonomy and
-    // the flags byte is full. A frame whose source does not own the mode is
-    // NOT rejected here -- it is well formed, and refusing it would stop the
-    // rover over a Jetson-side mux bug instead of reporting one. Authority is
-    // the controller's decision; see RoverController::commandAuthorized().
 
     const uint8_t indicator =
         static_cast<uint8_t>((flags & CTRL_INDICATOR_MASK) >> CTRL_INDICATOR_SHIFT);
     if (!isKnownIndicator(indicator)) return DECODE_BAD_INDICATOR;
 
-    // Same reasoning for an out-of-range drive or steer: reject, never clamp.
-    // See isValidCommand() in rover_protocol.h.
     const int16_t drive = getI16(buf + 0);
     const int16_t steer = getI16(buf + 2);
     if (!isValidCommand(drive) || !isValidCommand(steer)) return DECODE_BAD_RANGE;
@@ -307,10 +239,6 @@ DecodeResult decodeControl(uint32_t can_id, const uint8_t* buf, uint8_t len,
     out.seq              = seq;
     return DECODE_OK;
 }
-
-// ---------------------------------------------------------------------------
-// TELEMETRY
-// ---------------------------------------------------------------------------
 
 uint8_t encodeTelemetryDriveL(const TelemetryDriveL& msg, uint8_t seq, uint8_t* buf) {
     putI32(buf + 0, msg.enc_left);
@@ -359,13 +287,6 @@ DecodeResult decodeTelemetryPower(uint32_t can_id, const uint8_t* buf, uint8_t l
     return DECODE_OK;
 }
 
-// ---------------------------------------------------------------------------
-// Command-status byte
-// ---------------------------------------------------------------------------
-
-// Both fields are three bits wide, so the enums they carry have to fit. A
-// seventh DecodeResult or a fifth CMD_STATUS_* is fine; an eighth is not, and
-// would otherwise silently truncate onto the wire.
 static_assert(DECODE_BAD_RANGE <= 7, "DecodeResult no longer fits in 3 bits");
 static_assert(CMD_STATUS_NO_COMMAND <= 7, "CMD_STATUS_* no longer fits in 3 bits");
 
@@ -462,5 +383,4 @@ DecodeResult decodeTelemetryFeedback(uint32_t can_id, const uint8_t* buf, uint8_
     out.flags          = static_cast<uint8_t>(buf[5] & FB_FLAGS_MASK);
     return DECODE_OK;
 }
-
-}  // namespace rover
+}

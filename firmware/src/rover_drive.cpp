@@ -1,24 +1,18 @@
 #include "rover_drive.h"
 
 namespace rover {
-
-// CMD_MAX is the divisor in both the mix scaling and the PWM conversion.
 static_assert(CMD_MAX > 0, "CMD_MAX must be positive; it divides below");
 static_assert(CMD_MIN == -CMD_MAX, "the command range is assumed symmetric");
 
 namespace {
-
 int16_t clampEffort(int32_t value) {
     if (value > CMD_MAX) return CMD_MAX;
     if (value < CMD_MIN) return CMD_MIN;
     return static_cast<int16_t>(value);
 }
-
-}  // namespace
+}
 
 uint16_t effortToPwmUs(int16_t effort) {
-    // int32 throughout: effort * PWM_SPAN_US reaches 500000, which overflows
-    // int16 long before the division brings it back.
     const int32_t clamped = clampEffort(effort);
     const int32_t offset =
         (clamped * static_cast<int32_t>(PWM_SPAN_US)) / static_cast<int32_t>(CMD_MAX);
@@ -49,11 +43,6 @@ const DriveOutputs& DriveModule::update(int16_t drive, int16_t steer, bool energ
     updates_++;
     mix_saturated_ = false;
 
-    // A command outside the valid range should have been rejected by
-    // decodeControl() long before reaching this module. If it got here, the
-    // validation layer above is broken -- so clamp (never act on a value we do
-    // not understand) and LATCH it, because a silent clamp is exactly how a
-    // misunderstood command becomes full throttle.
     if (!isValidCommand(drive) || !isValidCommand(steer)) {
         range_fault_ = true;
         range_violations_++;
@@ -61,27 +50,17 @@ const DriveOutputs& DriveModule::update(int16_t drive, int16_t steer, bool energ
     const int32_t d = clampEffort(drive);
     const int32_t s = clampEffort(steer);
 
-    // The stop path, and it comes first so that no amount of later editing can
-    // slip a command past it. The caller has already zeroed the commands under
-    // a stop; this honours the flag anyway, because two independent reasons to
-    // be at neutral is the point.
     if (!energized) {
         neutral();
         return out_;
     }
 
-    // Differential mix. Scaled down proportionally rather than clamped per
-    // channel: clamping left to CMD_MAX while right stays where it is changes
-    // the RATIO between the two, which is the turn. Scaling keeps the turn and
-    // gives up only speed, which is the right thing to lose.
     int32_t left  = d + s;
     int32_t right = d - s;
     int32_t peak  = left >= 0 ? left : -left;
     const int32_t right_mag = right >= 0 ? right : -right;
     if (right_mag > peak) peak = right_mag;
     if (peak > CMD_MAX) {
-        // Integer division truncates toward zero, so the result is at or just
-        // inside full scale -- never over it.
         left  = (left  * CMD_MAX) / peak;
         right = (right * CMD_MAX) / peak;
         mix_saturated_ = true;
@@ -103,5 +82,4 @@ uint8_t DriveModule::health() const {
     if (mix_saturated_) return CTRL_HEALTH_DEGRADED;
     return CTRL_HEALTH_OK;
 }
-
-}  // namespace rover
+}

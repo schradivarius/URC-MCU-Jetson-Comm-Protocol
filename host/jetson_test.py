@@ -1,17 +1,12 @@
 #!/usr/bin/env python3
 """
-jetson_test.py -- Jetson-side test harness for the rover CAN link.
+jetson_test.py -- Jetson-side test harness for the rover serial link.
 
-    # Against the compiled simulator (no hardware, no CAN drivers):
+    # Against the compiled simulator (no hardware):
     python3 host/jetson_test.py --mock --duration 5
 
-    # Against a Linux virtual CAN bus:
-    #   sudo modprobe vcan && sudo ip link add dev vcan0 type vcan
-    #   sudo ip link set up vcan0
-    python3 host/jetson_test.py --channel vcan0
-
-    # Against the real Teensy on a real bus:
-    python3 host/jetson_test.py --channel can0 --bitrate 500000
+    # Against the real Teensy over USB serial:
+    python3 host/jetson_test.py --port /dev/ttyACM0
 
 Sends CONTROL at 20 Hz with an incrementing sequence number, and reassembles
 the six telemetry frames into coherent snapshots.
@@ -29,48 +24,31 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import c2_link  # noqa: E402
-import can_link  # noqa: E402
+import sim_link  # noqa: E402
 import rover_protocol as rp  # noqa: E402
 from rover_config import (  # noqa: E402
-    CAN_BITRATE_HZ, CONTROL_RATE_HZ, LINK_TIMEOUT_S,
+    SERIAL_BAUD_HZ, CONTROL_RATE_HZ, LINK_TIMEOUT_S,
 )
 
 
-
 class TelemetryAssembler:
-    """Collects the six telemetry frames of one cycle into one snapshot.
-
-    All six frames of a cycle carry the SAME sequence number, which is how a
-    coherent snapshot is told from one torn across two cycles. A torn snapshot
-    is counted rather than silently published, because mixing a fresh encoder
-    reading with a stale fault word is exactly the kind of quiet wrongness
-    that makes a dashboard untrustworthy.
-    """
-
     def __init__(self):
-        self.partial = {}          # can_id -> decoded dict, current seq only
+        self.partial = {}
         self.partial_seq = None
-        self.snapshot = None       # last COMPLETE snapshot
+        self.snapshot = None
         self.snapshot_seq = None
         self.complete_count = 0
         self.torn_count = 0
         self.frames_by_id = {cid: 0 for cid in rp.TELEM_IDS}
-        self.decode_errors = {}    # DecodeResult -> count
+        self.decode_errors = {}
 
     def missing_ids(self):
-        """Telemetry ids nothing has ever arrived on.
-
-        Worth naming rather than just waiting: a controller running an older
-        protocol sends a SUBSET of these frames, so the snapshot never
-        completes and the only symptom is silence. There is no version field
-        on the wire (PROTOCOL.md 6), so which ids showed up is the diagnostic.
-        """
         return tuple(cid for cid, n in self.frames_by_id.items() if n == 0)
 
     def feed(self, can_id, frame):
         decoder = rp.DECODERS.get(can_id)
         if decoder is None:
-            return False           # not telemetry; caller counts it
+            return False
         result, decoded = decoder(frame)
         if result != rp.DECODE_OK:
             self.decode_errors[result] = self.decode_errors.get(result, 0) + 1
@@ -79,8 +57,6 @@ class TelemetryAssembler:
         seq = decoded["seq"]
 
         if self.partial_seq is None or seq != self.partial_seq:
-            # A new cycle started. If the previous one never completed, the
-            # snapshot was torn -- frames were lost mid-cycle.
             if self.partial_seq is not None and len(self.partial) < len(rp.TELEM_IDS):
                 self.torn_count += 1
             self.partial = {}
@@ -109,10 +85,6 @@ class JetsonLink:
     def send_control(self, drive_cmd, steer_cmd, mode, c2_lost, stop=False,
                      autonomy_abort=False, return_request=False,
                      indicator_request=rp.INDICATOR_OFF, from_autonomy=False):
-        # c2_lost is required, not defaulted: see encode_control's docstring.
-        # from_autonomy defaults to the operator, which is the fail-safe
-        # direction -- a forgotten argument gets refused in AUTONOMOUS rather
-        # than driving an autonomous rover.
         self._tx_seq = (self._tx_seq + 1) & 0xFF
         self.link.send(rp.CAN_ID_CONTROL,
                        rp.encode_control(drive_cmd, steer_cmd, mode, c2_lost,
@@ -127,8 +99,6 @@ class JetsonLink:
 
     @property
     def tx_seq(self):
-        """The sequence number of the last CONTROL frame sent, for matching
-        against the ack_seq the controller echoes back."""
         return self._tx_seq
 
     def poll(self):
@@ -136,9 +106,6 @@ class JetsonLink:
             if self.tele.feed(can_id, frame):
                 self.last_rx_time = time.monotonic()
             else:
-                # A shared bus carries motor-controller and payload traffic.
-                # Counted rather than silently dropped, so an unexpected id is
-                # visible instead of invisible.
                 self.unknown_frames += 1
 
     @property
@@ -156,8 +123,6 @@ class JetsonLink:
         if s is None:
             missing = self.tele.missing_ids()
             if missing and any(self.tele.frames_by_id.values()):
-                # Some ids are arriving and others never have, which is what a
-                # protocol-version mismatch looks like from this end.
                 return ("[t=%5.1fs] no complete snapshot: nothing on %s"
                         % (elapsed, ", ".join("0x%03x" % c for c in missing)))
             return "[t=%5.1fs] waiting for a complete telemetry snapshot..." % elapsed
@@ -186,9 +151,6 @@ class JetsonLink:
 
 def run(link, duration_s, c2=None, verbose=True):
     jl = JetsonLink(link)
-    # The controller has no radio, so the base-station link is ours to watch
-    # and forward. Without a C2 link to watch we must report LOST, never OK:
-    # "we did not look" is not "it is fine".
     c2_monitor = c2_link.C2Monitor()
     period = 1.0 / CONTROL_RATE_HZ
     t_start = time.monotonic()
@@ -207,7 +169,7 @@ def run(link, duration_s, c2=None, verbose=True):
                             indicator_request=rp.INDICATOR_TELEOP)
             t_next += period
             if now - t_next > period:
-                t_next = now + period          # do not burst after a stall
+                t_next = now + period
         jl.poll()
 
         if verbose and jl.snapshot and jl.tele.complete_count != last_printed:
@@ -229,13 +191,12 @@ def run(link, duration_s, c2=None, verbose=True):
 
 def open_link(args):
     if args.mock:
-        return can_link.SimLink()
-    return can_link.SocketCanLink(channel=args.channel, bitrate=args.bitrate)
+        return sim_link.SimLink()
+    import serial_link
+    return serial_link.SerialLink(args.port, baud=args.baud)
 
 
 def open_c2_link(args):
-    # Only the simulated base-station link exists so far; a real radio link
-    # plugs in here with the same is_connected()/recv() shape.
     link = c2_link.SimC2Link()
     link.connect()
     return link
@@ -246,13 +207,13 @@ def main():
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--mock", action="store_true",
                     help="run against the compiled C++ simulator (no hardware)")
-    ap.add_argument("--channel", help="CAN interface, e.g. can0 or vcan0")
-    ap.add_argument("--bitrate", type=int, default=CAN_BITRATE_HZ)
+    ap.add_argument("--port", help="serial port, e.g. /dev/ttyACM0 or COM5")
+    ap.add_argument("--baud", type=int, default=SERIAL_BAUD_HZ)
     ap.add_argument("--duration", type=float, default=10.0)
     args = ap.parse_args()
 
-    if not args.mock and not args.channel:
-        print("Specify --mock for the simulator, or --channel can0 for a real bus.",
+    if not args.mock and not args.port:
+        print("Specify --mock for the simulator, or --port /dev/ttyACM0 for the Teensy.",
               file=sys.stderr)
         sys.exit(1)
 

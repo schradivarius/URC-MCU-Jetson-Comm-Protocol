@@ -3,7 +3,6 @@
 #include "rover_protocol.h"
 
 namespace rover {
-
 DriveSim::DriveSim(uint32_t seed)
     : rng_(seed ? seed : 1),
       started_(false),
@@ -15,7 +14,6 @@ DriveSim::DriveSim(uint32_t seed)
     right_ = {0.0f, 0.0f, 0, 0.0f};
 }
 
-// xorshift32, so the Teensy and a laptop give the same numbers.
 float DriveSim::random01() {
     rng_ ^= rng_ << 13;
     rng_ ^= rng_ >> 17;
@@ -35,9 +33,7 @@ void DriveSim::update(int16_t left_effort, int16_t right_effort, bool energized,
     last_ms_ = now_ms;
     last_dt_ms_ = dt;
 
-    // Shared by both wheels so equal commands stay equal.
     const float jitter = 1.0f + (2.0f * random01() - 1.0f) * SIM_STEP_JITTER;
-    // Cap the step so a long pause cannot overflow the tick count.
     const float step_ms = static_cast<float>(dt < SIM_MAX_STEP_MS ? dt : SIM_MAX_STEP_MS);
     stepWheel(left_,  frac_left_,  left_effort,  energized, step_ms, jitter);
     stepWheel(right_, frac_right_, right_effort, energized, step_ms, jitter);
@@ -62,5 +58,4 @@ void DriveSim::stepWheel(WheelFeedback& w, float& frac, int16_t effort,
     w.encoder_ticks = wrapI32(static_cast<int64_t>(w.encoder_ticks) + whole);
     w.ticks_per_s = w.measured_mps * SIM_TICKS_PER_M;
 }
-
-}  // namespace rover
+}

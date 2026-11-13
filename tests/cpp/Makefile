@@ -18,17 +18,18 @@ BUILD_DIR = build
 CORE = $(SRC_DIR)/rover_protocol.cpp $(SRC_DIR)/rover_controller.cpp \
        $(SRC_DIR)/rover_drive.cpp $(SRC_DIR)/rover_drive_sim.cpp \
        $(SRC_DIR)/rover_encoder.cpp $(SRC_DIR)/rover_steer_sim.cpp \
-       $(SRC_DIR)/rover_feedback_faults.cpp
+       $(SRC_DIR)/rover_feedback_faults.cpp $(SRC_DIR)/rover_serial.cpp
 # Listed so that editing only a header (e.g. a constant in rover_config.h)
 # still triggers a rebuild instead of silently testing the old binaries.
 HDRS = $(SRC_DIR)/rover_config.h $(SRC_DIR)/rover_protocol.h \
        $(SRC_DIR)/rover_controller.h $(SRC_DIR)/rover_drive.h \
        $(SRC_DIR)/rover_drive_sim.h $(SRC_DIR)/rover_encoder.h \
-       $(SRC_DIR)/rover_steer_sim.h $(SRC_DIR)/rover_feedback_faults.h
+       $(SRC_DIR)/rover_steer_sim.h $(SRC_DIR)/rover_feedback_faults.h \
+       $(SRC_DIR)/rover_serial.h
 BINS = $(BUILD_DIR)/test_protocol $(BUILD_DIR)/test_controller \
        $(BUILD_DIR)/test_drive $(BUILD_DIR)/test_drive_sim \
        $(BUILD_DIR)/test_encoder $(BUILD_DIR)/test_steer_sim \
-       $(BUILD_DIR)/test_feedback_faults
+       $(BUILD_DIR)/test_feedback_faults $(BUILD_DIR)/test_serial
 
 .PHONY: all test clean
 all: $(BINS)
@@ -64,3 +65,6 @@ $(BUILD_DIR)/test_steer_sim: test_steer_sim.cpp $(CORE) $(HDRS) test_framework.h
 
 $(BUILD_DIR)/test_feedback_faults: test_feedback_faults.cpp $(CORE) $(HDRS) test_framework.h | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) test_feedback_faults.cpp $(CORE) -o $@
+
+$(BUILD_DIR)/test_serial: test_serial.cpp $(CORE) $(HDRS) test_framework.h | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) test_serial.cpp $(CORE) -o $@

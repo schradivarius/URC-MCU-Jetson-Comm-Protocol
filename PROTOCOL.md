@@ -1,7 +1,12 @@
 # Rover Onboard Computer ↔ Embedded Controller Protocol (v0.8)
 
 **Scope:** Onboard computer (Jetson Orin Nano, candidate) ↔ embedded controller
-(**Teensy 4.1**, NXP i.MX RT1062, C++ / Teensyduino), over **CAN**.
+(**Teensy 4.1**, NXP i.MX RT1062, C++ / Teensyduino), over **USB serial (UART)**.
+
+> **Transport change.** The Jetson link moved from CAN to serial. The frame
+> contents, CRC, sequence numbers, watchdog and modes are unchanged; only the
+> way a frame is carried changed (§2). CAN is now used only between the Teensy
+> and the motor controllers, which this document does not cover.
 
 > **v0.4 — structured command and telemetry packets.** Added a sequence number
 > and an application-layer CRC-8 in both directions, plus the autonomy-abort,
@@ -114,39 +119,32 @@
 ## 1. Design goals
 
 - **No hardware dependency for development.** The protocol, the safety logic
-  and the full exchange run and are tested on a laptop with no board, no CAN
-  interface and no drivers (section 7).
+  and the full exchange run and are tested on a laptop with no board, no serial
+  port and no drivers (section 7).
 - **Fail-safe on silence**, and fail *closed* on anything unrecognized.
 - **End-to-end protected**, not merely wire-protected (section 4).
 - **One implementation of the safety rule**, with the codec pinned across the
   two languages that must both speak it (section 8).
-- **Portable across CAN flavours.** Every frame is 8 bytes, so this runs on
-  Classic CAN or CAN FD, alongside Classic-only motor controllers.
-
 ## 2. Link basics
 
 | Parameter | Value |
 |---|---|
-| Physical layer | CAN 2.0B, differential twisted pair, **120 Ω termination at both ends** |
-| Bit rate | 500 kbps (placeholder; 1 Mbps is fine at these frame sizes) |
-| Bus | Teensy 4.1 **CAN3** (FD-capable) — CAN1/CAN2 work unchanged |
-| Frame format | Standard, 11-bit identifiers, **every frame DLC 8** |
+| Physical layer | USB serial (the Teensy 4.1's native USB port, `Serial`) |
+| Baud rate | 115200 (`SERIAL_BAUD_HZ`). Native USB ignores it; a hardware UART must match |
+| Framing | SLIP (RFC 1055) around `id_low, id_high, <8 frame bytes>` (§2.3) |
+| Frame format | 11-bit message identifiers, **every frame 8 bytes** |
 | CONTROL rate | 20 Hz (1 frame per cycle) |
 | TELEMETRY rate | 20 Hz (6 frames per cycle = 120 frames/s) |
 | Byte order | Little-endian, written byte-by-byte (not struct-punned) |
 
-At 500 kbps an 8-byte frame is roughly 220 µs of airtime. Seven frames per
-cycle — one `CONTROL` and six telemetry — is ~1.5 ms of a 50 ms period, about
-**3% bus utilisation**. (`rover_config.h` quotes 3.6% for the same thing: it
-allows for bit stuffing, which this figure does not.) Throughput is
-nowhere near the constraint; CAN was chosen for determinism and noise immunity,
-not speed. Say so plainly when anyone asks.
+A framed message is at most 22 bytes on the wire, so seven per cycle is under
+3,100 bytes/s, far below what the link carries.
 
-### 2.1 Identifiers *are* priorities
+### 2.1 Identifiers
 
-CAN arbitration is bitwise and dominant-low, so the **numerically lowest id
-wins the bus** and the loser backs off without its message being corrupted.
-This table is a priority ordering, not just a set of names.
+The ids date from when this link ran over CAN, where the lowest id won the
+bus. On a point-to-point serial link they only name the message, and they
+still seed the CRC (§4.1).
 
 | ID | Message | Direction | DLC | Rate |
 |---|---|---|---|---|
@@ -158,9 +156,6 @@ This table is a priority ordering, not just a set of names.
 | **`0x203`** | `TELEM_STATE` | controller → Jetson | 8 | 20 Hz |
 | **`0x204`** | `TELEM_CMD_ECHO` | controller → Jetson | 8 | 20 Hz |
 | **`0x205`** | `TELEM_FEEDBACK` | controller → Jetson | 8 | 20 Hz |
-
-Commands outrank telemetry because a late command can hurt the rover and late
-telemetry only annoys an operator.
 
 ### 2.2 Frame envelope
 
@@ -176,13 +171,11 @@ Every frame, both directions, has the same shape:
 | Field | Type | Units | Range | Meaning |
 |---|---|---|---|---|
 | `seq` | uint8 | frames | 0–255, **wraps** | Increments once per transmitted cycle. Receiver uses the delta: 1 healthy, 0 duplicate, >1 frames lost. |
-| `crc8` | uint8 | — | 0–255 | CRC-8/SAE-J1850 over the CAN id then bytes 0–6. See section 4. |
+| `crc8` | uint8 | — | 0–255 | CRC-8/SAE-J1850 over the message id then bytes 0–6. See section 4. |
 
-**Why six telemetry frames and not one CAN FD frame.** 6 payload bytes × 6
-frames = 36 bytes, which is what the field list needs. One 64-byte FD frame
-would hold it all atomically, but would require FD-capable transceivers on
-every node of the bus including Classic-only motor controllers. The field
-definitions would not change if you later move telemetry to FD.
+**Why six 8-byte telemetry frames.** The 8-byte size is inherited from
+Classic CAN. Serial has no such limit, and collapsing the six frames into one
+packet is planned as the next protocol revision.
 
 **Snapshot tearing.** All six telemetry frames of one cycle carry the **same
 `seq`**. The Jetson therefore knows whether the six frames it holds came from
@@ -201,6 +194,22 @@ and kept the layout, so this diagnostic cannot tell them apart. The sign of a
 v0.6 Jetson talking to a v0.7 controller is `cmd_status = 4` (`MODE_REFUSED`)
 when it first asks for `AUTONOMOUS`, or a rover that stays in `FAULT` after a
 timeout. §3.1.2 has the full skew table.
+
+### 2.3 Serial framing
+
+```
+ 0xC0 | id_low | id_high | 8 frame bytes | 0xC0
+```
+
+Inside the delimiters, `0xC0` is sent as `0xDB 0xDC` and `0xDB` as `0xDB 0xDD`.
+A leading `0xC0` flushes whatever came before, so noise, a half-written frame
+or a board reset costs one frame and the reader resynchronises on its own.
+There is no second checksum: the CRC-8 inside the frame already covers it.
+The firmware drops telemetry rather than block when the host is not reading.
+
+`firmware/src/rover_serial.*` and `host/serial_link.py` implement this, and the
+wire format is pinned in both languages to the same literal bytes
+(`tests/cpp/test_serial.cpp`, `tests/host/test_serial_framing.py`).
 
 ## 3. Message definitions
 
@@ -687,8 +696,8 @@ or a secondary contactor that cuts the motors while leaving the logic powered.
 Neither exists yet.
 
 The same reasoning applies to the e-stop frame the `0x000`–`0x0FF` block is
-reserved for (§2.1): any CAN frame is necessarily a **soft** stop, because the
-hard one takes the bus down with everything else. That is not an argument
+reserved for (§2.1): any frame on this link is necessarily a **soft** stop, because the
+hard one takes the link down with everything else. That is not an argument
 against the frame — a fast soft stop that leaves the rover diagnosable is worth
 having — but it is not the rules requirement, and nothing here substitutes for
 the button.
@@ -1077,38 +1086,21 @@ CRC — and the only unclaimed byte in the whole set is `TELEM_STATE` byte 5,
 which cannot hold a source and two 16-bit ages. §2.1's priority ordering puts
 `0x205` last, which is right: it is the least urgent frame in the cycle.
 
-## 4. Integrity: two CRCs, covering different things
+## 4. Integrity
 
 | Concern | Provided by |
 |---|---|
-| Message boundaries | CAN hardware |
-| Wire corruption between the two CAN controllers | CAN hardware, 15-bit CRC |
-| Corruption recovery | CAN hardware, automatic retransmit in µs |
-| Priority / arbitration | CAN hardware, non-destructive |
-| **Corruption in the software path** | **our CRC-8** |
+| Message boundaries | SLIP framing (§2.3) |
+| Wire corruption | USB's own CRC on native USB; nothing on a bare UART |
+| **Corruption anywhere end to end** | **our CRC-8** |
 | **Loss, duplication, reordering** | **our sequence number** |
 | **Wrong-message-on-wrong-id** | **our CRC-8, via id seeding** |
-| **Protocol version mismatch** | **our DLC, mode, flag and indicator validation** |
+| **Protocol version mismatch** | **our length, mode, flag and indicator validation** |
 
-**Why an application-layer CRC when CAN already has one.** CAN's CRC is
-computed by the transmitting controller and checked by the receiving
-controller. It protects the **wire** between those two chips:
-
-```
-Jetson software → driver/DMA → [ CAN CRC covers this ] → driver/DMA → MCU software
-   ^^^^^^^^^^^^^^^^^^^^^^^^^                              ^^^^^^^^^^^^^^^^^^^^^^^^
-   covered only by our CRC-8                              covered only by our CRC-8
-```
-
-A bug assembling the struct, DMA corruption, or a driver copying into the wrong
-buffer all produce a frame CAN considers perfectly valid and delivers with
-wrong contents. Our CRC is computed by our code over our struct and checked by
-our code on the far side, so it covers the whole path. This is the same
-reasoning behind AUTOSAR's E2E protection, which also layers a CRC on top of
-CAN's.
-
-**Do not remove it as redundant.** It is not redundant; it covers a different
-failure domain.
+**Why an application-layer CRC.** It is computed by our code over our struct
+and checked by our code on the far side, so it covers the whole path, including
+a bug assembling the frame or a driver copying into the wrong buffer. On a bare
+UART it is also the only corruption check there is. **Do not remove it.**
 
 ### 4.1 The algorithm
 
@@ -1122,7 +1114,7 @@ failure domain.
 | Final XOR | `0xFF` |
 | **Check value** (`"123456789"`) | **`0x4B`** |
 
-Computed over **the CAN identifier (4 bytes, low byte first) followed by frame
+Computed over **the message identifier (4 bytes, low byte first) followed by frame
 bytes 0–6**, excluding the CRC byte itself.
 
 **The id is in the seed on purpose** — AUTOSAR calls this a Data ID. Without
@@ -1210,7 +1202,7 @@ is the fault-diagnosis mistake this protocol has already fixed once.
 2. **Boot-fault reporting.** The reset is otherwise invisible to the Jetson
    except as a telemetry gap — indistinguishable from a flaky bus. The next
    boot reads `SRC_SRSR` and, if the last reset was the watchdog, raises
-   `FIRMWARE_FAULT` for that whole session and says so in the startup banner.
+   `FIRMWARE_FAULT` for that whole session.
 3. **Bounded counters.** Encoder accumulators pass through `wrapI32()`. In
    Python an unwrapped counter raised inside `struct.pack`; in C++ signed
    overflow is **undefined behaviour**, which is worse. CI runs the suite under
@@ -1294,7 +1286,7 @@ in `rover_protocol.h` beside the structs they describe.
 | `LINK_DEGRADED_HOLD_MS` | 1000 | How long a gap or CRC error keeps the link `DEGRADED` |
 | `HW_WATCHDOG_MS` | 1000 | Teensy reset if the loop stalls (C++ only) |
 | `LINK_TIMEOUT_S` (Jetson) | 0.5 | Informational only (Python only) |
-| `C2_TIMEOUT_S` (Jetson, `C2Monitor`) | 1.0 | No base-station heartbeat for this long sets `c2_lost`. Longer than the 300 ms CAN watchdog because a radio drops packets far more often than a CAN bus. Tunable, and the base-station heartbeat rate is not yet defined (Python only) |
+| `C2_TIMEOUT_S` (Jetson, `C2Monitor`) | 1.0 | No base-station heartbeat for this long sets `c2_lost`. Longer than the 300 ms command watchdog because a radio drops packets far more often than a cable. Tunable, and the base-station heartbeat rate is not yet defined (Python only) |
 
 All placeholders, chosen to sit comfortably above one period plus margin. None
 are derived from measured actuator response yet. Two of the relationships
@@ -1308,7 +1300,7 @@ converged, a single radio hiccup would start stopping the rover in `TELEOP`.
 | Constant | Value | Notes |
 |---|---|---|
 | `PROTOCOL_VERSION` | 7 | Bump when a message's layout or meaning changes. Not sent on the wire; DLC and the CRC are the runtime mismatch signals, plus *which ids arrive* (§2.2) |
-| `CAN_BITRATE_HZ` | 500000 | Every node on the bus must match |
+| `SERIAL_BAUD_HZ` | 115200 | Host and firmware must match; ignored by native USB |
 | `CAN_ID_*` | `0x100`, `0x200`–`0x204` | §2.1 |
 | `FRAME_DLC`, `FRAME_PAYLOAD` | 8, 6 | Plus `FRAME_SEQ_OFFSET` 6 and `FRAME_CRC_OFFSET` 7 |
 | `MODE_*`, `MODE_MAX` | 0, 1, 2, 3 | `MODE_MAX` is 2, the highest commandable mode. `MODE_FAULT` (3) is reported but never commanded (§3.1.1) |
@@ -1410,7 +1402,7 @@ What to read in that capture:
 Against real hardware the same host script runs unchanged:
 
 ```
-python3 host/jetson_test.py --channel can0 --bitrate 500000
+python3 host/jetson_test.py --port /dev/ttyACM0
 ```
 
 ## 8. One implementation, pinned across two languages
@@ -1544,8 +1536,8 @@ Verified to fail on an injected endianness change.
   `FAULT_CMD_SOURCE` under the same rule — someone was actually building the
   thing that needed it — so the free bits are now `0x0800`–`0x8000` and a
   C2-observer disagreement takes `0x0800`.
-- **Not yet used:** CAN FD, the second and third CAN buses, and a dedicated
-  high-priority e-stop frame in the reserved `0x000`–`0x0FF` block.
+- **Not yet used:** a dedicated
+  e-stop frame in the reserved `0x000`–`0x0FF` block.
 - **The authority gate still trusts a stale operator frame.** v0.7 made the
   mode the controller's, so a stale *autonomy* frame can no longer carry the
   rover into or keep it in `AUTONOMOUS` (§3.1.5). A stale *operator* frame
@@ -1592,31 +1584,31 @@ Verified to fail on an injected endianness change.
 | `firmware/src/rover_drive.*` | **Both** | Drive/steering output stage (§5.4) |
 | `host/rover_protocol.py` | Jetson | Python codec (pinned to the C++ one) |
 | `host/protocol_root.py` | Jetson | Resolves which checkout `firmware/src` and `tools/` come from — the one place that decides |
-| `host/can_link.py` | Jetson | Sim and python-can backends |
+| `firmware/src/rover_serial.*` | **Both** | SLIP framing for the serial link (§2.3) |
+| `host/sim_link.py` | Jetson | Simulator backend |
+| `host/serial_link.py` | Jetson | Serial backend (pyserial) |
 | `host/c2_link.py` | Jetson | C2 (base-station) link-loss detection, and a fake link for testing |
 | `host/jetson_test.py` | Jetson | Live harness, snapshot reassembly |
 | `host/demo.py` | Jetson | The Task 3 demonstration in section 7 |
 | `host/autonomy_sim.py` | Jetson | Mock autonomy stack: the Task 4 mission (§7) |
 | `tools/rover_sim.cpp` | dev machine | Simulator: real controller, fake plant |
 | `tools/golden_vectors.cpp` | dev machine | Emits vectors for cross-language pinning |
-| `tests/cpp/`, `tests/host/` | dev machine | 268 tests total |
+| `tests/cpp/`, `tests/host/` | dev machine | 366 tests total |
 
 ### 10.1 Flashing the Teensy 4.1
 
 1. PlatformIO, with `platformio.ini` from the repo root. It names the board
-   (`teensy41`) and both libraries — **FlexCAN_T4** (`tonton81/FlexCAN_T4`) and
-   **WDT_T4** (`tonton81/WDT_T4`) — so there is nothing to install by hand.
+   (`teensy41`) and the one library, **WDT_T4** (`tonton81/WDT_T4`), so there is
+   nothing to install by hand.
 2. `pio run -t upload`. Sources under `src/` are compiled automatically.
-3. `pio device monitor` at 115200 for the boot banner.
+3. The USB port carries binary frames only, so there is no boot banner. The
+   onboard LED toggles once per telemetry period as proof of life.
+4. `python3 host/jetson_test.py --port /dev/ttyACM0` from the Jetson.
 
 **Before powering anything:**
 
 - Teensy 4.1 is **3.3 V and NOT 5 V tolerant.** A 5 V sensor wired straight to
   a pin destroys the board. Level-shift everything.
-- Each CAN bus needs a **transceiver**; the MCU cannot drive a differential bus.
-- The bus needs **120 Ω termination at both physical ends.** Exactly one
-  resistor, or three, is the most common CAN bring-up failure.
-
 ### 10.2 Running the autonomy program from a separate repository
 
 The autonomy program is a *consumer* of this protocol, not part of it, so it

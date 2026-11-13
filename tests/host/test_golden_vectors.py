@@ -1,16 +1,3 @@
-"""
-test_golden_vectors.py -- pin the C++ and Python codecs together, byte for byte.
-
-The codec is the only part of this protocol that exists in two languages. This
-test compiles the real C++ encoder, runs it, and asserts Python produces
-identical output for identical inputs -- not just for encoded frames, but for
-the CRC, the sequence arithmetic and every validation predicate.
-
-If it fails, the Teensy and the Jetson disagree about the wire format or about
-which values are legal. That is not a style issue: it means commands would be
-misread, or silently rejected, on a moving rover.
-"""
-
 import os
 import subprocess
 import sys
@@ -24,9 +11,6 @@ import rover_protocol as p  # noqa: E402
 
 
 def build_and_run_cpp():
-    # Resolved rather than derived from __file__, for the same reason as
-    # test_config_sync.py: pinning the local Python against a different
-    # checkout's C++ than the one under test proves nothing.
     out_dir = protocol_root.build_dir()
     os.makedirs(out_dir, exist_ok=True)
     binary = os.path.join(out_dir, "golden_vectors")
@@ -60,8 +44,6 @@ class TestCrcAgreement(GoldenBase):
             self.assertEqual("%02x" % p.crc8(text.encode()), expected)
 
     def test_crc8_check_value_is_sae_j1850(self):
-        """Pinned independently of the C++ output, so a matching pair of wrong
-        implementations still fails. CRC-8/SAE-J1850 check value is 0x4B."""
         self.assertEqual(p.crc8(b"123456789"), 0x4B)
 
     def test_frame_crc_matches_including_the_id_seed(self):
@@ -102,9 +84,6 @@ class TestPredicateAgreement(GoldenBase):
                              "is_known_indicator disagrees for %s" % value)
 
     def test_command_range_agrees_across_languages(self):
-        """Both sides must agree on exactly where the valid drive/steer range
-        ends. A host that sends 1001 thinking it is legal would stop the rover
-        with a PROTOCOL_ERROR it cannot explain."""
         rows = self.rowsOf("RANGE")
         self.assertGreater(len(rows), 0, "C++ emitted no RANGE cases")
         for _, value, valid in rows:
@@ -129,8 +108,6 @@ class TestPredicateAgreement(GoldenBase):
 
 
 class TestAuthorityAgreement(GoldenBase):
-    """The mux rule exists on both sides, so it is pinned like the codec."""
-
     def test_authority_agrees_for_every_mode_and_both_sources(self):
         rows = self.rowsOf("AUTHORITY")
         self.assertEqual(len(rows), 512, "expected both sources x 256 modes")
@@ -141,9 +118,6 @@ class TestAuthorityAgreement(GoldenBase):
                              % (src, mode))
 
     def test_no_undefined_mode_is_ever_owned_by_a_motion_command(self):
-        # Independent of the C++ output, so a matching pair of wrong
-        # implementations still fails. The only modes where the question has a
-        # real answer are the two that permit motion.
         for mode in range(256):
             if mode == p.MODE_AUTONOMOUS:
                 self.assertTrue(p.source_owns_mode(True, mode))
@@ -152,13 +126,10 @@ class TestAuthorityAgreement(GoldenBase):
                 self.assertTrue(p.source_owns_mode(False, mode))
                 self.assertFalse(p.source_owns_mode(True, mode))
             else:
-                # Nothing may move, so neither source is wrong -- and nothing
-                # is authorised to move either, which modePermitsMotion says.
                 self.assertFalse(p.mode_permits_motion(mode))
 
     def test_transitions_agree_for_every_state_request_and_source(self):
         rows = self.rowsOf("TRANSITION")
-        # 5 states (4 + one undefined) x 4 requests (3 + one undefined) x 2.
         self.assertEqual(len(rows), 40)
         for _, args, allowed in rows:
             frm, to, src = (int(a) for a in args.split(","))
@@ -167,7 +138,6 @@ class TestAuthorityAgreement(GoldenBase):
                              "transition_allowed disagrees for %s" % args)
 
     def test_the_autonomy_stack_can_never_grant_itself_motion(self):
-        # Independent of the C++ output, like the authority check above.
         for frm in range(256):
             for to in (p.MODE_TELEOP, p.MODE_AUTONOMOUS):
                 if frm != to:
@@ -267,7 +237,6 @@ class TestFrameAgreement(GoldenBase):
                              bool(n[3] & p.FB_FLAG_STEER_INVALID))
             sources.add(n[2])
             flagsets.add(n[3])
-        # A vector set that never varies these proves nothing about them.
         self.assertEqual(sources, {p.CMD_SOURCE_NONE, p.CMD_SOURCE_OPERATOR,
                                    p.CMD_SOURCE_AUTONOMY})
         self.assertIn(0, flagsets)
@@ -302,8 +271,6 @@ class TestFrameAgreement(GoldenBase):
             self.assertEqual(decoded["return_active"], bool(n[5]))
 
     def test_every_frame_is_exactly_eight_bytes(self):
-        # 8 bytes is Classic CAN's limit. Exceeding it would force CAN FD
-        # transceivers onto every node of the bus.
         for kind in self.FRAME_KINDS:
             for _, args, frame_hex in self.rowsOf(kind):
                 self.assertEqual(len(frame_hex) // 2, p.FRAME_DLC,
@@ -311,10 +278,7 @@ class TestFrameAgreement(GoldenBase):
 
 
 class TestPythonValidation(unittest.TestCase):
-    """Python must reject what C++ rejects, for the same reasons."""
-
     def test_non_commandable_mode_is_rejected(self):
-        # MODE_FAULT (3) is defined, but only the controller enters it.
         for mode in (p.MODE_FAULT, 4, 42, 128, 255):
             frame = p.encode_control(1000, 500, mode, False)
             result, decoded = p.decode_control(frame)
@@ -342,10 +306,6 @@ class TestPythonValidation(unittest.TestCase):
             self.assertEqual(p.decode_control(frame[:n])[0], p.DECODE_BAD_DLC)
 
     def test_no_flags_byte_value_is_rejected_any_more(self):
-        """v0.5 rejected bit 7 as reserved; v0.6 gave it to from_autonomy, so
-        the only part of the flags byte that can still be out of range is the
-        indicator field inside it. The guard that the check was really
-        removed, rather than left checking a mask someone resets later."""
         for raw in range(256):
             frame = p.encode_control(0, 0, p.MODE_TELEOP, False, raw_flags=raw)
             ind = (raw & p.CTRL_INDICATOR_MASK) >> p.CTRL_INDICATOR_SHIFT
@@ -355,8 +315,6 @@ class TestPythonValidation(unittest.TestCase):
                              "flags=0x%02x decoded unexpectedly" % raw)
 
     def test_the_c2_and_source_bits_are_fields_not_reserved_bits(self):
-        """Bits 6 and 7 are real fields, so setting them must NOT reject the
-        frame -- the guard against a stray mask writing into a live field."""
         flags = p.pack_control_flags(True, stop=True, from_autonomy=True)
         self.assertEqual(flags & p.CTRL_FLAG_C2_LOST, p.CTRL_FLAG_C2_LOST)
         self.assertEqual(flags & p.CTRL_FLAG_FROM_AUTONOMY,
@@ -368,9 +326,6 @@ class TestPythonValidation(unittest.TestCase):
         self.assertTrue(decoded["from_autonomy"])
 
     def test_a_mismatched_source_is_not_a_codec_error(self):
-        """Authority is the controller's decision, not the codec's. If decode
-        ever started rejecting these, a Jetson-side mux bug would stop the
-        rover instead of being reported."""
         for mode, src in ((p.MODE_TELEOP, True), (p.MODE_AUTONOMOUS, False)):
             frame = p.encode_control(700, 100, mode, False, from_autonomy=src)
             result, decoded = p.decode_control(frame)
@@ -384,13 +339,10 @@ class TestPythonValidation(unittest.TestCase):
             self.assertEqual(p.decode_control(frame)[0], p.DECODE_BAD_INDICATOR)
 
     def test_the_command_source_fault_bit_is_named(self):
-        """0x0400 was the first of the bits PROTOCOL.md 3.5.2 held in reserve
-        until someone was actually building the thing that needed one."""
         self.assertEqual(p.FAULT_CMD_SOURCE, 0x0400)
         self.assertEqual(p.fault_names(0x0400), ["CMD_SOURCE"])
 
     def test_the_c2_fault_bit_is_named(self):
-        """0x0080 is FAULT_C2_LINK_LOST, which v0.4 had left reserved."""
         self.assertEqual(p.FAULT_C2_LINK_LOST, 0x0080)
         self.assertEqual(p.fault_names(0x0080), ["C2_LINK_LOST"])
 
