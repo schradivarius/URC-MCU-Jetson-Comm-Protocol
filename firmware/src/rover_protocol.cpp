@@ -165,12 +165,14 @@ size_t faultNames(uint16_t bitmask, const char** out, size_t cap) {
         FAULT_ENCODER_FAULT, FAULT_UNDERVOLTAGE, FAULT_FIRMWARE_FAULT,
         FAULT_PROTOCOL_ERROR, FAULT_C2_LINK_LOST, FAULT_SEQ_GAP, FAULT_CRC_ERROR,
         FAULT_CMD_SOURCE, FAULT_STALE_FEEDBACK, FAULT_STEERING_FAULT,
+        FAULT_JETSON_LINK_LOST,
     };
     static const char* names[] = {
         "COMM_TIMEOUT", "OVER_CURRENT", "ESTOP_ACTIVE",
         "ENCODER_FAULT", "UNDERVOLTAGE", "FIRMWARE_FAULT",
         "PROTOCOL_ERROR", "C2_LINK_LOST", "SEQ_GAP", "CRC_ERROR",
         "CMD_SOURCE", "STALE_FEEDBACK", "STEERING_FAULT",
+        "JETSON_LINK_LOST",
     };
     size_t n = 0;
     for (size_t i = 0; i < sizeof(bits) / sizeof(bits[0]) && n < cap; ++i) {

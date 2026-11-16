@@ -149,6 +149,11 @@ bool RoverController::watchdogTripped() const {
     return elapsedSinceControl() >= watchdog_timeout_ms_;
 }
 
+bool RoverController::jetsonLinkLost() const {
+    if (!have_control_) return true;
+    return elapsedSinceControl() >= JETSON_LINK_TIMEOUT_MS;
+}
+
 uint8_t RoverController::activeMode() const {
     if(faultConditionPresent()) return MODE_FAULT;
     return mode_;
@@ -191,7 +196,9 @@ bool RoverController::returnRequestActive() const {
 }
 
 void RoverController::commandedOutputs(int16_t& drive, int16_t& steer) const {
-    if (effectiveStop() || !commandAuthorized()) { drive = 0; steer = 0; return; }
+    if (watchdogTripped() || effectiveStop() || !commandAuthorized()) {
+        drive = 0; steer = 0; return;
+    }
     drive = last_control_.drive_cmd;
     steer = last_control_.steer_cmd;
 }
@@ -216,8 +223,8 @@ bool RoverController::recentlyDegraded() const {
 }
 
 uint8_t RoverController::jetsonLinkState() const {
-    if (watchdogTripped()) return LINK_LOST;
-    if (recentlyDegraded()) return LINK_DEGRADED;
+    if (jetsonLinkLost()) return LINK_LOST;
+    if (watchdogTripped() || recentlyDegraded()) return LINK_DEGRADED;
     return LINK_OK;
 }
 
@@ -230,6 +237,7 @@ uint8_t RoverController::c2LinkState() const {
 uint16_t RoverController::faultWord(uint16_t sensor_faults, uint16_t extra_faults) const {
     uint16_t faults = static_cast<uint16_t>(sensor_faults | extra_faults);
     if (watchdogTripped()) faults |= FAULT_COMM_TIMEOUT;
+    if (jetsonLinkLost())  faults |= FAULT_JETSON_LINK_LOST;
     faults |= latched_faults_;
     if (encoderStale() || steerStale()) faults |= FAULT_STALE_FEEDBACK;
     if (encoderInvalid())               faults |= FAULT_ENCODER_FAULT;

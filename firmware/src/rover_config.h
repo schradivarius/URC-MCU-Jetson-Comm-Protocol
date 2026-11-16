@@ -8,7 +8,9 @@ static const uint8_t PROTOCOL_VERSION = 8;
 
 static const uint32_t SERIAL_BAUD_HZ = 115200;
 
-static const uint32_t DEFAULT_WATCHDOG_TIMEOUT_MS = 300;
+static const uint32_t COMMAND_TIMEOUT_MS          = 300;  // motion command goes stale
+static const uint32_t JETSON_LINK_TIMEOUT_MS      = 500;  // Jetson declared lost
+static const uint32_t DEFAULT_WATCHDOG_TIMEOUT_MS = COMMAND_TIMEOUT_MS;
 static const uint32_t DEFAULT_TELEMETRY_PERIOD_MS = 50;
 static const uint32_t HW_WATCHDOG_MS              = 1000;
 

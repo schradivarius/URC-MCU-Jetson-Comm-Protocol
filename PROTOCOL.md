@@ -656,6 +656,7 @@ left. Bits `0x0001`–`0x0040` keep their v0.3 values.
 | `0x0400` | `CMD_SOURCE` | A command arrived from the producer that does not own the current mode: an autonomy frame in `TELEOP`, or an operator frame in `AUTONOMOUS`. Drive and steering are refused; see §3.1.5 |
 | `0x0800` | `STALE_FEEDBACK` | **v0.8.** A feedback channel has not been refreshed within `FEEDBACK_STALE_MS`, so the controller will not vouch for the value it is still reporting. Which channel is in `TELEM_FEEDBACK.flags` (§3.7). Self-clearing. **Reported only** — the safe-state response is Task 6 |
 | `0x1000` | `STEERING_FAULT` | **v0.8.** Steering feedback outside `CMD_MIN … CMD_MAX`, i.e. a value the actuator could not produce. Self-clearing. Reported only |
+| `0x2000` | `JETSON_LINK_LOST` | No valid `CONTROL` frame for `JETSON_LINK_TIMEOUT_MS`, or none ever. Separate from `COMM_TIMEOUT` and `C2_LINK_LOST` (§5.5). Self-clearing |
 | `0x2000`–`0x8000` | *reserved* | |
 
 `PROTOCOL_ERROR`, `CRC_ERROR` and `SEQ_GAP` all self-clear when a valid,
@@ -730,8 +731,10 @@ station."* Treating C2 loss as equivalent to Jetson loss would stop the rover
 exactly where the rules require it to keep going, and forfeit the 25 points for
 that target.
 
-`jetson_link` the controller measures for itself, from the command watchdog and
-from sequence gaps or CRC errors seen within the last `LINK_DEGRADED_HOLD_MS`.
+`jetson_link` the controller measures for itself: `LINK_LOST` after
+`JETSON_LINK_TIMEOUT_MS` (500 ms) with no valid frame, `LINK_DEGRADED` once the
+command times out (300 ms) or after a sequence gap or CRC error within the last
+`LINK_DEGRADED_HOLD_MS`, otherwise `LINK_OK` (§5.5).
 
 `c2_link` it cannot measure at all — it has no radio — so the field is only
 ever the `c2_lost` bit the Jetson forwarded, mapped by `c2LinkState()`:
@@ -1262,6 +1265,39 @@ Like `rover_protocol.*` and `rover_controller.*` it is pure C++ with no
 Arduino dependency, so `tests/cpp/test_drive.cpp` exercises it natively and
 `tools/rover_sim` links the same source the Teensy compiles.
 
+### 5.5 Command timeout and Jetson loss
+
+Two timers, both measured from the last **valid accepted** `CONTROL` frame. A
+frame with a bad CRC, bad framing or an invalid field does not reset either.
+
+| Stage | After | Firmware does |
+|---|---|---|
+| Command timeout | `COMMAND_TIMEOUT_MS` (300 ms) | Drive and steer forced to 0 (steering centred), `COMM_TIMEOUT` raised, a moving rover latches `FAULT`, `jetson_link` = `DEGRADED` |
+| Jetson loss | `JETSON_LINK_TIMEOUT_MS` (500 ms) | `JETSON_LINK_LOST` raised, `jetson_link` = `LOST`, `c2_link` = `NOT_REPORTED` |
+
+When frames return, the old command is not reused: a latched `FAULT` refuses
+motion until the Jetson sends `SAFE` and then requests a motion mode again.
+
+**Why these values.** 300 ms is six 50 ms control periods, so a few late or
+dropped frames do not stop the rover, but a dead Jetson stops it within about
+a third of a second. 500 ms is ten periods, long enough that a short stall
+reads as a stale command rather than a lost Jetson, and matches the Jetson's
+own `LINK_TIMEOUT_S`.
+
+**Measured response (simulator, 10 runs).** Drive output reported 0 a median
+of 307 ms after the last frame (range 305–312 ms). `JETSON_LINK_LOST` reported
+a median of 507 ms after it (range 506–512 ms). Both are within one telemetry
+period of their timeouts. Still to be measured on the real Teensy (Group F).
+
+**C2 loss is separate.** `C2_LINK_LOST` means the base station → Jetson radio
+link is down while the Jetson and Teensy still talk. It stops `TELEOP` but not
+`AUTONOMOUS`. `JETSON_LINK_LOST` means the Teensy's command source is gone, and
+stops every mode. The two are separate bits and are never combined.
+
+**To confirm with Systems (Lance Finke / Hector):** whether Jetson loss should
+go to `FAULT` (current behaviour for a moving rover) or `SAFE`, and whether
+returning from it should need anything beyond the `SAFE` → mode request above.
+
 ## 6. Configuration constants
 
 Every value in this section lives in **`firmware/src/rover_config.h`**,
@@ -1281,7 +1317,8 @@ in `rover_protocol.h` beside the structs they describe.
 |---|---|---|
 | `CONTROL` rate | 20 Hz | 1 frame per cycle (`CONTROL_RATE_HZ`, Jetson side) |
 | `TELEMETRY` rate | 20 Hz | 6 frames per cycle |
-| `WATCHDOG_TIMEOUT_MS` | 300 | 6× the control period. `DEFAULT_WATCHDOG_TIMEOUT_MS` in C++ |
+| `COMMAND_TIMEOUT_MS` | 300 | Motion command goes stale (§5.5). `WATCHDOG_TIMEOUT_MS` / `DEFAULT_WATCHDOG_TIMEOUT_MS` are aliases |
+| `JETSON_LINK_TIMEOUT_MS` | 500 | Jetson declared lost (§5.5) |
 | `TELEMETRY_PERIOD_MS` | 50 | `DEFAULT_TELEMETRY_PERIOD_MS` in C++ |
 | `LINK_DEGRADED_HOLD_MS` | 1000 | How long a gap or CRC error keeps the link `DEGRADED` |
 | `HW_WATCHDOG_MS` | 1000 | Teensy reset if the loop stalls (C++ only) |

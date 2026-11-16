@@ -15,7 +15,7 @@ struct Rig {
     SteerSim steer;
     FeedbackFaultInjector faults;
 
-    Rig() : ctl(fakeMillis, 300, 50), seq_(0), commanding_(false),
+    Rig() : ctl(fakeMillis, COMMAND_TIMEOUT_MS, 50), seq_(0), commanding_(false),
             drive_cmd_(0), steer_cmd_(0) { g_now = 1000; }
 
     void command(int16_t drive, int16_t steer) {

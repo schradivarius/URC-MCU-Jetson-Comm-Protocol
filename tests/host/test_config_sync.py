@@ -16,7 +16,8 @@ HEADER_PATH = protocol_root.firmware_src("rover_config.h")
 SHARED = {
     "PROTOCOL_VERSION":      "PROTOCOL_VERSION",
     "SERIAL_BAUD_HZ":        "SERIAL_BAUD_HZ",
-    "WATCHDOG_TIMEOUT_MS":   "DEFAULT_WATCHDOG_TIMEOUT_MS",
+    "COMMAND_TIMEOUT_MS":    "COMMAND_TIMEOUT_MS",
+    "JETSON_LINK_TIMEOUT_MS": "JETSON_LINK_TIMEOUT_MS",
     "TELEMETRY_PERIOD_MS":   "DEFAULT_TELEMETRY_PERIOD_MS",
     "LINK_DEGRADED_HOLD_MS": "LINK_DEGRADED_HOLD_MS",
     "CAN_ID_CONTROL":        "CAN_ID_CONTROL",
@@ -98,6 +99,10 @@ class TestConfigSync(unittest.TestCase):
 
     def test_watchdog_tolerates_a_missed_control_frame(self):
         self.assertGreater(cfg.WATCHDOG_TIMEOUT_MS, 2 * 1000 // cfg.CONTROL_RATE_HZ)
+
+    def test_jetson_loss_comes_after_the_command_timeout(self):
+        self.assertGreater(cfg.JETSON_LINK_TIMEOUT_MS, cfg.COMMAND_TIMEOUT_MS)
+        self.assertEqual(cfg.WATCHDOG_TIMEOUT_MS, cfg.COMMAND_TIMEOUT_MS)
 
     def test_c2_timeout_is_longer_than_the_command_watchdog(self):
         self.assertGreater(cfg.C2_TIMEOUT_S * 1000, cfg.WATCHDOG_TIMEOUT_MS)
