@@ -123,9 +123,12 @@
 >   its cause.
 > * **STOP latches.** It is honoured from either producer in any mode once the
 >   frame is intact and well formed, and it holds until an accepted *neutral*
->   command (drive 0, steer 0) re-arms it. A later motion command no longer
->   releases it. The controller boots with STOP latched, and
->   `autonomy_abort` while `AUTONOMOUS` is now a STOP.
+>   command (drive 0, steer 0) **from the operator** re-arms it. A later motion
+>   command never releases it, and the autonomy stack cannot release it at all.
+>   The controller boots with STOP latched, and `autonomy_abort` while
+>   `AUTONOMOUS` is now a STOP.
+> * **The operator hands `AUTONOMOUS` over without STOP.** A grant with
+>   `stop = 1` would latch a STOP that autonomy is not allowed to release.
 > * **Motion in `SAFE` is rejected** (`CMD_STATUS_MODE_CONFLICT = 5`).
 >   Refused mode requests and `SAFE`-plus-motion raise the new
 >   `FAULT_MODE_CONFLICT` (`0x2000`).
@@ -367,7 +370,7 @@ controller on the bus *before* a host may send it.
 
 | Bits | Field | Type | Range | Meaning |
 |---|---|---|---|---|
-| 0 | `stop` | bool | 0/1 | Stop now, regardless of `mode` or producer. Takes effect on the cycle it arrives — no coast frame. **Latches since v0.9**: it holds until an accepted neutral frame (`drive_cmd = steer_cmd = 0`, `stop = 0`) re-arms it, so the next motion command cannot undo it (§5.5). Separate from `mode`, so it is asserted **and released** without a mode round trip. |
+| 0 | `stop` | bool | 0/1 | Stop now, regardless of `mode` or producer. Takes effect on the cycle it arrives — no coast frame. **Latches since v0.9**: it holds until an accepted neutral frame (`drive_cmd = steer_cmd = 0`, `stop = 0`) **from the operator** re-arms it, so the next motion command cannot undo it and the autonomy stack cannot release it (§5.5). Separate from `mode`, so it is asserted **and released** without a mode round trip. |
 | 1 | `autonomy_abort` | bool | 0/1 | Abandon the current autonomous task. **Forces a stop while `mode == AUTONOMOUS`**, and since v0.9 latches exactly like `stop` (§5.5); in `TELEOP` the operator is already driving, so it has no autonomous task to abort and does not stop. ⚠️ *This behaviour is a judgement call, not spelled out by the requirement — flagged for review.* |
 | 2 | `return_request` | bool | 0/1 | Begin the return-to-base behaviour. Carried, and since v0.6 **acknowledged** in `TELEM_CMD_ECHO` bit 6 while `mode == AUTONOMOUS`; the controller still takes no low-level action on it — see §3.1.6. |
 | 3–5 | `indicator_request` | uint8 | **0–4** | Requested status-indicator state. `0=OFF, 1=TELEOP, 2=AUTONOMOUS, 3=ARRIVED, 4=FAULT`. 5–7 are reachable on the wire and **reject the frame**. The controller honours this only where it agrees with its own mode — see §3.5. |
@@ -493,9 +496,9 @@ talking. `CMD_STATUS_WRONG_SOURCE` names the verdict on the last frame.
 Since v0.7 two cases are **not** reported as a mismatch, because neither asks
 for motion from the wrong producer:
 
-- **A frame with `stop = 1`.** This is what makes the operator's grant frame
-  work (§3.1.7). The operator asks for `AUTONOMOUS` with the stop flag set, and
-  that is a hand-over, not an operator trying to drive in autonomy's mode.
+- **A frame with `stop = 1`.** STOP is honoured from either producer (§5.5).
+  Until v0.9 this was also how the operator's grant frame worked; since v0.9
+  the grant is a neutral hand-over without STOP instead (§3.1.7).
 - **A frame whose mode request was refused.** Its verdict is `MODE_REFUSED`,
   which already names the problem, and since v0.9 it raises
   `FAULT_MODE_CONFLICT` instead.
@@ -621,19 +624,23 @@ single cell in the table, and it is listed in §9 until Systems confirms it.
   nothing to move:
 
   ```
-  mode=AUTONOMOUS, from_autonomy=0, stop=1, drive_cmd=0, steer_cmd=0
+  mode=AUTONOMOUS, from_autonomy=0, stop=0, drive_cmd=0, steer_cmd=0
   ```
 
-  The autonomy stack then sends ordinary `mode=AUTONOMOUS, from_autonomy=1`
-  frames, which are no-op requests in the mode it now owns. `TELEOP` needs no
-  separate grant: the operator both grants it and drives it, so the operator's
-  first `TELEOP` frame may already carry motion. `stop = 1` is what keeps the grant frame from reading as
-  an operator trying to drive in autonomy's mode (§3.1.5). Since v0.9 that
-  `stop = 1` latches, so the autonomy stack's first frame must be neutral
-  (`drive_cmd = steer_cmd = 0`) before it drives.
-- **Re-arm at neutral after any STOP** (v0.9). A motion command does not
-  release a latched STOP. Send one neutral frame from the producer that owns
-  the mode, then drive. The controller also boots with STOP latched.
+  The arbiter accepts this as a hand-over, not as the operator trying to drive
+  in autonomy's mode (§5.5). **Since v0.9 it must not carry `stop = 1`:** only
+  the operator can release a STOP, so a STOP in the grant would leave the
+  autonomy stack unable to drive. Send the grant until `TELEM_STATE.mode` shows
+  the new mode, then stop: once the rover is `AUTONOMOUS`, further operator
+  frames are wrong-source frames and raise `FAULT_CMD_SOURCE`. The autonomy
+  stack then sends ordinary `mode=AUTONOMOUS, from_autonomy=1` frames. `TELEOP`
+  needs no separate grant: the operator both grants it and drives it, so the
+  operator's first `TELEOP` frame may already carry motion.
+- **Only the operator releases a STOP** (v0.9, Systems). A motion command never
+  releases it, and nothing from the autonomy stack does. The operator sends one
+  neutral frame. In `AUTONOMOUS` that means taking `TELEOP` (or `SAFE`) at
+  neutral, then handing `AUTONOMOUS` back. The controller also boots with STOP
+  latched; the first neutral `SAFE` frame from the operator releases it.
 - **Send `SAFE` after any fault before driving again.** Once `TELEM_STATE.mode`
   reads `FAULT`, requests for `TELEOP` or `AUTONOMOUS` come back as
   `MODE_REFUSED` until a `SAFE` request has been accepted. Read `fault_status`
@@ -783,7 +790,7 @@ ever the `c2_lost` bit the Jetson forwarded, mapped by `c2LinkState()`:
 | Condition | `c2_link` | `FAULT_C2_LINK_LOST` |
 |---|---|---|
 | No valid `CONTROL` frame has ever arrived | `LINK_NOT_REPORTED` | clear |
-| `JETSON_HEARTBEAT_LOST` — the forwarded value is **stale** | `LINK_NOT_REPORTED` | clear |
+| `JETSON_HEARTBEAT_LOST` — no readable frame for a watchdog period, so the forwarded value is **stale** (v0.9: rejected frames still count as readable) | `LINK_NOT_REPORTED` | clear |
 | Last frame said `c2_lost = 1` | `LINK_LOST` | **set** |
 | Last frame said `c2_lost = 0` | `LINK_OK` | clear |
 
@@ -987,15 +994,15 @@ being acted on.
 what it is. The controller checks, in order: `NO_COMMAND` if no readable frame
 has arrived; then, while the last readable frame is fresh, its gate-3 verdict if
 it was rejected (`MODE_REFUSED`, `MODE_CONFLICT`, `WRONG_SOURCE`); then
-`STOPPED`; then `NO_COMMAND` if there is no active command; then `APPLIED`. The
+`STOPPED`; then `APPLIED`. The
 first match wins (`RoverController::commandStatus()`):
 
 | Value | Name | Meaning |
 |---|---|---|
-| 0 | `APPLIED` | the echoed drive and steer are what the drive stage was handed |
+| 0 | `APPLIED` | the echoed drive and steer are what the drive stage was handed. Right after a hand-over that is 0 and 0, until the new owner sends a command |
 | 1 | `STOPPED` | a stop condition zeroed them: the command watchdog, the `stop` flag, a mode that does not permit motion (`SAFE` or `FAULT`), an autonomy abort, or C2 loss in `TELEOP`. *Which* one is in `fault_status` and `TELEM_STATE.mode` |
 | 2 | `WRONG_SOURCE` | the last readable frame came from a producer that does not own the current mode, and was rejected (§3.1.5). Since v0.9 the echoed drive is the **previous accepted command**, which carries on until it is replaced or times out (§5.5) |
-| 3 | `NO_COMMAND` | no valid `CONTROL` frame has ever arrived, or (v0.9) a mode was handed over and its new owner has not sent a command yet |
+| 3 | `NO_COMMAND` | no valid `CONTROL` frame has ever arrived |
 | 4 | `MODE_REFUSED` | **v0.7.** The last frame asked for a mode the controller is not in, and it was not granted: the transition is not allowed for that producer, the rover is latched in `FAULT`, or a condition in §3.1.7 refused it. `TELEM_STATE.mode` shows the mode the rover stayed in. Not reported once the frame is stale; the verdict then falls back to `STOPPED` |
 | 5 | `MODE_CONFLICT` | **v0.9.** The last readable frame asked for motion in a mode that does not permit it (`SAFE` + drive) and was rejected. Stale the same way as `MODE_REFUSED` |
 
@@ -1369,20 +1376,23 @@ gate-1/2 reason.
 
 - Set by `VERDICT_STOP`, and at boot.
 - Released only by an `ACCEPTED` neutral frame (`drive_cmd = steer_cmd = 0`,
-  `stop = 0`). A motion command never releases it, so neither the next
-  autonomy frame nor an operator letting go of STOP with the stick still
-  pushed can restart the rover. That is the usual machine-stop rule: resetting
-  a stop must not by itself start motion.
+  `stop = 0`) **from the operator** (`from_autonomy = 0`, Systems decision). A
+  motion command never releases it, so neither the next autonomy frame nor an
+  operator letting go of STOP with the stick still pushed can restart the
+  rover. That is the usual machine-stop rule: resetting a stop must not by
+  itself start motion. The autonomy stack cannot release it at all, even a
+  STOP it sent itself; in `AUTONOMOUS` the operator releases it by taking
+  `TELEOP` or `SAFE` at neutral (`only_the_operator_can_release_stop`).
 - Does not change the mode. A rover stopped in `AUTONOMOUS` is still in
   `AUTONOMOUS`, and mode changes still follow §3.1.7.
 
-**A6 — an invalid command while moving. PENDING SYSTEMS.**
+**A6 — an invalid command while moving. Decided by Systems: ride out.**
 `INVALID_COMMAND_POLICY` in `rover_config.h`; both settings are tested
 (`an_invalid_command_while_moving_*`):
 
 | Policy | A frame rejected at gate 2 or 3 while the rover is moving |
 |---|---|
-| `INVALID_CMD_RIDE_OUT` *(current)* | is dropped; the rover keeps the last accepted command until it is replaced or the watchdog expires (≤ 300 ms) |
+| `INVALID_CMD_RIDE_OUT` *(Systems' choice)* | is dropped; the rover keeps the last accepted command until it is replaced or the watchdog expires (≤ 300 ms) |
 | `INVALID_CMD_STOP` | latches STOP immediately; re-armed like any STOP |
 
 Corrupt frames (gate 1) ride out under either policy: they are line noise, not
@@ -1419,20 +1429,23 @@ The last row is why gate 4 is separate from gate 3: gate 3 judges the
 *request*, and the E-stop is not part of the request. (Group C may decide to
 refuse it at gate 3 as well.)
 
-**Questions for Systems** (Lance Finke / Hector). Each answer is a small,
-local change here:
+**Systems decisions** (Lance Finke / Hector, November 2026):
 
-1. **A6:** stop on a single invalid frame, or ride out to the timeout?
-   (`INVALID_COMMAND_POLICY`)
-2. **Who may release a STOP?** Today any accepted neutral frame does, so the
-   autonomy stack's own zero-velocity frame can release an operator's STOP if
-   the Jetson stops forwarding the stop bit. The stricter option: only the
-   operator releases an operator's STOP.
-3. **Must STOP be well formed?** Today a STOP has to pass gates 1 and 2. The
-   alternative is to honour the stop bit of any intact frame (gate 1 only), on
-   the grounds that stopping is never the unsafe direction.
-4. **May the operator override in `AUTONOMOUS`** other than by taking
-   `TELEOP`? (A7: "unless Systems explicitly allows override".) Today: no.
+| # | Question | Decision | In the code |
+|---|---|---|---|
+| 1 | A6: stop on one invalid frame, or ride out to the timeout? | Ride out | `INVALID_COMMAND_POLICY = INVALID_CMD_RIDE_OUT` |
+| 2 | STOP vs E-stop? | STOP is software, E-stop is hardware | STOP latch here; E-stop is Group C |
+| 3 | Does STOP latch? | Yes | `stop_latched_` |
+| 4 | Who may release a STOP? | Only the operator | operator neutral frame only |
+| 5 | Must STOP pass gates 1 and 2? | Yes | `a_stop_must_pass_gates_one_and_two` |
+| 6 | May teleop drive in `AUTONOMOUS`? | No: teleop commands execute only in `TELEOP` | `REJECT_WRONG_SOURCE` |
+| 7 | Is an autonomy abort a latched STOP? | Yes | `an_abort_latches_like_a_stop_while_autonomous` |
+| 8 | Refused frames time out to `FAULT`, recovered through `SAFE`? | Accurate | §3.1.7, §5.1 |
+
+On #4, "operator" is read as the human operator (`from_autonomy = 0`), who may
+be a different person from mission to mission. If Systems meant "whoever is in
+control of the current mode", the change is one condition in
+`RoverController::ingestFrame()`.
 
 ## 6. Configuration constants
 
@@ -1482,7 +1495,7 @@ converged, a single radio hiccup would start stopping the rover in `TELEOP`.
 | `UNDERVOLTAGE_CV` | 2000 | 20.00 V, placeholder (C++ only) |
 | `PWM_NEUTRAL_US` | 1500 | Servo/ESC neutral pulse width (§5.4) |
 | `PWM_SPAN_US` | 500 | Full scale either side of neutral, so `CMD_MIN..CMD_MAX` maps onto 1000–2000 µs |
-| `INVALID_COMMAND_POLICY` | `INVALID_CMD_RIDE_OUT` | **Pending Systems** (Task 6 A6): what an intact-but-invalid frame does to a moving rover. §5.5 (C++ only) |
+| `INVALID_COMMAND_POLICY` | `INVALID_CMD_RIDE_OUT` | **Decided by Systems** (Task 6 A6): what an intact-but-invalid frame does to a moving rover. §5.5 (C++ only) |
 
 ## 7. Demonstration and tests — no hardware required
 

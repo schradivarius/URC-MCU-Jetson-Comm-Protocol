@@ -19,7 +19,7 @@ static const uint32_t LINK_DEGRADED_HOLD_MS = 1000;
 static const uint32_t REJECT_REPORT_HOLD_MS = 1000;
 
 // What to do when a bad command arrives while the rover is moving.
-// WAITING ON SYSTEMS (Task 6 A6).
+// DECIDED BY SYSTEMS: RIDE_OUT (Task 6 A6).
 //   RIDE_OUT  ignore it; keep the last good command until the timeout (300 ms)
 //   STOP      ignore it and stop right away
 // Damaged frames (bad CRC) are always just ignored.
