@@ -35,10 +35,12 @@ static bool sendFrame(RoverController& ctl, int16_t drive, int16_t steer,
     return ctl.ingestFrame(CAN_ID_CONTROL, buf, encodeControl(m, buf));
 }
 
-// Switch modes the way the Jetson does: the operator sends the new mode with
-// STOP on, then the new owner sends one neutral command to turn STOP off.
+// Switch modes the way the Jetson does: the operator hands the mode over at
+// neutral, then the new owner sends one neutral command.
+// CHANGED: the handover no longer sets STOP. Only the operator can release
+// STOP now (Systems), so a STOP in the handover would trap autonomy.
 static void grantMode(RoverController& ctl, uint8_t mode, bool c2_lost = false) {
-    sendFrame(ctl, 0, 0, mode, true, false, false, INDICATOR_OFF,
+    sendFrame(ctl, 0, 0, mode, false, false, false, INDICATOR_OFF,
               c2_lost, SRC_TELEOP);
     sendFrame(ctl, 0, 0, mode, false, false, false, INDICATOR_OFF,
               c2_lost, SRC_OWNER);
@@ -1025,17 +1027,15 @@ static void a_refused_mode_change_does_not_drive_in_the_old_mode() {
     CHECK(!ctl.effectiveStop());
 }
 
+// CHANGED: the operator hands over at neutral, without STOP.
 static void the_operator_hands_over_and_autonomy_drives() {
     RoverController ctl = freshController();
-    CHECK(sendFrame(ctl, 0, 0, MODE_AUTONOMOUS, true, false, false,
+    CHECK(sendFrame(ctl, 0, 0, MODE_AUTONOMOUS, false, false, false,
                     INDICATOR_OFF, false, SRC_TELEOP));
     CHECK_EQ(ctl.activeMode(), MODE_AUTONOMOUS);
-    CHECK_EQ(ctl.commandStatus(), CMD_STATUS_STOPPED);
-    CHECK(!(ctl.faultWord() & FAULT_CMD_SOURCE));
-
-    CHECK(sendFrame(ctl, 0, 0, MODE_AUTONOMOUS, false));
     CHECK(!ctl.stopLatched());
     CHECK_EQ(ctl.commandStatus(), CMD_STATUS_APPLIED);
+    CHECK(!(ctl.faultWord() & FAULT_CMD_SOURCE));
 
     CHECK(sendFrame(ctl, 600, 100, MODE_AUTONOMOUS, false));
     CHECK_EQ(ctl.commandStatus(), CMD_STATUS_APPLIED);
@@ -1600,16 +1600,61 @@ static void the_rover_boots_with_stop_latched() {
     CHECK_EQ(outputDrive(ctl), 600);
 }
 
+// CHANGED: after an abort, autonomy can't restart itself. The operator
+// releases it, here by taking TELEOP at neutral.
 static void an_abort_latches_like_a_stop_while_autonomous() {
     RoverController ctl = freshController();
     sendControl(ctl, 600, 0, MODE_AUTONOMOUS, false);
     CHECK(sendFrame(ctl, 600, 0, MODE_AUTONOMOUS, false, true));
     CHECK_EQ(ctl.lastVerdict(), VERDICT_STOP);
+    CHECK(sendFrame(ctl, 0, 0, MODE_AUTONOMOUS, false));
+    CHECK(ctl.stopLatched());
     CHECK(sendFrame(ctl, 600, 0, MODE_AUTONOMOUS, false));
     CHECK_EQ(outputDrive(ctl), 0);
+
+    CHECK(sendFrame(ctl, 0, 0, MODE_TELEOP, false));
+    CHECK(!ctl.stopLatched());
+    CHECK(sendFrame(ctl, 400, 0, MODE_TELEOP, false));
+    CHECK_EQ(outputDrive(ctl), 400);
+}
+
+// NEW (Systems): only the operator can release STOP, no matter who sent it.
+static void only_the_operator_can_release_stop() {
+    // In SAFE, autonomy's neutral commands are accepted but don't release it.
+    RoverController ctl = freshController();
+    CHECK(sendFrame(ctl, 0, 0, MODE_SAFE, true, false, false, INDICATOR_OFF,
+                    false, SRC_AUTONOMY));
+    CHECK(sendFrame(ctl, 0, 0, MODE_SAFE, false, false, false, INDICATOR_OFF,
+                    false, SRC_AUTONOMY));
+    CHECK(ctl.stopLatched());
+    CHECK(sendFrame(ctl, 0, 0, MODE_SAFE, false, false, false, INDICATOR_OFF,
+                    false, SRC_TELEOP));
+    CHECK(!ctl.stopLatched());
+
+    // In AUTONOMOUS, autonomy can't release even its own STOP. The operator
+    // takes TELEOP (which releases it), then hands AUTONOMOUS back.
+    sendControl(ctl, 600, 0, MODE_AUTONOMOUS, false);
+    CHECK(sendFrame(ctl, 0, 0, MODE_AUTONOMOUS, true));
     CHECK(sendFrame(ctl, 0, 0, MODE_AUTONOMOUS, false));
+    CHECK(ctl.stopLatched());
+    grantMode(ctl, MODE_TELEOP);
+    CHECK(!ctl.stopLatched());
+    grantMode(ctl, MODE_AUTONOMOUS);
     CHECK(sendFrame(ctl, 600, 0, MODE_AUTONOMOUS, false));
     CHECK_EQ(outputDrive(ctl), 600);
+}
+
+// NEW: why the Jetson must hand over WITHOUT STOP now. A handover with STOP
+// set latches the operator's STOP, and autonomy can't release it.
+static void a_handover_with_stop_set_keeps_autonomy_stopped() {
+    RoverController ctl = freshController();
+    CHECK(sendFrame(ctl, 0, 0, MODE_AUTONOMOUS, true, false, false,
+                    INDICATOR_OFF, false, SRC_TELEOP));
+    CHECK(sendFrame(ctl, 0, 0, MODE_AUTONOMOUS, false));
+    CHECK(sendFrame(ctl, 600, 0, MODE_AUTONOMOUS, false));
+    CHECK(ctl.stopLatched());
+    CHECK_EQ(outputDrive(ctl), 0);
+    CHECK_EQ(ctl.commandStatus(), CMD_STATUS_STOPPED);
 }
 
 // STOP skips gate 3 but must pass gates 1 and 2. A damaged or invalid
@@ -1656,7 +1701,7 @@ static void a_stop_frame_still_obeys_the_mode_rules() {
     CHECK(ctl.effectiveStop());
 }
 
-// A6 (waiting on Systems): a bad command arrives while the rover is moving.
+// A6 (Systems chose RIDE_OUT): a bad command arrives while the rover is moving.
 static void an_invalid_command_while_moving_rides_out_to_the_timeout() {
     RoverController ctl = freshController();
     CHECK_EQ(ctl.invalidCommandPolicy(), INVALID_CMD_RIDE_OUT);
@@ -1906,6 +1951,8 @@ int main() {
     RUN_TEST(stop_is_not_overridden_by_the_next_autonomy_command);
     RUN_TEST(the_rover_boots_with_stop_latched);
     RUN_TEST(an_abort_latches_like_a_stop_while_autonomous);
+    RUN_TEST(only_the_operator_can_release_stop);
+    RUN_TEST(a_handover_with_stop_set_keeps_autonomy_stopped);
     RUN_TEST(a_stop_must_pass_gates_one_and_two);
     RUN_TEST(stop_is_not_a_mode_change);
     RUN_TEST(a_stop_frame_still_obeys_the_mode_rules);

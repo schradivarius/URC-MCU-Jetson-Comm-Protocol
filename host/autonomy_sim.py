@@ -168,7 +168,9 @@ def build_mission():
     auto = dict(mode=rp.MODE_AUTONOMOUS, c2_lost=False, from_autonomy=True)
     teleop = dict(mode=rp.MODE_TELEOP, c2_lost=False, from_autonomy=False)
 
-    grant_auto = dict(drive_cmd=0, steer_cmd=0, stop=True,
+    # CHANGED: the operator hands AUTONOMOUS over at neutral, without STOP.
+    # Only the operator can release STOP, so a STOP here would trap autonomy.
+    grant_auto = dict(drive_cmd=0, steer_cmd=0,
                      mode=rp.MODE_AUTONOMOUS, c2_lost=False, from_autonomy=False)
     grant_teleop = dict(drive_cmd=0, steer_cmd=0, stop=True, **teleop)
 
@@ -192,7 +194,7 @@ def build_mission():
         Step("3. operator grants AUTONOMOUS",
              grant_auto,
              all_of(expect(mode=rp.MODE_AUTONOMOUS,
-                           cmd_status=rp.CMD_STATUS_STOPPED,
+                           cmd_status=rp.CMD_STATUS_APPLIED, drive_applied=0,
                            indicator_state=rp.INDICATOR_AUTONOMOUS),
                     fault_clear(rp.FAULT_CMD_SOURCE, "CMD_SOURCE"))),
 
@@ -245,9 +247,10 @@ def build_mission():
                     fault_set(rp.FAULT_CMD_SOURCE, "CMD_SOURCE"))),
         Step("12. operator grants AUTONOMOUS again",
              grant_auto,
-             expect(mode=rp.MODE_AUTONOMOUS, cmd_status=rp.CMD_STATUS_STOPPED)),
+             expect(mode=rp.MODE_AUTONOMOUS, cmd_status=rp.CMD_STATUS_APPLIED,
+                    drive_applied=0)),
 
-        Step("12b. autonomy re-arms at neutral",
+        Step("12b. autonomy takes over again",
              dict(drive_cmd=0, steer_cmd=0, **auto),
              expect(cmd_status=rp.CMD_STATUS_APPLIED, drive_applied=0)),
 

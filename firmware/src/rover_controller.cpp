@@ -128,9 +128,11 @@ bool RoverController::ingestFrame(uint32_t can_id, const uint8_t* buf, uint8_t l
         clearActiveCommand();
     } else {
         setActiveCommand(msg);
-        // Only a neutral command (drive 0, steer 0) turns STOP off,
-        // so the rover can never restart by surprise.
-        if (msg.drive_cmd == 0 && msg.steer_cmd == 0) stop_latched_ = false;
+        // Only the OPERATOR can turn STOP off (Systems decision, Task 6 A),
+        // and only with a neutral command (drive 0, steer 0), so the rover
+        // can never restart by surprise. The autonomy stack can't release it.
+        const bool neutral = msg.drive_cmd == 0 && msg.steer_cmd == 0;
+        if (neutral && !msg.from_autonomy) stop_latched_ = false;
     }
 
     have_accepted_    = true;
@@ -314,8 +316,9 @@ uint8_t RoverController::commandStatus() const {
             case VERDICT_REJECT_WRONG_SOURCE:  return CMD_STATUS_WRONG_SOURCE;
         }
     }
-    if (effectiveStop())       return CMD_STATUS_STOPPED;
-    if (!activeCommandValid()) return CMD_STATUS_NO_COMMAND;
+    if (effectiveStop()) return CMD_STATUS_STOPPED;
+    // Also covers a handover the new owner hasn't followed up yet: the motors
+    // are handed 0. NO_COMMAND is kept for "nothing received yet".
     return CMD_STATUS_APPLIED;
 }
 
@@ -357,9 +360,10 @@ uint8_t RoverController::jetsonLinkState() const {
     return LINK_OK;
 }
 
+// CHANGED: c2_lost is read from every readable frame, so it counts as current
+// while readable frames are arriving, even if the commands are being rejected.
 uint8_t RoverController::c2LinkState() const {
-    if (!have_control_)    return LINK_NOT_REPORTED;
-    if (watchdogTripped()) return LINK_NOT_REPORTED;
+    if (!rxFresh()) return LINK_NOT_REPORTED;
     return last_control_.c2_lost ? LINK_LOST : LINK_OK;
 }
 

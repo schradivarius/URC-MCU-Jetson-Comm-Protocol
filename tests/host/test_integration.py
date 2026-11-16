@@ -37,10 +37,20 @@ class RoverFixture(unittest.TestCase):
         self.send_frames(seconds, send=send, **kw)
 
     def grant(self, mode, c2_lost=False):
-        # Switch modes like the Jetson does: the operator sends the mode with
-        # STOP on, then the new owner sends one neutral command to turn STOP off.
-        self.send_frames(0.15, drive_cmd=0, steer_cmd=0, mode=mode, stop=True,
-                         c2_lost=c2_lost, from_autonomy=False)
+        # Switch modes like the Jetson does: the operator hands the mode over
+        # at neutral, then the new owner sends one neutral command.
+        # CHANGED: no STOP in the handover; only the operator can release STOP.
+        # CHANGED: send the handover until telemetry shows the new mode, then
+        # stop. Once in AUTONOMOUS, more operator frames are wrong-sender frames.
+        deadline = time.monotonic() + 0.5
+        next_send = 0.0
+        while time.monotonic() < deadline and self.mode() != mode:
+            if time.monotonic() >= next_send:
+                self.jl.send_control(drive_cmd=0, steer_cmd=0, mode=mode,
+                                     c2_lost=c2_lost, from_autonomy=False)
+                next_send = time.monotonic() + 0.15
+            self.jl.poll()
+            time.sleep(0.02)
         self.send_frames(0.06, drive_cmd=0, steer_cmd=0, mode=mode,
                          c2_lost=c2_lost,
                          from_autonomy=mode == rp.MODE_AUTONOMOUS)
