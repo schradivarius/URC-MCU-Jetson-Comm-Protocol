@@ -35,9 +35,15 @@ static bool sendFrame(RoverController& ctl, int16_t drive, int16_t steer,
     return ctl.ingestFrame(CAN_ID_CONTROL, buf, encodeControl(m, buf));
 }
 
+// Switch modes the way the Jetson does: the operator hands the mode over at
+// neutral, then the new owner sends one neutral command.
+// CHANGED: the handover no longer sets STOP. Only the operator can release
+// STOP now (Systems), so a STOP in the handover would trap autonomy.
 static void grantMode(RoverController& ctl, uint8_t mode, bool c2_lost = false) {
-    sendFrame(ctl, 0, 0, mode, true, false, false, INDICATOR_OFF,
+    sendFrame(ctl, 0, 0, mode, false, false, false, INDICATOR_OFF,
               c2_lost, SRC_TELEOP);
+    sendFrame(ctl, 0, 0, mode, false, false, false, INDICATOR_OFF,
+              c2_lost, SRC_OWNER);
 }
 
 static bool sendControl(RoverController& ctl, int16_t drive, int16_t steer,
@@ -119,12 +125,22 @@ static void explicit_stop_flag_wins_in_any_mode() {
     }
 }
 
-static void stop_is_releasable_without_a_mode_change() {
+// A4: STOP stays on until a neutral command. A drive command can't turn it off.
+static void stop_latches_until_a_neutral_command() {
     RoverController ctl = freshController();
+    sendControl(ctl, 500, 0, MODE_TELEOP, false);
     sendControl(ctl, 500, 0, MODE_TELEOP, true);
     CHECK(ctl.effectiveStop());
-    sendControl(ctl, 500, 0, MODE_TELEOP, false);
-    CHECK(!ctl.effectiveStop());
+    CHECK(sendControl(ctl, 500, 0, MODE_TELEOP, false));
+    CHECK(ctl.stopLatched());
+    int16_t d, s; ctl.commandedOutputs(d, s);
+    CHECK_EQ(d, 0);
+    CHECK(sendControl(ctl, 0, 0, MODE_TELEOP, false));
+    CHECK(!ctl.stopLatched());
+    CHECK(sendControl(ctl, 500, 0, MODE_TELEOP, false));
+    ctl.commandedOutputs(d, s);
+    CHECK_EQ(d, 500);
+    CHECK_EQ(ctl.activeMode(), MODE_TELEOP);
 }
 
 static void disabled_mode_forces_stop_at_full_throttle() {
@@ -439,13 +455,13 @@ static void fault_latches_until_safe_is_commanded() {
     sendControl(ctl, 500, 0, MODE_TELEOP, false);
     advance(DEFAULT_WATCHDOG_TIMEOUT_MS);
     CHECK_EQ(ctl.activeMode(), MODE_FAULT);
-    CHECK(sendFrame(ctl, 500, 0, MODE_TELEOP, false));
+    CHECK(!sendFrame(ctl, 500, 0, MODE_TELEOP, false));
     CHECK_EQ(ctl.activeMode(), MODE_FAULT);
     CHECK(ctl.modeRefused());
     CHECK_EQ(ctl.commandStatus(), CMD_STATUS_MODE_REFUSED);
     int16_t d, s; ctl.commandedOutputs(d, s);
     CHECK_EQ(d, 0); CHECK_EQ(s, 0);
-    CHECK(!ctl.watchdogTripped());
+    CHECK(ctl.watchdogTripped());
     CHECK(ctl.faultWord() & FAULT_COMM_TIMEOUT);
 
     CHECK(sendFrame(ctl, 0, 0, MODE_SAFE, false));
@@ -673,11 +689,12 @@ static void telemetry_pacing_is_correct_across_wraparound() {
 
 static void an_autonomy_command_is_refused_while_teleoperated() {
     RoverController ctl = freshController();
-    CHECK(sendControl(ctl, 600, 200, MODE_TELEOP, false, false, false,
-                      INDICATOR_OFF, false, SRC_AUTONOMY));
+    CHECK(!sendControl(ctl, 600, 200, MODE_TELEOP, false, false, false,
+                       INDICATOR_OFF, false, SRC_AUTONOMY));
     CHECK_EQ(ctl.lastDecodeResult(), DECODE_OK);
+    CHECK_EQ(ctl.lastVerdict(), VERDICT_REJECT_WRONG_SOURCE);
     CHECK_EQ(ctl.controlFramesAccepted(), 2u);
-    CHECK(!ctl.watchdogTripped());
+    CHECK_EQ(ctl.framesRefused(), 1u);
     CHECK(!ctl.commandAuthorized());
     CHECK(!ctl.effectiveStop());
     int16_t d, s; ctl.commandedOutputs(d, s);
@@ -688,8 +705,9 @@ static void an_autonomy_command_is_refused_while_teleoperated() {
 
 static void a_teleop_command_is_refused_while_autonomous() {
     RoverController ctl = freshController();
-    CHECK(sendControl(ctl, 600, 200, MODE_AUTONOMOUS, false, false, false,
-                      INDICATOR_OFF, false, SRC_TELEOP));
+    CHECK(!sendControl(ctl, 600, 200, MODE_AUTONOMOUS, false, false, false,
+                       INDICATOR_OFF, false, SRC_TELEOP));
+    CHECK_EQ(ctl.lastVerdict(), VERDICT_REJECT_WRONG_SOURCE);
     CHECK(!ctl.commandAuthorized());
     int16_t d, s; ctl.commandedOutputs(d, s);
     CHECK_EQ(d, 0); CHECK_EQ(s, 0);
@@ -699,8 +717,8 @@ static void a_teleop_command_is_refused_while_autonomous() {
 
 static void the_same_command_is_accepted_once_the_mode_matches() {
     RoverController ctl = freshController();
-    CHECK(sendControl(ctl, 600, 200, MODE_TELEOP, false, false, false,
-                      INDICATOR_OFF, false, SRC_AUTONOMY));
+    CHECK(!sendControl(ctl, 600, 200, MODE_TELEOP, false, false, false,
+                       INDICATOR_OFF, false, SRC_AUTONOMY));
     int16_t d, s; ctl.commandedOutputs(d, s);
     CHECK_EQ(d, 0); CHECK_EQ(s, 0);
 
@@ -710,6 +728,10 @@ static void the_same_command_is_accepted_once_the_mode_matches() {
     ctl.commandedOutputs(d, s);
     CHECK_EQ(d, 600); CHECK_EQ(s, 200);
     CHECK_EQ(ctl.commandStatus(), CMD_STATUS_APPLIED);
+    CHECK(ctl.faultWord() & FAULT_CMD_SOURCE);
+    advance(REJECT_REPORT_HOLD_MS);
+    sendControl(ctl, 600, 200, MODE_AUTONOMOUS, false, false, false,
+                INDICATOR_OFF, false, SRC_AUTONOMY);
     CHECK(!(ctl.faultWord() & FAULT_CMD_SOURCE));
 }
 
@@ -755,37 +777,47 @@ static void disabled_mode_has_no_owner_so_neither_source_mismatches() {
     }
 }
 
-static void a_stale_source_mismatch_is_not_reported() {
+// The wrong-sender fault stays on after the timeout it caused, so the operator
+// can see why the rover stopped. It clears after REJECT_REPORT_HOLD_MS.
+static void a_source_mismatch_is_held_then_expires() {
     RoverController ctl = freshController();
-    CHECK(sendControl(ctl, 600, 0, MODE_AUTONOMOUS, false, false, false,
-                      INDICATOR_OFF, false, SRC_TELEOP));
+    CHECK(!sendControl(ctl, 600, 0, MODE_AUTONOMOUS, false, false, false,
+                       INDICATOR_OFF, false, SRC_TELEOP));
     CHECK(ctl.sourceMismatch());
     CHECK(ctl.faultWord() & FAULT_CMD_SOURCE);
 
     advance(400);
     CHECK(ctl.watchdogTripped());
-    CHECK(!ctl.sourceMismatch());
-    CHECK(!(ctl.faultWord() & FAULT_CMD_SOURCE));
+    CHECK(ctl.sourceMismatch());
+    CHECK(ctl.faultWord() & FAULT_CMD_SOURCE);
     CHECK(ctl.faultWord() & FAULT_COMM_TIMEOUT);
     CHECK_EQ(ctl.commandStatus(), CMD_STATUS_STOPPED);
+
+    advance(REJECT_REPORT_HOLD_MS);
+    CHECK(!ctl.sourceMismatch());
+    CHECK(!(ctl.faultWord() & FAULT_CMD_SOURCE));
 }
 
-static void an_unauthorised_frame_still_feeds_the_watchdog() {
+// A3: a command from the wrong sender must not reset the timeout.
+// (Before Task 6 it did.)
+static void an_unauthorised_frame_does_not_feed_the_watchdog() {
     RoverController ctl = freshController();
-    CHECK(sendControl(ctl, 600, 0, MODE_AUTONOMOUS, false, false, false,
-                      INDICATOR_OFF, false, SRC_TELEOP));
+    grantMode(ctl, MODE_AUTONOMOUS);
     advance(200);
-    CHECK(sendControl(ctl, 600, 0, MODE_AUTONOMOUS, false, false, false,
-                      INDICATOR_OFF, false, SRC_TELEOP));
-    advance(200);
-    CHECK(!ctl.watchdogTripped());
-    CHECK_EQ(ctl.jetsonLinkState(), LINK_OK);
+    CHECK(!sendFrame(ctl, 600, 0, MODE_AUTONOMOUS, false, false, false,
+                     INDICATOR_OFF, false, SRC_TELEOP));
+    advance(100);
+    CHECK(!sendFrame(ctl, 600, 0, MODE_AUTONOMOUS, false, false, false,
+                     INDICATOR_OFF, false, SRC_TELEOP));
+    CHECK(ctl.watchdogTripped());
+    CHECK(ctl.faultWord() & FAULT_COMM_TIMEOUT);
+    CHECK(ctl.faultWord() & FAULT_CMD_SOURCE);
 }
 
 static void an_arrival_claim_from_the_wrong_source_is_ignored() {
     RoverController ctl = freshController();
-    CHECK(sendControl(ctl, 0, 0, MODE_AUTONOMOUS, false, false, false,
-                      INDICATOR_ARRIVED, false, SRC_TELEOP));
+    CHECK(!sendControl(ctl, 0, 0, MODE_AUTONOMOUS, false, false, false,
+                       INDICATOR_ARRIVED, false, SRC_TELEOP));
     CHECK_EQ(ctl.indicatorState(), INDICATOR_AUTONOMOUS);
 
     CHECK(sendControl(ctl, 0, 0, MODE_AUTONOMOUS, false, false, false,
@@ -814,8 +846,10 @@ static void a_return_request_outside_autonomous_is_not_active() {
 
 static void a_return_request_from_the_operator_is_honoured() {
     RoverController ctl = freshController();
-    CHECK(sendControl(ctl, 0, 0, MODE_AUTONOMOUS, false, false, true,
-                      INDICATOR_OFF, false, SRC_TELEOP));
+    // The command is rejected, but the return request still counts:
+    // URC rule 1.e.xi says the operator is the one who signals the return.
+    CHECK(!sendControl(ctl, 0, 0, MODE_AUTONOMOUS, false, false, true,
+                       INDICATOR_OFF, false, SRC_TELEOP));
     CHECK(!ctl.commandAuthorized());
     CHECK(ctl.returnRequestActive());
 }
@@ -831,6 +865,7 @@ static void a_stale_return_request_is_not_reported() {
 
 static void the_echo_acknowledges_the_sequence_number_it_acted_on() {
     RoverController ctl = freshController();
+    CHECK(sendWithSeq(ctl, 76, 0));
     CHECK(sendWithSeq(ctl, 77, 400));
     TelemetryCmdEcho e = ctl.buildCmdEcho(400, 0);
     CHECK_EQ(e.ack_seq, 77);
@@ -867,8 +902,8 @@ static void the_echo_carries_the_reason_the_last_frame_was_rejected() {
 
 static void the_echo_reports_a_refused_command_as_zero() {
     RoverController ctl = freshController();
-    CHECK(sendControl(ctl, 800, 300, MODE_TELEOP, false, false, false,
-                      INDICATOR_OFF, false, SRC_AUTONOMY));
+    CHECK(!sendControl(ctl, 800, 300, MODE_TELEOP, false, false, false,
+                       INDICATOR_OFF, false, SRC_AUTONOMY));
     int16_t d, s; ctl.commandedOutputs(d, s);
     TelemetryCmdEcho e = ctl.buildCmdEcho(d, s);
     CHECK_EQ(e.drive_applied, 0);
@@ -893,39 +928,44 @@ static void outputs_are_nonzero_only_when_permitted_and_authorised() {
                     for (int c2 = 0; c2 <= 1; ++c2) {
                         for (int stale = 0; stale <= 1; ++stale) {
                             RoverController ctl = freshController();
-                            const bool accepted = sendControl(
+                            const bool honoured = sendControl(
                                 ctl, 700, 300, static_cast<uint8_t>(mode),
                                 stop != 0, abort != 0, false, INDICATOR_OFF,
                                 c2 != 0, src ? SRC_AUTONOMY : SRC_TELEOP);
-                            CHECK_EQ(accepted, mode <= 2);
+                            const uint8_t verdict = ctl.lastVerdict();
+                            CHECK_EQ(honoured, verdict == VERDICT_ACCEPTED
+                                               || verdict == VERDICT_STOP);
+                            if (mode > MODE_MAX) {
+                                CHECK_EQ(verdict, VERDICT_REJECT_MALFORMED);
+                            }
                             if (stale) advance(400);
 
                             int16_t d, s;
                             ctl.commandedOutputs(d, s);
-                            const bool permitted = !ctl.effectiveStop();
-                            const bool authorised = ctl.commandAuthorized();
+                            const bool moving = d != 0 || s != 0;
+                            CHECK_EQ(moving,
+                                     ctl.commandStatus() == CMD_STATUS_APPLIED);
 
-                            if (d != 0 || s != 0) {
-                                CHECK(permitted);
-                                CHECK(authorised);
-                                CHECK_EQ(ctl.commandStatus(), CMD_STATUS_APPLIED);
+                            if (moving) {
+                                CHECK(!stale);
+                                CHECK(!stop);
+                                CHECK(!ctl.effectiveStop());
+                                CHECK_EQ(verdict, VERDICT_ACCEPTED);
+                                CHECK(modePermitsMotion(ctl.activeMode()));
+                                CHECK(sourceOwnsMode(src != 0, ctl.activeMode()));
                                 CHECK_EQ(d, 700); CHECK_EQ(s, 300);
                                 moved++;
-                            } else if (!permitted) {
-                                CHECK_EQ(ctl.commandStatus(),
-                                         !accepted        ? CMD_STATUS_NO_COMMAND
-                                         : ctl.modeRefused() ? CMD_STATUS_MODE_REFUSED
-                                                             : CMD_STATUS_STOPPED);
-                                stopped_count++;
-                            } else {
-                                CHECK(!authorised);
-                                CHECK_EQ(ctl.commandStatus(), CMD_STATUS_WRONG_SOURCE);
+                            } else if (verdictIsRejection(verdict)) {
                                 refused++;
+                            } else {
+                                stopped_count++;
                             }
 
-                            const bool bit = (ctl.faultWord() & FAULT_CMD_SOURCE) != 0;
-                            CHECK_EQ(bit, ctl.sourceMismatch());
-                            if (stale) CHECK(!bit);
+                            CHECK_EQ((ctl.faultWord() & FAULT_CMD_SOURCE) != 0,
+                                     ctl.sourceMismatch());
+                            CHECK_EQ((ctl.faultWord() & FAULT_MODE_CONFLICT) != 0,
+                                     ctl.modeConflict());
+                            if (stale) CHECK(ctl.watchdogTripped());
                         }
                     }
                 }
@@ -939,9 +979,10 @@ static void outputs_are_nonzero_only_when_permitted_and_authorised() {
 
 static void a_refused_command_is_not_a_stop() {
     RoverController ctl = freshController();
-    CHECK(sendControl(ctl, 700, 300, MODE_AUTONOMOUS, false, false, false,
-                      INDICATOR_OFF, false, SRC_TELEOP));
+    CHECK(!sendControl(ctl, 700, 300, MODE_AUTONOMOUS, false, false, false,
+                       INDICATOR_OFF, false, SRC_TELEOP));
     CHECK(!ctl.effectiveStop());
+    CHECK(!ctl.stopLatched());
     CHECK_EQ(ctl.commandStatus(), CMD_STATUS_WRONG_SOURCE);
 
     CHECK(sendControl(ctl, 700, 300, MODE_AUTONOMOUS, false, false, false,
@@ -952,8 +993,8 @@ static void a_refused_command_is_not_a_stop() {
 
 static void autonomy_cannot_put_itself_in_charge() {
     RoverController ctl = freshController();
-    CHECK(sendFrame(ctl, 600, 0, MODE_AUTONOMOUS, false, false, false,
-                    INDICATOR_OFF, false, SRC_AUTONOMY));
+    CHECK(!sendFrame(ctl, 600, 0, MODE_AUTONOMOUS, false, false, false,
+                     INDICATOR_OFF, false, SRC_AUTONOMY));
     CHECK_EQ(ctl.activeMode(), MODE_SAFE);
     CHECK(ctl.modeRefused());
     CHECK_EQ(ctl.commandStatus(), CMD_STATUS_MODE_REFUSED);
@@ -961,14 +1002,15 @@ static void autonomy_cannot_put_itself_in_charge() {
     int16_t d, s; ctl.commandedOutputs(d, s);
     CHECK_EQ(d, 0); CHECK_EQ(s, 0);
     CHECK(!(ctl.faultWord() & FAULT_CMD_SOURCE));
-    CHECK(!ctl.watchdogTripped());
+    CHECK(ctl.faultWord() & FAULT_MODE_CONFLICT);
+    CHECK(ctl.watchdogTripped());
 }
 
 static void autonomy_cannot_take_over_from_the_operator() {
     RoverController ctl = freshController();
     sendFrame(ctl, 300, 0, MODE_TELEOP, false);
-    CHECK(sendFrame(ctl, 600, 0, MODE_AUTONOMOUS, false, false, false,
-                    INDICATOR_OFF, false, SRC_AUTONOMY));
+    CHECK(!sendFrame(ctl, 600, 0, MODE_AUTONOMOUS, false, false, false,
+                     INDICATOR_OFF, false, SRC_AUTONOMY));
     CHECK_EQ(ctl.activeMode(), MODE_TELEOP);
     CHECK_EQ(ctl.commandStatus(), CMD_STATUS_MODE_REFUSED);
 }
@@ -976,8 +1018,8 @@ static void autonomy_cannot_take_over_from_the_operator() {
 static void a_refused_mode_change_does_not_drive_in_the_old_mode() {
     RoverController ctl = freshController();
     grantMode(ctl, MODE_AUTONOMOUS);
-    CHECK(sendFrame(ctl, 600, 0, MODE_TELEOP, false, false, false,
-                    INDICATOR_OFF, false, SRC_AUTONOMY));
+    CHECK(!sendFrame(ctl, 600, 0, MODE_TELEOP, false, false, false,
+                     INDICATOR_OFF, false, SRC_AUTONOMY));
     CHECK_EQ(ctl.activeMode(), MODE_AUTONOMOUS);
     CHECK(!ctl.commandAuthorized());
     int16_t d, s; ctl.commandedOutputs(d, s);
@@ -985,11 +1027,14 @@ static void a_refused_mode_change_does_not_drive_in_the_old_mode() {
     CHECK(!ctl.effectiveStop());
 }
 
+// CHANGED: the operator hands over at neutral, without STOP.
 static void the_operator_hands_over_and_autonomy_drives() {
     RoverController ctl = freshController();
-    grantMode(ctl, MODE_AUTONOMOUS);
+    CHECK(sendFrame(ctl, 0, 0, MODE_AUTONOMOUS, false, false, false,
+                    INDICATOR_OFF, false, SRC_TELEOP));
     CHECK_EQ(ctl.activeMode(), MODE_AUTONOMOUS);
-    CHECK_EQ(ctl.commandStatus(), CMD_STATUS_STOPPED);
+    CHECK(!ctl.stopLatched());
+    CHECK_EQ(ctl.commandStatus(), CMD_STATUS_APPLIED);
     CHECK(!(ctl.faultWord() & FAULT_CMD_SOURCE));
 
     CHECK(sendFrame(ctl, 600, 100, MODE_AUTONOMOUS, false));
@@ -1080,7 +1125,7 @@ static void safe_is_refused_while_the_fault_is_still_there() {
     sendControl(ctl, 500, 0, MODE_TELEOP, false);
     ctl.updateFaults(FAULT_OVER_CURRENT, CTRL_HEALTH_OK);
 
-    CHECK(sendFrame(ctl, 0, 0, MODE_SAFE, false));
+    CHECK(!sendFrame(ctl, 0, 0, MODE_SAFE, false));
     CHECK_EQ(ctl.activeMode(), MODE_FAULT);
     CHECK_EQ(ctl.commandStatus(), CMD_STATUS_MODE_REFUSED);
 
@@ -1332,12 +1377,16 @@ static void the_source_names_the_producer_that_is_driving() {
     CHECK_EQ(ctl.commandSource(), CMD_SOURCE_AUTONOMY);
 }
 
-static void a_refused_source_is_not_an_active_source() {
+// A rejected command changes nothing: the operator keeps driving.
+static void a_refused_source_does_not_displace_the_active_source() {
     RoverController ctl = freshController(1000);
-    sendControl(ctl, 400, 0, MODE_TELEOP, false, false, false, INDICATOR_OFF,
+    sendControl(ctl, 400, 0, MODE_TELEOP, false);
+    sendControl(ctl, 900, 0, MODE_TELEOP, false, false, false, INDICATOR_OFF,
                 false, SRC_AUTONOMY);
     CHECK_EQ(ctl.commandStatus(), CMD_STATUS_WRONG_SOURCE);
-    CHECK_EQ(ctl.commandSource(), CMD_SOURCE_NONE);
+    CHECK_EQ(ctl.commandSource(), CMD_SOURCE_OPERATOR);
+    int16_t d, s; ctl.commandedOutputs(d, s);
+    CHECK_EQ(d, 400);
 }
 
 static void safe_has_no_owner_so_it_has_no_source() {
@@ -1398,6 +1447,391 @@ static void the_feedback_frame_round_trips_on_the_wire() {
     CHECK_EQ(got.flags, sent.flags);
 }
 
+// ===========================================================================
+// Task 6 Group A: who is allowed to command the rover.
+// Gate 1 intact -> gate 2 well formed -> gate 3 allowed -> gate 4 safe to move.
+// STOP only needs gates 1 and 2.
+// ===========================================================================
+
+static bool sendCorrupt(RoverController& ctl, int16_t drive, uint8_t mode,
+                        bool stop, Source src = SRC_OWNER) {
+    ControlMsg m;
+    m.drive_cmd = drive; m.steer_cmd = 0; m.mode = mode;
+    m.stop = stop; m.autonomy_abort = false; m.return_request = false;
+    m.c2_lost = false; m.from_autonomy = sourceBit(src, mode);
+    m.indicator_request = INDICATOR_OFF; m.seq = ++g_seq;
+    uint8_t buf[8] = {0};
+    encodeControl(m, buf);
+    buf[FRAME_CRC_OFFSET] ^= 0x5A;
+    return ctl.ingestFrame(CAN_ID_CONTROL, buf, FRAME_DLC);
+}
+
+static int16_t outputDrive(const RoverController& ctl) {
+    int16_t d, s;
+    ctl.commandedOutputs(d, s);
+    return d;
+}
+
+// A1: with one arbiter, a second sender can't make the motors flicker.
+// (Before Task 6 this went 400, 0, 400, 0 ...)
+static void the_arbiter_does_not_flap_between_two_producers() {
+    RoverController ctl = freshController();
+    sendControl(ctl, 400, 0, MODE_TELEOP, false);
+    for (int i = 0; i < 6; ++i) {
+        advance(25);
+        CHECK(!sendFrame(ctl, 900, 0, MODE_TELEOP, false, false, false,
+                         INDICATOR_OFF, false, SRC_AUTONOMY));
+        CHECK_EQ(outputDrive(ctl), 400);
+        advance(25);
+        CHECK(sendFrame(ctl, 400, 0, MODE_TELEOP, false));
+        CHECK_EQ(outputDrive(ctl), 400);
+    }
+    CHECK(!ctl.watchdogTripped());
+    CHECK(ctl.faultWord() & FAULT_CMD_SOURCE);
+}
+
+// A2: a command can be readable and still be wrong.
+static void motion_in_safe_is_a_mode_conflict() {
+    RoverController ctl = freshController();
+    CHECK(sendFrame(ctl, 0, 0, MODE_SAFE, false));
+    CHECK(!sendFrame(ctl, 600, 0, MODE_SAFE, false));
+    CHECK_EQ(ctl.lastVerdict(), VERDICT_REJECT_MODE_CONFLICT);
+    CHECK_EQ(ctl.commandStatus(), CMD_STATUS_MODE_CONFLICT);
+    CHECK(ctl.faultWord() & FAULT_MODE_CONFLICT);
+    CHECK_EQ(outputDrive(ctl), 0);
+}
+
+static void an_invalid_command_does_not_replace_the_active_command() {
+    RoverController ctl = freshController();
+    sendControl(ctl, 400, 100, MODE_TELEOP, false);
+    CHECK(!sendFrame(ctl, CMD_MAX + 1, 0, MODE_TELEOP, false));
+    CHECK_EQ(ctl.lastVerdict(), VERDICT_REJECT_MALFORMED);
+    int16_t d, s; ctl.commandedOutputs(d, s);
+    CHECK_EQ(d, 400); CHECK_EQ(s, 100);
+    CHECK(ctl.faultWord() & FAULT_PROTOCOL_ERROR);
+}
+
+// A3: only an accepted command (or a STOP) resets the timeout.
+static void a_refused_mode_change_does_not_feed_the_watchdog() {
+    RoverController ctl = freshController();
+    sendControl(ctl, 400, 0, MODE_TELEOP, false);
+    advance(200);
+    CHECK(!sendFrame(ctl, 0, 0, MODE_AUTONOMOUS, false, false, false,
+                     INDICATOR_OFF, false, SRC_AUTONOMY));
+    advance(100);
+    CHECK(ctl.watchdogTripped());
+    CHECK_EQ(ctl.activeMode(), MODE_FAULT);
+}
+
+static void a_motion_command_in_safe_does_not_feed_the_watchdog() {
+    RoverController ctl = freshController();
+    CHECK(sendFrame(ctl, 0, 0, MODE_SAFE, false));
+    advance(200);
+    CHECK(!sendFrame(ctl, 600, 0, MODE_SAFE, false));
+    advance(100);
+    CHECK(ctl.watchdogTripped());
+}
+
+static void a_stop_feeds_the_watchdog() {
+    RoverController ctl = freshController();
+    sendControl(ctl, 400, 0, MODE_TELEOP, false);
+    for (int i = 0; i < 4; ++i) {
+        advance(200);
+        CHECK(sendFrame(ctl, 0, 0, MODE_TELEOP, true));
+    }
+    CHECK(!ctl.watchdogTripped());
+    CHECK_EQ(ctl.activeMode(), MODE_TELEOP);
+    CHECK(ctl.effectiveStop());
+}
+
+static void a_jetson_sending_only_refused_frames_is_alive_but_stale() {
+    RoverController ctl = freshController();
+    sendControl(ctl, 400, 0, MODE_TELEOP, false);
+    for (int i = 0; i < 8; ++i) {
+        advance(50);
+        sendFrame(ctl, 400, 0, MODE_TELEOP, false, false, false,
+                  INDICATOR_OFF, false, SRC_AUTONOMY);
+    }
+    CHECK(ctl.watchdogTripped());
+    CHECK(ctl.faultWord() & FAULT_COMM_TIMEOUT);
+    CHECK_EQ(ctl.jetsonLinkState(), LINK_OK);
+    advance(DEFAULT_WATCHDOG_TIMEOUT_MS);
+    CHECK_EQ(ctl.jetsonLinkState(), LINK_LOST);
+}
+
+static void entering_safe_clears_the_refusal_reports() {
+    RoverController ctl = freshController();
+    sendControl(ctl, 400, 0, MODE_TELEOP, false);
+    sendFrame(ctl, 600, 0, MODE_TELEOP, false, false, false, INDICATOR_OFF,
+              false, SRC_AUTONOMY);
+    sendFrame(ctl, 0, 0, MODE_AUTONOMOUS, false, false, false, INDICATOR_OFF,
+              false, SRC_AUTONOMY);
+    CHECK(ctl.faultWord() & FAULT_CMD_SOURCE);
+    CHECK(ctl.faultWord() & FAULT_MODE_CONFLICT);
+    CHECK(sendFrame(ctl, 0, 0, MODE_SAFE, false));
+    CHECK(!(ctl.faultWord() & FAULT_CMD_SOURCE));
+    CHECK(!(ctl.faultWord() & FAULT_MODE_CONFLICT));
+}
+
+// A4: STOP wins right away, and autonomy's next drive command can't undo it.
+static void stop_is_not_overridden_by_the_next_autonomy_command() {
+    RoverController ctl = freshController();
+    sendControl(ctl, 600, 0, MODE_AUTONOMOUS, false);
+    CHECK_EQ(outputDrive(ctl), 600);
+    CHECK(sendFrame(ctl, 0, 0, MODE_AUTONOMOUS, true, false, false,
+                    INDICATOR_OFF, false, SRC_TELEOP));
+    CHECK_EQ(outputDrive(ctl), 0);
+    for (int i = 0; i < 5; ++i) {
+        advance(50);
+        CHECK(sendFrame(ctl, 600, 0, MODE_AUTONOMOUS, false));
+        CHECK_EQ(outputDrive(ctl), 0);
+        CHECK_EQ(ctl.commandStatus(), CMD_STATUS_STOPPED);
+    }
+}
+
+static void the_rover_boots_with_stop_latched() {
+    RoverController ctl = freshController();
+    CHECK(ctl.stopLatched());
+    CHECK(sendFrame(ctl, 600, 0, MODE_TELEOP, false));
+    CHECK_EQ(ctl.activeMode(), MODE_TELEOP);
+    CHECK_EQ(outputDrive(ctl), 0);
+    CHECK(sendFrame(ctl, 0, 0, MODE_TELEOP, false));
+    CHECK(sendFrame(ctl, 600, 0, MODE_TELEOP, false));
+    CHECK_EQ(outputDrive(ctl), 600);
+}
+
+// CHANGED: after an abort, autonomy can't restart itself. The operator
+// releases it, here by taking TELEOP at neutral.
+static void an_abort_latches_like_a_stop_while_autonomous() {
+    RoverController ctl = freshController();
+    sendControl(ctl, 600, 0, MODE_AUTONOMOUS, false);
+    CHECK(sendFrame(ctl, 600, 0, MODE_AUTONOMOUS, false, true));
+    CHECK_EQ(ctl.lastVerdict(), VERDICT_STOP);
+    CHECK(sendFrame(ctl, 0, 0, MODE_AUTONOMOUS, false));
+    CHECK(ctl.stopLatched());
+    CHECK(sendFrame(ctl, 600, 0, MODE_AUTONOMOUS, false));
+    CHECK_EQ(outputDrive(ctl), 0);
+
+    CHECK(sendFrame(ctl, 0, 0, MODE_TELEOP, false));
+    CHECK(!ctl.stopLatched());
+    CHECK(sendFrame(ctl, 400, 0, MODE_TELEOP, false));
+    CHECK_EQ(outputDrive(ctl), 400);
+}
+
+// NEW (Systems): only the operator can release STOP, no matter who sent it.
+static void only_the_operator_can_release_stop() {
+    // In SAFE, autonomy's neutral commands are accepted but don't release it.
+    RoverController ctl = freshController();
+    CHECK(sendFrame(ctl, 0, 0, MODE_SAFE, true, false, false, INDICATOR_OFF,
+                    false, SRC_AUTONOMY));
+    CHECK(sendFrame(ctl, 0, 0, MODE_SAFE, false, false, false, INDICATOR_OFF,
+                    false, SRC_AUTONOMY));
+    CHECK(ctl.stopLatched());
+    CHECK(sendFrame(ctl, 0, 0, MODE_SAFE, false, false, false, INDICATOR_OFF,
+                    false, SRC_TELEOP));
+    CHECK(!ctl.stopLatched());
+
+    // In AUTONOMOUS, autonomy can't release even its own STOP. The operator
+    // takes TELEOP (which releases it), then hands AUTONOMOUS back.
+    sendControl(ctl, 600, 0, MODE_AUTONOMOUS, false);
+    CHECK(sendFrame(ctl, 0, 0, MODE_AUTONOMOUS, true));
+    CHECK(sendFrame(ctl, 0, 0, MODE_AUTONOMOUS, false));
+    CHECK(ctl.stopLatched());
+    grantMode(ctl, MODE_TELEOP);
+    CHECK(!ctl.stopLatched());
+    grantMode(ctl, MODE_AUTONOMOUS);
+    CHECK(sendFrame(ctl, 600, 0, MODE_AUTONOMOUS, false));
+    CHECK_EQ(outputDrive(ctl), 600);
+}
+
+// NEW: why the Jetson must hand over WITHOUT STOP now. A handover with STOP
+// set latches the operator's STOP, and autonomy can't release it.
+static void a_handover_with_stop_set_keeps_autonomy_stopped() {
+    RoverController ctl = freshController();
+    CHECK(sendFrame(ctl, 0, 0, MODE_AUTONOMOUS, true, false, false,
+                    INDICATOR_OFF, false, SRC_TELEOP));
+    CHECK(sendFrame(ctl, 0, 0, MODE_AUTONOMOUS, false));
+    CHECK(sendFrame(ctl, 600, 0, MODE_AUTONOMOUS, false));
+    CHECK(ctl.stopLatched());
+    CHECK_EQ(outputDrive(ctl), 0);
+    CHECK_EQ(ctl.commandStatus(), CMD_STATUS_STOPPED);
+}
+
+// STOP skips gate 3 but must pass gates 1 and 2. A damaged or invalid
+// frame is ignored, even if its stop bit is set.
+static void a_stop_must_pass_gates_one_and_two() {
+    RoverController ctl = freshController();
+    sendControl(ctl, 400, 0, MODE_TELEOP, false);
+
+    CHECK(!sendCorrupt(ctl, 0, MODE_TELEOP, true));
+    CHECK_EQ(ctl.lastVerdict(), VERDICT_REJECT_CORRUPT);
+    CHECK(!ctl.stopLatched());
+    CHECK_EQ(outputDrive(ctl), 400);
+
+    CHECK(!sendFrame(ctl, CMD_MAX + 1, 0, MODE_TELEOP, true));
+    CHECK_EQ(ctl.lastVerdict(), VERDICT_REJECT_MALFORMED);
+    CHECK(!ctl.stopLatched());
+    CHECK_EQ(outputDrive(ctl), 400);
+
+    CHECK(sendFrame(ctl, 900, 0, MODE_TELEOP, true, false, false,
+                    INDICATOR_OFF, false, SRC_AUTONOMY));
+    CHECK_EQ(ctl.lastVerdict(), VERDICT_STOP);
+    CHECK_EQ(outputDrive(ctl), 0);
+}
+
+// A5: STOP stops the rover but does not change its mode.
+static void stop_is_not_a_mode_change() {
+    const uint8_t modes[] = {MODE_TELEOP, MODE_AUTONOMOUS};
+    for (uint8_t mode : modes) {
+        RoverController ctl = freshController();
+        sendControl(ctl, 500, 0, mode, false);
+        CHECK(sendFrame(ctl, 500, 0, mode, true));
+        CHECK_EQ(ctl.activeMode(), mode);
+        CHECK(ctl.effectiveStop());
+    }
+}
+
+static void a_stop_frame_still_obeys_the_mode_rules() {
+    RoverController ctl = freshController();
+    sendControl(ctl, 600, 0, MODE_AUTONOMOUS, false);
+    CHECK(sendFrame(ctl, 0, 0, MODE_TELEOP, true, false, false,
+                    INDICATOR_OFF, false, SRC_AUTONOMY));
+    CHECK_EQ(ctl.lastVerdict(), VERDICT_STOP);
+    CHECK_EQ(ctl.activeMode(), MODE_AUTONOMOUS);
+    CHECK(ctl.effectiveStop());
+}
+
+// A6 (Systems chose RIDE_OUT): a bad command arrives while the rover is moving.
+static void an_invalid_command_while_moving_rides_out_to_the_timeout() {
+    RoverController ctl = freshController();
+    CHECK_EQ(ctl.invalidCommandPolicy(), INVALID_CMD_RIDE_OUT);
+    sendControl(ctl, 500, 0, MODE_TELEOP, false);
+    CHECK_EQ(outputDrive(ctl), 500);
+
+    CHECK(!sendFrame(ctl, CMD_MAX + 1, 0, MODE_TELEOP, false));
+    CHECK(ctl.faultWord() & FAULT_PROTOCOL_ERROR);
+    CHECK_EQ(outputDrive(ctl), 500);
+
+    advance(DEFAULT_WATCHDOG_TIMEOUT_MS - 1);
+    CHECK_EQ(outputDrive(ctl), 500);
+    advance(1);
+    CHECK_EQ(outputDrive(ctl), 0);
+    CHECK(ctl.faultWord() & FAULT_COMM_TIMEOUT);
+}
+
+static void an_invalid_command_while_moving_stops_under_the_stop_policy() {
+    g_now = 0;
+    RoverController ctl(fakeMillis, 300, 50, INVALID_CMD_STOP);
+    sendControl(ctl, 500, 0, MODE_TELEOP, false);
+    CHECK_EQ(outputDrive(ctl), 500);
+
+    CHECK(!sendFrame(ctl, CMD_MAX + 1, 0, MODE_TELEOP, false));
+    CHECK(ctl.stopLatched());
+    CHECK_EQ(outputDrive(ctl), 0);
+    CHECK_EQ(ctl.activeMode(), MODE_TELEOP);
+
+    CHECK(sendFrame(ctl, 500, 0, MODE_TELEOP, false));
+    CHECK_EQ(outputDrive(ctl), 0);
+    CHECK(sendFrame(ctl, 0, 0, MODE_TELEOP, false));
+    CHECK(sendFrame(ctl, 500, 0, MODE_TELEOP, false));
+    CHECK_EQ(outputDrive(ctl), 500);
+}
+
+static void a_wrong_source_frame_stops_under_the_stop_policy() {
+    g_now = 0;
+    RoverController ctl(fakeMillis, 300, 50, INVALID_CMD_STOP);
+    sendControl(ctl, 500, 0, MODE_TELEOP, false);
+    CHECK(!sendFrame(ctl, 900, 0, MODE_TELEOP, false, false, false,
+                     INDICATOR_OFF, false, SRC_AUTONOMY));
+    CHECK_EQ(outputDrive(ctl), 0);
+}
+
+static void a_corrupt_frame_rides_out_under_either_policy() {
+    const uint8_t policies[] = {INVALID_CMD_RIDE_OUT, INVALID_CMD_STOP};
+    for (uint8_t policy : policies) {
+        g_now = 0;
+        RoverController ctl(fakeMillis, 300, 50, policy);
+        sendControl(ctl, 500, 0, MODE_TELEOP, false);
+        CHECK(!sendCorrupt(ctl, 500, MODE_TELEOP, false));
+        CHECK_EQ(ctl.lastVerdict(), VERDICT_REJECT_CORRUPT);
+        CHECK_EQ(outputDrive(ctl), 500);
+    }
+}
+
+// A7: the rule table. Each row is one rule and runs as its own test.
+struct RuleRow {
+    const char* name;           // printed in the test output
+    uint8_t     state;          // starting mode; TELEOP/AUTONOMOUS = already driving at 500
+    bool        estop;          // turn the E-stop on first?
+    Source      src;            // who sends the test command
+    uint8_t     frame_mode;     // mode the command asks for
+    int16_t     drive;          // drive value in the command
+    bool        stop;           // STOP bit set?
+    bool        abort;          // abort bit set?
+    bool        corrupt;        // damage the CRC?
+    uint8_t     expect_verdict; // the decision we expect
+    int16_t     expect_drive;   // what the motors get after; 500 = rejected, old command kept
+};
+
+static const RuleRow RULES[] = {
+    // name                                        state            estop  src           frame mode       drive  stop   abort  corrupt verdict                        drive
+    {"rule: SAFE + drive",                         MODE_SAFE,       false, SRC_TELEOP,   MODE_SAFE,       600,   false, false, false,  VERDICT_REJECT_MODE_CONFLICT,  0},
+    {"rule: SAFE + autonomy drive",                MODE_SAFE,       false, SRC_AUTONOMY, MODE_SAFE,       600,   false, false, false,  VERDICT_REJECT_MODE_CONFLICT,  0},
+    {"rule: SAFE + autonomy grants itself AUTO",   MODE_SAFE,       false, SRC_AUTONOMY, MODE_AUTONOMOUS, 600,   false, false, false,  VERDICT_REJECT_MODE_REFUSED,   0},
+    {"rule: SAFE + operator hands over AUTO",      MODE_SAFE,       false, SRC_TELEOP,   MODE_AUTONOMOUS, 0,     false, false, false,  VERDICT_ACCEPTED,              0},
+    {"rule: SAFE + operator drives in AUTO",       MODE_SAFE,       false, SRC_TELEOP,   MODE_AUTONOMOUS, 600,   false, false, false,  VERDICT_REJECT_WRONG_SOURCE,   0},
+    {"rule: TELEOP + teleop drive",                MODE_TELEOP,     false, SRC_TELEOP,   MODE_TELEOP,     600,   false, false, false,  VERDICT_ACCEPTED,              600},
+    {"rule: TELEOP + autonomy drive",              MODE_TELEOP,     false, SRC_AUTONOMY, MODE_TELEOP,     600,   false, false, false,  VERDICT_REJECT_WRONG_SOURCE,   500},
+    {"rule: TELEOP + autonomy takes AUTO",         MODE_TELEOP,     false, SRC_AUTONOMY, MODE_AUTONOMOUS, 600,   false, false, false,  VERDICT_REJECT_MODE_REFUSED,   500},
+    {"rule: AUTONOMOUS + autonomy drive",          MODE_AUTONOMOUS, false, SRC_AUTONOMY, MODE_AUTONOMOUS, 600,   false, false, false,  VERDICT_ACCEPTED,              600},
+    {"rule: AUTONOMOUS + teleop drive",            MODE_AUTONOMOUS, false, SRC_TELEOP,   MODE_AUTONOMOUS, 600,   false, false, false,  VERDICT_REJECT_WRONG_SOURCE,   500},
+    {"rule: AUTONOMOUS + operator takes TELEOP",   MODE_AUTONOMOUS, false, SRC_TELEOP,   MODE_TELEOP,     0,     false, false, false,  VERDICT_ACCEPTED,              0},
+    {"rule: TELEOP + STOP (operator)",             MODE_TELEOP,     false, SRC_TELEOP,   MODE_TELEOP,     600,   true,  false, false,  VERDICT_STOP,                  0},
+    {"rule: TELEOP + STOP (autonomy)",             MODE_TELEOP,     false, SRC_AUTONOMY, MODE_TELEOP,     600,   true,  false, false,  VERDICT_STOP,                  0},
+    {"rule: AUTONOMOUS + STOP (autonomy)",         MODE_AUTONOMOUS, false, SRC_AUTONOMY, MODE_AUTONOMOUS, 600,   true,  false, false,  VERDICT_STOP,                  0},
+    {"rule: AUTONOMOUS + STOP (operator)",         MODE_AUTONOMOUS, false, SRC_TELEOP,   MODE_AUTONOMOUS, 600,   true,  false, false,  VERDICT_STOP,                  0},
+    {"rule: AUTONOMOUS + abort (operator)",        MODE_AUTONOMOUS, false, SRC_TELEOP,   MODE_AUTONOMOUS, 600,   false, true,  false,  VERDICT_STOP,                  0},
+    {"rule: TELEOP + STOP, corrupt",               MODE_TELEOP,     false, SRC_TELEOP,   MODE_TELEOP,     0,     true,  false, true,   VERDICT_REJECT_CORRUPT,        500},
+    {"rule: TELEOP + STOP, out of range",          MODE_TELEOP,     false, SRC_TELEOP,   MODE_TELEOP,     5000,  true,  false, false,  VERDICT_REJECT_MALFORMED,      500},
+    {"rule: TELEOP + drive out of range",          MODE_TELEOP,     false, SRC_TELEOP,   MODE_TELEOP,     5000,  false, false, false,  VERDICT_REJECT_MALFORMED,      500},
+    {"rule: FAULT + drive",                        MODE_FAULT,      false, SRC_TELEOP,   MODE_TELEOP,     600,   false, false, false,  VERDICT_REJECT_MODE_REFUSED,   0},
+    {"rule: E-stop while driving + drive",         MODE_TELEOP,     true,  SRC_TELEOP,   MODE_TELEOP,     600,   false, false, false,  VERDICT_REJECT_MODE_REFUSED,   0},
+    {"rule: E-stop in SAFE + drive",               MODE_SAFE,       true,  SRC_TELEOP,   MODE_SAFE,       600,   false, false, false,  VERDICT_REJECT_MODE_CONFLICT,  0},
+    {"rule: E-stop in SAFE + enter TELEOP, drive", MODE_SAFE,       true,  SRC_TELEOP,   MODE_TELEOP,     600,   false, false, false,  VERDICT_ACCEPTED,              0},
+};
+
+static void setUpRuleState(RoverController& ctl, uint8_t state) {
+    sendFrame(ctl, 0, 0, MODE_SAFE, false);
+    if (state == MODE_TELEOP || state == MODE_AUTONOMOUS) {
+        grantMode(ctl, state);
+        sendFrame(ctl, 500, 0, state, false);
+    } else if (state == MODE_FAULT) {
+        grantMode(ctl, MODE_TELEOP);
+        sendFrame(ctl, 500, 0, MODE_TELEOP, false);
+        advance(DEFAULT_WATCHDOG_TIMEOUT_MS);
+    }
+}
+
+static void runRuleTable() {
+    for (const RuleRow& row : RULES) {
+        testing::beginTest(row.name);
+        RoverController ctl = freshController();
+        setUpRuleState(ctl, row.state);
+        if (row.estop) ctl.updateFaults(FAULT_ESTOP_ACTIVE, CTRL_HEALTH_OK);
+
+        if (row.corrupt) {
+            sendCorrupt(ctl, row.drive, row.frame_mode, row.stop, row.src);
+        } else {
+            sendFrame(ctl, row.drive, 0, row.frame_mode, row.stop, row.abort,
+                      false, INDICATOR_OFF, false, row.src);
+        }
+        CHECK_EQ(ctl.lastVerdict(), row.expect_verdict);
+        CHECK_EQ(outputDrive(ctl), row.expect_drive);
+        if (row.expect_drive != 0) CHECK(!ctl.effectiveStop());
+        testing::endTest();
+    }
+}
+
 int main() {
     std::printf("test_controller\n");
     RUN_TEST(boots_stopped_and_safe);
@@ -1405,7 +1839,7 @@ int main() {
     RUN_TEST(watchdog_trips_exactly_at_the_boundary);
     RUN_TEST(watchdog_is_correct_across_millis_wraparound);
     RUN_TEST(explicit_stop_flag_wins_in_any_mode);
-    RUN_TEST(stop_is_releasable_without_a_mode_change);
+    RUN_TEST(stop_latches_until_a_neutral_command);
     RUN_TEST(disabled_mode_forces_stop_at_full_throttle);
     RUN_TEST(undefined_mode_never_permits_motion);
     RUN_TEST(autonomy_abort_stops_an_autonomous_rover);
@@ -1459,8 +1893,8 @@ int main() {
     RUN_TEST(a_stop_from_the_wrong_source_still_stops_the_rover);
     RUN_TEST(an_abort_from_the_wrong_source_still_stops_the_rover);
     RUN_TEST(disabled_mode_has_no_owner_so_neither_source_mismatches);
-    RUN_TEST(a_stale_source_mismatch_is_not_reported);
-    RUN_TEST(an_unauthorised_frame_still_feeds_the_watchdog);
+    RUN_TEST(a_source_mismatch_is_held_then_expires);
+    RUN_TEST(an_unauthorised_frame_does_not_feed_the_watchdog);
     RUN_TEST(an_arrival_claim_from_the_wrong_source_is_ignored);
     RUN_TEST(a_return_request_is_reported_but_changes_no_behaviour);
     RUN_TEST(a_return_request_outside_autonomous_is_not_active);
@@ -1501,10 +1935,31 @@ int main() {
     RUN_TEST(stale_feedback_does_not_stop_the_rover);
     RUN_TEST(the_source_is_none_before_anybody_has_spoken);
     RUN_TEST(the_source_names_the_producer_that_is_driving);
-    RUN_TEST(a_refused_source_is_not_an_active_source);
+    RUN_TEST(a_refused_source_does_not_displace_the_active_source);
     RUN_TEST(safe_has_no_owner_so_it_has_no_source);
     RUN_TEST(a_stale_source_is_not_reported);
     RUN_TEST(the_feedback_frame_carries_what_the_accessors_say);
     RUN_TEST(the_feedback_frame_round_trips_on_the_wire);
+    RUN_TEST(the_arbiter_does_not_flap_between_two_producers);
+    RUN_TEST(motion_in_safe_is_a_mode_conflict);
+    RUN_TEST(an_invalid_command_does_not_replace_the_active_command);
+    RUN_TEST(a_refused_mode_change_does_not_feed_the_watchdog);
+    RUN_TEST(a_motion_command_in_safe_does_not_feed_the_watchdog);
+    RUN_TEST(a_stop_feeds_the_watchdog);
+    RUN_TEST(a_jetson_sending_only_refused_frames_is_alive_but_stale);
+    RUN_TEST(entering_safe_clears_the_refusal_reports);
+    RUN_TEST(stop_is_not_overridden_by_the_next_autonomy_command);
+    RUN_TEST(the_rover_boots_with_stop_latched);
+    RUN_TEST(an_abort_latches_like_a_stop_while_autonomous);
+    RUN_TEST(only_the_operator_can_release_stop);
+    RUN_TEST(a_handover_with_stop_set_keeps_autonomy_stopped);
+    RUN_TEST(a_stop_must_pass_gates_one_and_two);
+    RUN_TEST(stop_is_not_a_mode_change);
+    RUN_TEST(a_stop_frame_still_obeys_the_mode_rules);
+    RUN_TEST(an_invalid_command_while_moving_rides_out_to_the_timeout);
+    RUN_TEST(an_invalid_command_while_moving_stops_under_the_stop_policy);
+    RUN_TEST(a_wrong_source_frame_stops_under_the_stop_policy);
+    RUN_TEST(a_corrupt_frame_rides_out_under_either_policy);
+    runRuleTable();
     return testing::summary("test_controller");
 }

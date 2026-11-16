@@ -12,9 +12,19 @@ class RoverController {
 public:
     explicit RoverController(MillisFn now_ms,
                              uint32_t watchdog_timeout_ms = DEFAULT_WATCHDOG_TIMEOUT_MS,
-                             uint32_t telemetry_period_ms = DEFAULT_TELEMETRY_PERIOD_MS);
+                             uint32_t telemetry_period_ms = DEFAULT_TELEMETRY_PERIOD_MS,
+                             uint8_t invalid_command_policy = INVALID_COMMAND_POLICY);
 
+    // Checks one incoming command (gates 1-3, see VERDICT_* in rover_protocol.h).
+    // Returns true if it was accepted or was a STOP. Only those reset the timeout.
     bool ingestFrame(uint32_t can_id, const uint8_t* buf, uint8_t len);
+
+    // --- command arbiter (Task 6 A) ---
+    uint8_t  lastVerdict() const { return last_verdict_; }
+    bool     stopLatched() const { return stop_latched_; }
+    uint32_t framesRefused() const { return frames_refused_; }
+    uint8_t  invalidCommandPolicy() const { return invalid_command_policy_; }
+    bool     modeConflict() const;
 
     void updateFaults(uint16_t hardware_faults, uint8_t controller_health);
 
@@ -98,10 +108,30 @@ public:
     void updateMeasured(int16_t drive, int16_t steer);
 
 private:
-    uint32_t elapsedSinceControl() const;
-    bool recentlyDegraded() const;
+    // The only command the motors follow. Only the arbiter may change it;
+    // teleop and autonomy never write it directly.
+    struct ActiveCommand {
+        int16_t drive;
+        int16_t steer;
+        uint8_t mode;
+        bool    from_autonomy;
+        bool    valid;
+    };
 
-    void requestMode(const ControlMsg& msg);
+    uint32_t elapsedSinceAccepted() const;
+    bool recentlyDegraded() const;
+    bool rxFresh() const;
+    bool heldWithin(bool ever, uint32_t since_ms) const;
+
+    uint8_t arbitrate(const ControlMsg& msg) const;
+    bool modeChangeAllowed(const ControlMsg& msg) const;
+    void applyMode(uint8_t to);
+    void setActiveCommand(const ControlMsg& msg);
+    void clearActiveCommand();
+    void refuse(uint8_t verdict);
+    void applyInvalidCommandPolicy();
+    bool activeCommandValid() const;
+
     uint16_t faultCauses() const;
     bool hardwareFaultActive() const;
     bool faultConditionPresent() const;
@@ -110,6 +140,7 @@ private:
     MillisFn now_ms_;
     uint32_t watchdog_timeout_ms_;
     uint32_t telemetry_period_ms_;
+    uint8_t  invalid_command_policy_;
 
     uint8_t    mode_;
     uint16_t   latched_faults_;
@@ -118,7 +149,19 @@ private:
 
     ControlMsg last_control_;
     bool       have_control_;
-    uint32_t   last_control_ms_;
+    uint32_t   last_rx_ms_;
+    bool       have_accepted_;
+    uint32_t   last_accepted_ms_;
+
+    ActiveCommand active_;
+    bool       stop_latched_;
+    uint8_t    last_verdict_;
+    uint8_t    ack_verdict_;
+    bool       ever_wrong_source_;
+    uint32_t   last_wrong_source_ms_;
+    bool       ever_mode_conflict_;
+    uint32_t   last_mode_conflict_ms_;
+    uint32_t   frames_refused_;
     uint32_t   next_telemetry_ms_;
     uint8_t    telemetry_seq_;
 

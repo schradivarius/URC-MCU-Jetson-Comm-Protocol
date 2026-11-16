@@ -168,7 +168,9 @@ def build_mission():
     auto = dict(mode=rp.MODE_AUTONOMOUS, c2_lost=False, from_autonomy=True)
     teleop = dict(mode=rp.MODE_TELEOP, c2_lost=False, from_autonomy=False)
 
-    grant_auto = dict(drive_cmd=0, steer_cmd=0, stop=True,
+    # CHANGED: the operator hands AUTONOMOUS over at neutral, without STOP.
+    # Only the operator can release STOP, so a STOP here would trap autonomy.
+    grant_auto = dict(drive_cmd=0, steer_cmd=0,
                      mode=rp.MODE_AUTONOMOUS, c2_lost=False, from_autonomy=False)
     grant_teleop = dict(drive_cmd=0, steer_cmd=0, stop=True, **teleop)
 
@@ -192,7 +194,7 @@ def build_mission():
         Step("3. operator grants AUTONOMOUS",
              grant_auto,
              all_of(expect(mode=rp.MODE_AUTONOMOUS,
-                           cmd_status=rp.CMD_STATUS_STOPPED,
+                           cmd_status=rp.CMD_STATUS_APPLIED, drive_applied=0,
                            indicator_state=rp.INDICATOR_AUTONOMOUS),
                     fault_clear(rp.FAULT_CMD_SOURCE, "CMD_SOURCE"))),
 
@@ -245,7 +247,12 @@ def build_mission():
                     fault_set(rp.FAULT_CMD_SOURCE, "CMD_SOURCE"))),
         Step("12. operator grants AUTONOMOUS again",
              grant_auto,
-             expect(mode=rp.MODE_AUTONOMOUS, cmd_status=rp.CMD_STATUS_STOPPED)),
+             expect(mode=rp.MODE_AUTONOMOUS, cmd_status=rp.CMD_STATUS_APPLIED,
+                    drive_applied=0)),
+
+        Step("12b. autonomy takes over again",
+             dict(drive_cmd=0, steer_cmd=0, **auto),
+             expect(cmd_status=rp.CMD_STATUS_APPLIED, drive_applied=0)),
 
         Step("13. AUTONOMOUS accepts the same command",
              dict(drive_cmd=FAST, steer_cmd=0, **auto),
@@ -254,11 +261,13 @@ def build_mission():
                            drive_applied=FAST),
                     fault_clear(rp.FAULT_CMD_SOURCE, "CMD_SOURCE"))),
 
+        # The operator's command is rejected, so autonomy's FAST keeps
+        # running and the operator's CRUISE never reaches the motors.
         Step("14. AUTONOMOUS refuses a teleop command",
-             dict(drive_cmd=FAST, steer_cmd=0, mode=rp.MODE_AUTONOMOUS,
+             dict(drive_cmd=CRUISE, steer_cmd=0, mode=rp.MODE_AUTONOMOUS,
                   c2_lost=False, from_autonomy=False),
              all_of(expect(cmd_status=rp.CMD_STATUS_WRONG_SOURCE,
-                           drive_applied=0),
+                           drive_applied=FAST),
                     fault_set(rp.FAULT_CMD_SOURCE, "CMD_SOURCE"))),
 
         Step("15. an arrival claim needs authority too",
@@ -271,9 +280,18 @@ def build_mission():
              dict(drive_cmd=FAST, steer_cmd=TURN, stop=True, **auto),
              expect(cmd_status=rp.CMD_STATUS_STOPPED, drive_applied=0)),
 
+        Step("16b. the next motion command does not release STOP",
+             dict(drive_cmd=FAST, steer_cmd=TURN, **auto),
+             expect(cmd_status=rp.CMD_STATUS_STOPPED, drive_applied=0)),
+
         Step("17. abort overrides an authorised command",
              dict(drive_cmd=FAST, steer_cmd=TURN, autonomy_abort=True, **auto),
              expect(cmd_status=rp.CMD_STATUS_STOPPED, drive_applied=0)),
+
+        Step("17b. operator takes TELEOP at neutral",
+             dict(drive_cmd=0, steer_cmd=0, **teleop),
+             expect(mode=rp.MODE_TELEOP, cmd_status=rp.CMD_STATUS_APPLIED,
+                    drive_applied=0)),
 
         Step("18. teleop drives again afterwards",
              dict(drive_cmd=CRUISE, steer_cmd=0, **teleop),

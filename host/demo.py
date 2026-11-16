@@ -78,20 +78,28 @@ def main():
               drive_cmd=1000, steer_cmd=500, mode=rp.MODE_TELEOP, c2_lost=False,
               stop=True)
 
-        phase(jl, t0, 0.2, "D: operator grants AUTONOMOUS",
+        # CHANGED: the operator hands AUTONOMOUS over at neutral, without STOP.
+        # Only the operator can release STOP now, so autonomy couldn't.
+        phase(jl, t0, 0.2, "D: operator hands AUTONOMOUS over (neutral, no STOP)",
               drive_cmd=0, steer_cmd=0, mode=rp.MODE_AUTONOMOUS, c2_lost=False,
-              stop=True, from_autonomy=False)
-
-        phase(jl, t0, 0.5, "D: autonomy abort while AUTONOMOUS",
-              drive_cmd=800, steer_cmd=0, mode=rp.MODE_AUTONOMOUS, c2_lost=False,
-              autonomy_abort=True, indicator_request=rp.INDICATOR_AUTONOMOUS,
-              from_autonomy=True)
+              from_autonomy=False)
 
         phase(jl, t0, 0.5, "D2: C2 lost while AUTONOMOUS -- keeps driving, fault raised",
               drive_cmd=800, steer_cmd=0, mode=rp.MODE_AUTONOMOUS, c2_lost=True,
               indicator_request=rp.INDICATOR_AUTONOMOUS, from_autonomy=True)
 
-        phase(jl, t0, 0.3, "D3: operator takes back TELEOP",
+        # CHANGED: the abort now comes after D2. It latches, and only the
+        # operator can release it, so autonomy can't drive again afterwards.
+        phase(jl, t0, 0.5, "D: autonomy abort while AUTONOMOUS (latches)",
+              drive_cmd=800, steer_cmd=0, mode=rp.MODE_AUTONOMOUS, c2_lost=False,
+              autonomy_abort=True, indicator_request=rp.INDICATOR_AUTONOMOUS,
+              from_autonomy=True)
+
+        phase(jl, t0, 0.2, "D3: operator takes back TELEOP at neutral (releases STOP)",
+              drive_cmd=0, steer_cmd=0, mode=rp.MODE_TELEOP, c2_lost=False,
+              indicator_request=rp.INDICATOR_TELEOP)
+
+        phase(jl, t0, 0.3, "D3: operator drives",
               drive_cmd=800, steer_cmd=0, mode=rp.MODE_TELEOP, c2_lost=False,
               indicator_request=rp.INDICATOR_TELEOP)
 

@@ -52,6 +52,7 @@ enum : uint16_t {
     FAULT_CMD_SOURCE     = 0x0400,
     FAULT_STALE_FEEDBACK = 0x0800,
     FAULT_STEERING_FAULT = 0x1000,
+    FAULT_MODE_CONFLICT  = 0x2000,
 };
 static const uint16_t FAULT_CRITICAL_MASK = FAULT_OVER_CURRENT | FAULT_ESTOP_ACTIVE;
 enum : uint8_t {
@@ -75,6 +76,7 @@ enum : uint8_t {
     CMD_STATUS_NO_COMMAND   = 3,
     CMD_STATUS_MAX          = 7,
     CMD_STATUS_MODE_REFUSED = 4,
+    CMD_STATUS_MODE_CONFLICT = 5,
 };
 
 enum : uint16_t {
@@ -184,6 +186,29 @@ enum DecodeResult : uint8_t {
 };
 
 const char* decodeResultName(DecodeResult r);
+
+// The arbiter's decision about one incoming command (Task 6 A).
+// A command is checked in this order and stops at the first check it fails:
+//   gate 1  Intact?       Did it arrive undamaged? (length, CRC)
+//   gate 2  Well formed?  Are all its values allowed? (mode, drive/steer range)
+//   gate 3  Allowed?      May this sender ask for this, in this mode?
+// STOP only needs gates 1 and 2.
+// Gate 4 (is it safe to move right now?) is checked every loop instead.
+enum : uint8_t {
+    VERDICT_NONE                 = 0,
+    VERDICT_ACCEPTED             = 1,
+    VERDICT_STOP                 = 2,
+    VERDICT_REJECT_CORRUPT       = 3,
+    VERDICT_REJECT_MALFORMED     = 4,
+    VERDICT_REJECT_MODE_REFUSED  = 5,
+    VERDICT_REJECT_WRONG_SOURCE  = 6,
+    VERDICT_REJECT_MODE_CONFLICT = 7,
+    VERDICT_MAX                  = VERDICT_REJECT_MODE_CONFLICT,
+};
+
+const char* verdictName(uint8_t verdict);
+bool        verdictIsRejection(uint8_t verdict);
+uint8_t     verdictGate(uint8_t verdict);
 
 enum : uint8_t {
     CMD_ECHO_STATUS_MASK   = 0x07,

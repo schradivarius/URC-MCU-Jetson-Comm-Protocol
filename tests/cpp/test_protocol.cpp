@@ -399,7 +399,8 @@ static void fault_has_no_owner() {
 static void the_command_status_byte_packs_and_unpacks() {
     const uint8_t statuses[] = {CMD_STATUS_APPLIED, CMD_STATUS_STOPPED,
                                 CMD_STATUS_WRONG_SOURCE, CMD_STATUS_NO_COMMAND,
-                                CMD_STATUS_MODE_REFUSED};
+                                CMD_STATUS_MODE_REFUSED,
+                                CMD_STATUS_MODE_CONFLICT};
     const DecodeResult decodes[] = {DECODE_OK, DECODE_BAD_DLC, DECODE_BAD_CRC,
                                     DECODE_BAD_MODE, DECODE_BAD_FLAGS,
                                     DECODE_BAD_INDICATOR, DECODE_BAD_RANGE};
@@ -522,6 +523,28 @@ static void the_c2_fault_bit_is_named() {
     CHECK(std::strcmp(names[0], "C2_LINK_LOST") == 0);
 }
 
+static void every_verdict_is_named_and_gated() {
+    CHECK_STREQ(verdictName(VERDICT_ACCEPTED), "ACCEPTED");
+    CHECK_STREQ(verdictName(VERDICT_STOP), "STOP");
+    CHECK_STREQ(verdictName(VERDICT_REJECT_MODE_CONFLICT), "REJECT_MODE_CONFLICT");
+    CHECK_STREQ(verdictName(VERDICT_MAX + 1), "UNKNOWN");
+    for (uint8_t v = VERDICT_NONE; v <= VERDICT_MAX; ++v) {
+        CHECK(std::strcmp(verdictName(v), "UNKNOWN") != 0);
+        CHECK_EQ(verdictIsRejection(v), verdictGate(v) != 0);
+    }
+    CHECK_EQ(verdictGate(VERDICT_REJECT_CORRUPT), 1);
+    CHECK_EQ(verdictGate(VERDICT_REJECT_MALFORMED), 2);
+    CHECK_EQ(verdictGate(VERDICT_REJECT_WRONG_SOURCE), 3);
+    CHECK_EQ(verdictGate(VERDICT_STOP), 0);
+}
+
+static void the_mode_conflict_fault_is_named() {
+    const char* names[16];
+    CHECK_EQ(faultNames(FAULT_MODE_CONFLICT, names, 16), static_cast<size_t>(1));
+    CHECK_STREQ(names[0], "MODE_CONFLICT");
+    CHECK_STREQ(cmdStatusName(CMD_STATUS_MODE_CONFLICT), "MODE_CONFLICT");
+}
+
 int main() {
     std::printf("test_protocol\n");
     RUN_TEST(crc8_known_answer_vector);
@@ -567,5 +590,7 @@ int main() {
     RUN_TEST(cmd_age_sentinel_is_distinct_from_saturation);
     RUN_TEST(fault_names_includes_the_new_wide_bits);
     RUN_TEST(the_c2_fault_bit_is_named);
+    RUN_TEST(every_verdict_is_named_and_gated);
+    RUN_TEST(the_mode_conflict_fault_is_named);
     return testing::summary("test_protocol");
 }

@@ -346,11 +346,13 @@ def build_mission():
              expect(mode=rp.MODE_TELEOP,
                     indicator_state=rp.INDICATOR_TELEOP)),
 
+        # CHANGED: handover at neutral, without STOP (only the operator can
+        # release STOP, so a STOP here would keep autonomy stopped).
         Step("1c. operator grants AUTONOMOUS",
-             dict(drive_cmd=0, steer_cmd=0, stop=True, mode=rp.MODE_AUTONOMOUS,
+             dict(drive_cmd=0, steer_cmd=0, mode=rp.MODE_AUTONOMOUS,
                   c2_lost=False, from_autonomy=False),
              all_of(expect(mode=rp.MODE_AUTONOMOUS,
-                           cmd_status=rp.CMD_STATUS_STOPPED,
+                           cmd_status=rp.CMD_STATUS_APPLIED, drive_applied=0,
                            indicator_state=rp.INDICATOR_AUTONOMOUS),
                     fault_clear(rp.FAULT_CMD_SOURCE, "CMD_SOURCE"))),
 
