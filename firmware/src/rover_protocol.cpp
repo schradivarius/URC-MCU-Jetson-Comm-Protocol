@@ -165,12 +165,14 @@ size_t faultNames(uint16_t bitmask, const char** out, size_t cap) {
         FAULT_ENCODER_FAULT, FAULT_UNDERVOLTAGE, FAULT_FIRMWARE_FAULT,
         FAULT_PROTOCOL_ERROR, FAULT_C2_LINK_LOST, FAULT_SEQ_GAP, FAULT_CRC_ERROR,
         FAULT_CMD_SOURCE, FAULT_STALE_FEEDBACK, FAULT_STEERING_FAULT,
+        FAULT_MODE_CONFLICT,
     };
     static const char* names[] = {
         "COMM_TIMEOUT", "OVER_CURRENT", "ESTOP_ACTIVE",
         "ENCODER_FAULT", "UNDERVOLTAGE", "FIRMWARE_FAULT",
         "PROTOCOL_ERROR", "C2_LINK_LOST", "SEQ_GAP", "CRC_ERROR",
         "CMD_SOURCE", "STALE_FEEDBACK", "STEERING_FAULT",
+        "MODE_CONFLICT",
     };
     size_t n = 0;
     for (size_t i = 0; i < sizeof(bits) / sizeof(bits[0]) && n < cap; ++i) {
@@ -190,6 +192,35 @@ const char* decodeResultName(DecodeResult r) {
         case DECODE_BAD_RANGE:     return "BAD_RANGE";
     }
     return "UNKNOWN";
+}
+
+const char* verdictName(uint8_t verdict) {
+    switch (verdict) {
+        case VERDICT_NONE:                 return "NONE";
+        case VERDICT_ACCEPTED:             return "ACCEPTED";
+        case VERDICT_STOP:                 return "STOP";
+        case VERDICT_REJECT_CORRUPT:       return "REJECT_CORRUPT";
+        case VERDICT_REJECT_MALFORMED:     return "REJECT_MALFORMED";
+        case VERDICT_REJECT_MODE_REFUSED:  return "REJECT_MODE_REFUSED";
+        case VERDICT_REJECT_WRONG_SOURCE:  return "REJECT_WRONG_SOURCE";
+        case VERDICT_REJECT_MODE_CONFLICT: return "REJECT_MODE_CONFLICT";
+    }
+    return "UNKNOWN";
+}
+
+bool verdictIsRejection(uint8_t verdict) {
+    return verdict >= VERDICT_REJECT_CORRUPT && verdict <= VERDICT_MAX;
+}
+
+uint8_t verdictGate(uint8_t verdict) {
+    switch (verdict) {
+        case VERDICT_REJECT_CORRUPT:       return 1;
+        case VERDICT_REJECT_MALFORMED:     return 2;
+        case VERDICT_REJECT_MODE_REFUSED:
+        case VERDICT_REJECT_WRONG_SOURCE:
+        case VERDICT_REJECT_MODE_CONFLICT: return 3;
+    }
+    return 0;
 }
 
 uint8_t encodeControl(const ControlMsg& msg, uint8_t* buf) {
@@ -319,6 +350,7 @@ const char* cmdStatusName(uint8_t status) {
         case CMD_STATUS_WRONG_SOURCE: return "WRONG_SOURCE";
         case CMD_STATUS_NO_COMMAND:   return "NO_COMMAND";
         case CMD_STATUS_MODE_REFUSED: return "MODE_REFUSED";
+        case CMD_STATUS_MODE_CONFLICT: return "MODE_CONFLICT";
     }
     return "UNKNOWN";
 }

@@ -247,6 +247,10 @@ def build_mission():
              grant_auto,
              expect(mode=rp.MODE_AUTONOMOUS, cmd_status=rp.CMD_STATUS_STOPPED)),
 
+        Step("12b. autonomy re-arms at neutral",
+             dict(drive_cmd=0, steer_cmd=0, **auto),
+             expect(cmd_status=rp.CMD_STATUS_APPLIED, drive_applied=0)),
+
         Step("13. AUTONOMOUS accepts the same command",
              dict(drive_cmd=FAST, steer_cmd=0, **auto),
              all_of(expect(mode=rp.MODE_AUTONOMOUS,
@@ -254,11 +258,13 @@ def build_mission():
                            drive_applied=FAST),
                     fault_clear(rp.FAULT_CMD_SOURCE, "CMD_SOURCE"))),
 
+        # The operator's command is rejected, so autonomy's FAST keeps
+        # running and the operator's CRUISE never reaches the motors.
         Step("14. AUTONOMOUS refuses a teleop command",
-             dict(drive_cmd=FAST, steer_cmd=0, mode=rp.MODE_AUTONOMOUS,
+             dict(drive_cmd=CRUISE, steer_cmd=0, mode=rp.MODE_AUTONOMOUS,
                   c2_lost=False, from_autonomy=False),
              all_of(expect(cmd_status=rp.CMD_STATUS_WRONG_SOURCE,
-                           drive_applied=0),
+                           drive_applied=FAST),
                     fault_set(rp.FAULT_CMD_SOURCE, "CMD_SOURCE"))),
 
         Step("15. an arrival claim needs authority too",
@@ -271,9 +277,18 @@ def build_mission():
              dict(drive_cmd=FAST, steer_cmd=TURN, stop=True, **auto),
              expect(cmd_status=rp.CMD_STATUS_STOPPED, drive_applied=0)),
 
+        Step("16b. the next motion command does not release STOP",
+             dict(drive_cmd=FAST, steer_cmd=TURN, **auto),
+             expect(cmd_status=rp.CMD_STATUS_STOPPED, drive_applied=0)),
+
         Step("17. abort overrides an authorised command",
              dict(drive_cmd=FAST, steer_cmd=TURN, autonomy_abort=True, **auto),
              expect(cmd_status=rp.CMD_STATUS_STOPPED, drive_applied=0)),
+
+        Step("17b. operator takes TELEOP at neutral",
+             dict(drive_cmd=0, steer_cmd=0, **teleop),
+             expect(mode=rp.MODE_TELEOP, cmd_status=rp.CMD_STATUS_APPLIED,
+                    drive_applied=0)),
 
         Step("18. teleop drives again afterwards",
              dict(drive_cmd=CRUISE, steer_cmd=0, **teleop),

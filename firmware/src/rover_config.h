@@ -4,7 +4,7 @@
 #include <stdint.h>
 
 namespace rover {
-static const uint8_t PROTOCOL_VERSION = 8;
+static const uint8_t PROTOCOL_VERSION = 9;
 
 static const uint32_t SERIAL_BAUD_HZ = 115200;
 
@@ -13,6 +13,21 @@ static const uint32_t DEFAULT_TELEMETRY_PERIOD_MS = 50;
 static const uint32_t HW_WATCHDOG_MS              = 1000;
 
 static const uint32_t LINK_DEGRADED_HOLD_MS = 1000;
+
+// How long a "rejected command" fault stays on after the last bad command,
+// so the base station has time to see it.
+static const uint32_t REJECT_REPORT_HOLD_MS = 1000;
+
+// What to do when a bad command arrives while the rover is moving.
+// WAITING ON SYSTEMS (Task 6 A6).
+//   RIDE_OUT  ignore it; keep the last good command until the timeout (300 ms)
+//   STOP      ignore it and stop right away
+// Damaged frames (bad CRC) are always just ignored.
+enum : uint8_t {
+    INVALID_CMD_RIDE_OUT = 0,
+    INVALID_CMD_STOP     = 1,
+};
+static const uint8_t INVALID_COMMAND_POLICY = INVALID_CMD_RIDE_OUT;
 
 enum : uint32_t {
     CAN_ID_CONTROL        = 0x100,

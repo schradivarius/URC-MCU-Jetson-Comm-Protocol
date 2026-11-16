@@ -67,7 +67,8 @@ int main() {
 
     const uint8_t statuses[] = {CMD_STATUS_APPLIED, CMD_STATUS_STOPPED,
                                 CMD_STATUS_WRONG_SOURCE, CMD_STATUS_NO_COMMAND,
-                                CMD_STATUS_MODE_REFUSED};
+                                CMD_STATUS_MODE_REFUSED,
+                                CMD_STATUS_MODE_CONFLICT};
     const DecodeResult decodes[] = {DECODE_OK, DECODE_BAD_DLC, DECODE_BAD_CRC,
                                     DECODE_BAD_MODE, DECODE_BAD_FLAGS,
                                     DECODE_BAD_INDICATOR, DECODE_BAD_RANGE};

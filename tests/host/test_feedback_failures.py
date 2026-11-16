@@ -26,6 +26,7 @@ class InjectionFixture(unittest.TestCase):
         try:
             jl = JetsonLink(link)
             self._pump(jl, 0.2, drive_cmd=0, steer_cmd=0, stop=True)
+            self._pump(jl, 0.06, drive_cmd=0, steer_cmd=0)
             self._pump(jl, run_s, drive_cmd=DRIVE, steer_cmd=STEER)
             snap = jl.snapshot
             self.assertIsNotNone(snap, "never received a complete snapshot")

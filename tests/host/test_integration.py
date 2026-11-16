@@ -37,8 +37,13 @@ class RoverFixture(unittest.TestCase):
         self.send_frames(seconds, send=send, **kw)
 
     def grant(self, mode, c2_lost=False):
+        # Switch modes like the Jetson does: the operator sends the mode with
+        # STOP on, then the new owner sends one neutral command to turn STOP off.
         self.send_frames(0.15, drive_cmd=0, steer_cmd=0, mode=mode, stop=True,
                          c2_lost=c2_lost, from_autonomy=False)
+        self.send_frames(0.06, drive_cmd=0, steer_cmd=0, mode=mode,
+                         c2_lost=c2_lost,
+                         from_autonomy=mode == rp.MODE_AUTONOMOUS)
 
     def mode(self):
         if self.jl.snapshot is None:
@@ -53,6 +58,16 @@ class RoverFixture(unittest.TestCase):
             self.jl.poll()
             time.sleep(0.02)
         self.jl.poll()
+
+    # A short burst of wrong-sender commands: long enough to get a reply,
+    # short enough (under 300 ms) that the last good command hasn't timed out.
+    ROGUE_BURST_S = 0.12
+
+    def rogue(self, **kw):
+        kw.setdefault("drive_cmd", 600)
+        kw.setdefault("steer_cmd", 0)
+        kw.setdefault("c2_lost", False)
+        self.send_frames(self.ROGUE_BURST_S, **kw)
 
     def send_raw(self, frame, seconds):
         end = time.monotonic() + seconds
@@ -123,9 +138,10 @@ class TestSnapshotAssembly(RoverFixture):
     def test_the_active_command_source_is_read_back(self):
         self.drive(0.6, mode=rp.MODE_TELEOP, from_autonomy=False)
         self.assertEqual(self.snap()["cmd_source"], rp.CMD_SOURCE_OPERATOR)
-        self.drive(0.6, mode=rp.MODE_TELEOP, from_autonomy=True)
-        self.assertEqual(self.snap()["cmd_source"], rp.CMD_SOURCE_NONE)
+        self.rogue(mode=rp.MODE_TELEOP, from_autonomy=True)
         self.assertEqual(self.snap()["cmd_status"], rp.CMD_STATUS_WRONG_SOURCE)
+        self.assertEqual(self.snap()["cmd_source"], rp.CMD_SOURCE_OPERATOR,
+                         "a refused producer displaced the one in charge")
 
 
 class TestEndToEnd(RoverFixture):
@@ -161,11 +177,12 @@ class TestEndToEnd(RoverFixture):
         s = self.snap()
         self.assertEqual(s["mode"], rp.MODE_FAULT)
         self.assertEqual(s["cmd_status"], rp.CMD_STATUS_MODE_REFUSED)
+        self.assertIn("MODE_CONFLICT", self.faults())
         self.assertEqual(s["jetson_link"], rp.LINK_OK)
         self.assertIn("COMM_TIMEOUT", self.faults())
         self.assertEqual(s["enc_left"], frozen, "drove out of a latched fault")
 
-        self.drive(0.4, mode=rp.MODE_SAFE)
+        self.drive(0.4, mode=rp.MODE_SAFE, drive_cmd=0, steer_cmd=0)
         self.assertEqual(self.snap()["mode"], rp.MODE_SAFE)
         self.assertEqual(self.faults(), [])
         self.drive(0.6)
@@ -181,6 +198,11 @@ class TestEndToEnd(RoverFixture):
         self.assertEqual(self.snap()["enc_left"], halted,
                          "moved while stop was asserted")
         self.assertLess(halted - running, 500, "coasted far too long")
+
+        self.drive(0.4)
+        self.assertEqual(self.snap()["enc_left"], halted,
+                         "a motion command released the STOP latch")
+        self.drive(0.1, drive_cmd=0, steer_cmd=0)
         self.drive(0.5)
         self.assertGreater(self.snap()["enc_left"], halted)
 
@@ -189,6 +211,9 @@ class TestEndToEnd(RoverFixture):
         self.assertEqual(self.snap()["enc_left"], 0)
         self.assertEqual(self.snap()["current_ca"], 0)
         self.assertEqual(self.snap()["mode"], rp.MODE_SAFE)
+        # A2: driving in SAFE is rejected.
+        self.assertEqual(self.snap()["cmd_status"], rp.CMD_STATUS_MODE_CONFLICT)
+        self.assertIn("MODE_CONFLICT", self.faults())
 
 
 class TestNewCommandFields(RoverFixture):
@@ -225,13 +250,15 @@ class TestNewCommandFields(RoverFixture):
                    indicator_request=rp.INDICATOR_ARRIVED)
         self.assertEqual(self.snap()["indicator_state"], rp.INDICATOR_ARRIVED)
 
-        self.drive(0.4, mode=rp.MODE_SAFE,
+        self.drive(0.4, mode=rp.MODE_SAFE, drive_cmd=0, steer_cmd=0,
                    indicator_request=rp.INDICATOR_AUTONOMOUS)
         self.assertEqual(self.snap()["indicator_state"], rp.INDICATOR_OFF)
 
     def test_mode_is_echoed_back(self):
         for mode in (rp.MODE_TELEOP, rp.MODE_AUTONOMOUS, rp.MODE_SAFE):
-            self.drive(0.4, mode=mode)
+            motion = mode in rp.MOTION_MODES
+            self.drive(0.4, mode=mode, drive_cmd=400 if motion else 0,
+                       steer_cmd=100 if motion else 0)
             self.assertEqual(self.snap()["mode"], mode)
 
 
@@ -335,8 +362,8 @@ class TestBusHygiene(RoverFixture):
 
 class TestCommandAuthority(RoverFixture):
     def test_an_autonomy_command_is_not_acted_on_while_teleoperated(self):
-        self.drive(0.6, drive_cmd=600, steer_cmd=0, mode=rp.MODE_TELEOP,
-                   from_autonomy=True)
+        self.drive(0.3, drive_cmd=0, steer_cmd=0, mode=rp.MODE_TELEOP)
+        self.rogue(mode=rp.MODE_TELEOP, from_autonomy=True)
         s = self.snap()
         self.assertEqual(s["enc_left"], 0, "an unauthorised command drove the rover")
         self.assertEqual(s["drive_applied"], 0)
@@ -346,10 +373,11 @@ class TestCommandAuthority(RoverFixture):
         self.assertEqual(s["jetson_link"], rp.LINK_OK)
 
     def test_the_same_command_drives_once_the_mode_matches(self):
-        self.drive(0.6, drive_cmd=600, steer_cmd=0, mode=rp.MODE_TELEOP,
-                   from_autonomy=True)
+        self.drive(0.3, drive_cmd=0, steer_cmd=0, mode=rp.MODE_TELEOP)
+        self.rogue(mode=rp.MODE_TELEOP, from_autonomy=True)
         refused = self.snap()["enc_left"]
         self.assertEqual(refused, 0)
+        self.assertEqual(self.snap()["cmd_status"], rp.CMD_STATUS_WRONG_SOURCE)
 
         self.drive(0.6, drive_cmd=600, steer_cmd=0, mode=rp.MODE_AUTONOMOUS,
                    from_autonomy=True)
@@ -357,11 +385,10 @@ class TestCommandAuthority(RoverFixture):
         self.assertGreater(s["enc_left"], 0, "the authorised command did not drive")
         self.assertEqual(s["drive_applied"], 600)
         self.assertEqual(s["cmd_status"], rp.CMD_STATUS_APPLIED)
-        self.assertNotIn("CMD_SOURCE", self.faults())
 
     def test_a_teleop_command_is_not_acted_on_while_autonomous(self):
-        self.drive(0.6, drive_cmd=600, steer_cmd=0, mode=rp.MODE_AUTONOMOUS,
-                   from_autonomy=False)
+        self.drive(0.3, drive_cmd=0, steer_cmd=0, mode=rp.MODE_AUTONOMOUS)
+        self.rogue(mode=rp.MODE_AUTONOMOUS, from_autonomy=False)
         self.assertEqual(self.snap()["enc_left"], 0)
         self.assertEqual(self.snap()["cmd_status"], rp.CMD_STATUS_WRONG_SOURCE)
 
@@ -387,25 +414,38 @@ class TestCommandAuthority(RoverFixture):
         self.assertEqual(self.snap()["cmd_status"], rp.CMD_STATUS_STOPPED)
 
     def test_the_refusal_does_not_latch(self):
-        self.drive(0.5, drive_cmd=600, mode=rp.MODE_TELEOP, from_autonomy=True)
+        self.drive(0.3, drive_cmd=0, steer_cmd=0, mode=rp.MODE_TELEOP)
+        self.rogue(mode=rp.MODE_TELEOP, from_autonomy=True)
         self.assertIn("CMD_SOURCE", self.faults())
-        self.drive(0.5, drive_cmd=600, mode=rp.MODE_TELEOP, from_autonomy=False)
+        self.drive(1.2, drive_cmd=600, mode=rp.MODE_TELEOP, from_autonomy=False)
         self.assertNotIn("CMD_SOURCE", self.faults())
         self.assertEqual(self.snap()["cmd_status"], rp.CMD_STATUS_APPLIED)
         self.assertGreater(self.snap()["enc_left"], 0)
 
     def test_an_unauthorised_arrival_claim_does_not_light_the_indicator(self):
-        self.drive(0.5, drive_cmd=0, mode=rp.MODE_AUTONOMOUS,
-                   from_autonomy=False, indicator_request=rp.INDICATOR_ARRIVED)
+        self.drive(0.3, drive_cmd=0, steer_cmd=0, mode=rp.MODE_AUTONOMOUS)
+        self.rogue(drive_cmd=0, mode=rp.MODE_AUTONOMOUS, from_autonomy=False,
+                   indicator_request=rp.INDICATOR_ARRIVED)
         self.assertEqual(self.snap()["indicator_state"], rp.INDICATOR_AUTONOMOUS)
         self.drive(0.5, drive_cmd=0, mode=rp.MODE_AUTONOMOUS,
                    from_autonomy=True, indicator_request=rp.INDICATOR_ARRIVED)
         self.assertEqual(self.snap()["indicator_state"], rp.INDICATOR_ARRIVED)
 
-    def test_a_stale_source_mismatch_is_not_reported(self):
-        self.drive(0.5, drive_cmd=600, mode=rp.MODE_TELEOP, from_autonomy=True)
-        self.assertIn("CMD_SOURCE", self.faults())
-        self.drive(0.7, send=False)
+    def test_only_wrong_source_frames_time_out_and_say_why(self):
+        # A3: wrong-sender commands don't keep the rover alive.
+        self.drive(0.3, drive_cmd=0, steer_cmd=0, mode=rp.MODE_TELEOP)
+        self.send_frames(0.7, drive_cmd=600, steer_cmd=0, mode=rp.MODE_TELEOP,
+                         c2_lost=False, from_autonomy=True)
+        s = self.snap()
+        self.assertEqual(s["mode"], rp.MODE_FAULT)
+        self.assertEqual(s["enc_left"], 0)
+        self.assertIn("COMM_TIMEOUT", self.faults())
+        self.assertIn("CMD_SOURCE", self.faults(),
+                      "the timeout hid its real cause")
+        self.assertEqual(s["jetson_link"], rp.LINK_OK,
+                         "a talking Jetson was reported lost")
+
+        self.drive(1.2, send=False)
         self.assertIn("COMM_TIMEOUT", self.faults())
         self.assertNotIn("CMD_SOURCE", self.faults())
 

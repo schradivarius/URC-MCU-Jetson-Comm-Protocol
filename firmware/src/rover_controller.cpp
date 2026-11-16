@@ -4,16 +4,28 @@
 namespace rover {
 RoverController::RoverController(MillisFn now_ms,
                                  uint32_t watchdog_timeout_ms,
-                                 uint32_t telemetry_period_ms)
+                                 uint32_t telemetry_period_ms,
+                                 uint8_t invalid_command_policy)
     : now_ms_(now_ms),
       watchdog_timeout_ms_(watchdog_timeout_ms),
       telemetry_period_ms_(telemetry_period_ms),
+      invalid_command_policy_(invalid_command_policy),
       mode_(MODE_SAFE),
       latched_faults_(0),
       hw_faults_(0),
       hw_health_(CTRL_HEALTH_NOT_REPORTED),
       have_control_(false),
-      last_control_ms_(0),
+      last_rx_ms_(0),
+      have_accepted_(false),
+      last_accepted_ms_(0),
+      stop_latched_(true),
+      last_verdict_(VERDICT_NONE),
+      ack_verdict_(VERDICT_NONE),
+      ever_wrong_source_(false),
+      last_wrong_source_ms_(0),
+      ever_mode_conflict_(false),
+      last_mode_conflict_ms_(0),
+      frames_refused_(0),
       next_telemetry_ms_(now_ms ? now_ms() : 0),
       telemetry_seq_(0),
       have_seq_(false),
@@ -47,6 +59,7 @@ RoverController::RoverController(MillisFn now_ms,
     last_control_.c2_lost           = true;
     last_control_.from_autonomy     = false;
     last_control_.seq               = 0;
+    clearActiveCommand();
 }
 
 bool RoverController::ingestFrame(uint32_t can_id, const uint8_t* buf, uint8_t len) {
@@ -58,6 +71,7 @@ bool RoverController::ingestFrame(uint32_t can_id, const uint8_t* buf, uint8_t l
     latchIfFaulted();
     last_decode_ = r;
 
+    // Gates 1 and 2: did it arrive undamaged, and are all its values allowed?
     if (r != DECODE_OK) {
         frames_ignored_++;
         if (r == DECODE_BAD_CRC) {
@@ -68,6 +82,9 @@ bool RoverController::ingestFrame(uint32_t can_id, const uint8_t* buf, uint8_t l
         } else {
             protocol_error_ = true;
         }
+        const bool corrupt = (r == DECODE_BAD_CRC || r == DECODE_BAD_DLC);
+        last_verdict_ = corrupt ? VERDICT_REJECT_CORRUPT : VERDICT_REJECT_MALFORMED;
+        if (!corrupt) applyInvalidCommandPolicy();
         return false;
     }
 
@@ -86,15 +103,116 @@ bool RoverController::ingestFrame(uint32_t can_id, const uint8_t* buf, uint8_t l
     last_seq_ = msg.seq;
     have_seq_ = true;
 
-    protocol_error_  = false;
-    crc_error_       = false;
-    last_control_    = msg;
-    have_control_    = true;
-    last_control_ms_ = now_ms_();
+    protocol_error_ = false;
+    crc_error_      = false;
+    last_control_   = msg;
+    have_control_   = true;
+    last_rx_ms_     = now_ms_();
+
+    // Gate 3: is this sender allowed to ask for this?
+    const uint8_t verdict = arbitrate(msg);
+    last_verdict_ = verdict;
+    ack_verdict_  = verdict;
+    if (verdictIsRejection(verdict)) {
+        refuse(verdict);
+        latchIfFaulted();
+        return false;
+    }
+
+    // STOP never changes the mode. A mode change in the same frame must
+    // still be allowed on its own.
+    if (modeChangeAllowed(msg)) applyMode(msg.mode);
+
+    if (verdict == VERDICT_STOP) {
+        stop_latched_ = true;
+        clearActiveCommand();
+    } else {
+        setActiveCommand(msg);
+        // Only a neutral command (drive 0, steer 0) turns STOP off,
+        // so the rover can never restart by surprise.
+        if (msg.drive_cmd == 0 && msg.steer_cmd == 0) stop_latched_ = false;
+    }
+
+    have_accepted_    = true;
+    last_accepted_ms_ = now_ms_();
     control_frames_accepted_++;
-    requestMode(msg);
     latchIfFaulted();
     return true;
+}
+
+uint8_t RoverController::arbitrate(const ControlMsg& msg) const {
+    // STOP beats every mode and every sender.
+    // In AUTONOMOUS, an abort counts as a STOP.
+    if (msg.stop) return VERDICT_STOP;
+    if (msg.autonomy_abort && mode_ == MODE_AUTONOMOUS) return VERDICT_STOP;
+
+    if (!modeChangeAllowed(msg)) return VERDICT_REJECT_MODE_REFUSED;
+
+    const bool motion = msg.drive_cmd != 0 || msg.steer_cmd != 0;
+    if (!modePermitsMotion(msg.mode)) {
+        return motion ? VERDICT_REJECT_MODE_CONFLICT : VERDICT_ACCEPTED;
+    }
+    if (sourceOwnsMode(msg.from_autonomy, msg.mode)) return VERDICT_ACCEPTED;
+
+    // A sender may switch the rover into a mode it doesn't own (the operator
+    // handing over to AUTONOMOUS), but may not drive in that mode.
+    if (msg.mode != mode_ && !motion) return VERDICT_ACCEPTED;
+    return VERDICT_REJECT_WRONG_SOURCE;
+}
+
+void RoverController::setActiveCommand(const ControlMsg& msg) {
+    if (!sourceOwnsMode(msg.from_autonomy, mode_)) {
+        clearActiveCommand();
+        return;
+    }
+    active_.drive         = msg.drive_cmd;
+    active_.steer         = msg.steer_cmd;
+    active_.mode          = mode_;
+    active_.from_autonomy = msg.from_autonomy;
+    active_.valid         = true;
+}
+
+void RoverController::clearActiveCommand() {
+    active_.drive         = 0;
+    active_.steer         = 0;
+    active_.mode          = MODE_SAFE;
+    active_.from_autonomy = false;
+    active_.valid         = false;
+}
+
+void RoverController::refuse(uint8_t verdict) {
+    frames_refused_++;
+    const uint32_t now = now_ms_();
+    if (verdict == VERDICT_REJECT_WRONG_SOURCE) {
+        ever_wrong_source_    = true;
+        last_wrong_source_ms_ = now;
+    } else {
+        ever_mode_conflict_    = true;
+        last_mode_conflict_ms_ = now;
+    }
+    applyInvalidCommandPolicy();
+}
+
+void RoverController::applyInvalidCommandPolicy() {
+    if (invalid_command_policy_ != INVALID_CMD_STOP) return;
+    stop_latched_ = true;
+    clearActiveCommand();
+}
+
+bool RoverController::activeCommandValid() const {
+    if (!active_.valid) return false;
+    if (active_.mode != activeMode()) return false;
+    return sourceOwnsMode(active_.from_autonomy, active_.mode);
+}
+
+bool RoverController::heldWithin(bool ever, uint32_t since_ms) const {
+    if (!ever) return false;
+    return (now_ms_() - since_ms) < REJECT_REPORT_HOLD_MS;
+}
+
+bool RoverController::rxFresh() const {
+    if (!have_control_) return false;
+    return (now_ms_() - last_rx_ms_) < watchdog_timeout_ms_;
 }
 
 void RoverController:: updateFaults(uint16_t hardware_faults, uint8_t controller_health) {
@@ -103,14 +221,24 @@ void RoverController:: updateFaults(uint16_t hardware_faults, uint8_t controller
     latchIfFaulted();
 }
 
-void RoverController::requestMode(const ControlMsg& msg){
+bool RoverController::modeChangeAllowed(const ControlMsg& msg) const {
     const uint8_t to = msg.mode;
-    if(to == mode_) return;
-    if(!transitionAllowed(mode_, to, msg.from_autonomy)) return;
-    if(mode_ == MODE_FAULT && hardwareFaultActive()) return;
-    if(to ==MODE_TELEOP && msg.c2_lost) return;
+    if (to == mode_) return true;
+    if (!transitionAllowed(mode_, to, msg.from_autonomy)) return false;
+    if (mode_ == MODE_FAULT && hardwareFaultActive()) return false;
+    if (to == MODE_TELEOP && msg.c2_lost) return false;
+    return true;
+}
+
+void RoverController::applyMode(uint8_t to) {
+    if (to == mode_) return;
     mode_ = to;
-    if(to == MODE_SAFE) latched_faults_ = 0;
+    if (to == MODE_SAFE) {
+        // Going to SAFE is the reset button: clear all stored faults.
+        latched_faults_     = 0;
+        ever_wrong_source_  = false;
+        ever_mode_conflict_ = false;
+    }
 }
 
 uint16_t RoverController::faultCauses()const{
@@ -135,18 +263,18 @@ void RoverController::latchIfFaulted(){
     mode_ = MODE_FAULT;
 }
 
-uint32_t RoverController::elapsedSinceControl() const {
-    return now_ms_() - last_control_ms_;
+uint32_t RoverController::elapsedSinceAccepted() const {
+    return now_ms_() - last_accepted_ms_;
 }
 
 uint16_t RoverController::cmdAgeMs() const {
-    if (!have_control_) return CMD_AGE_UNKNOWN;
-    return clampCmdAgeMs(static_cast<int64_t>(elapsedSinceControl()));
+    if (!have_accepted_) return CMD_AGE_UNKNOWN;
+    return clampCmdAgeMs(static_cast<int64_t>(elapsedSinceAccepted()));
 }
 
 bool RoverController::watchdogTripped() const {
-    if (!have_control_) return true;
-    return elapsedSinceControl() >= watchdog_timeout_ms_;
+    if (!have_accepted_) return true;
+    return elapsedSinceAccepted() >= watchdog_timeout_ms_;
 }
 
 uint8_t RoverController::activeMode() const {
@@ -154,15 +282,17 @@ uint8_t RoverController::activeMode() const {
     return mode_;
 }
 
-bool RoverController::modeRefused() const{
-    if(!have_control_ || watchdogTripped()) return false;
-    return last_control_.mode != activeMode();
+bool RoverController::modeRefused() const {
+    return rxFresh() && ack_verdict_ == VERDICT_REJECT_MODE_REFUSED;
 }
 
+bool RoverController::modeConflict() const {
+    return heldWithin(ever_mode_conflict_, last_mode_conflict_ms_);
+}
+
+// Gate 4, checked every loop: is the rover allowed to move at all right now?
 bool RoverController::effectiveStop() const {
-    return last_control_.stop
-        || !modePermitsMotion(activeMode())
-        || (last_control_.autonomy_abort && activeMode() == MODE_AUTONOMOUS);
+    return stop_latched_ || !modePermitsMotion(activeMode());
 }
 
 bool RoverController::commandAuthorized() const {
@@ -172,16 +302,20 @@ bool RoverController::commandAuthorized() const {
 }
 
 bool RoverController::sourceMismatch() const {
-    if (!modePermitsMotion(activeMode())) return false;
-    if(modeRefused() || last_control_.stop) return false;
-    return !commandAuthorized();
+    return heldWithin(ever_wrong_source_, last_wrong_source_ms_);
 }
 
 uint8_t RoverController::commandStatus() const {
-    if (!have_control_)       return CMD_STATUS_NO_COMMAND;
-    if(modeRefused())         return CMD_STATUS_MODE_REFUSED;
-    if (effectiveStop())      return CMD_STATUS_STOPPED;
-    if (!commandAuthorized()) return CMD_STATUS_WRONG_SOURCE;
+    if (!have_control_) return CMD_STATUS_NO_COMMAND;
+    if (rxFresh()) {
+        switch (ack_verdict_) {
+            case VERDICT_REJECT_MODE_REFUSED:  return CMD_STATUS_MODE_REFUSED;
+            case VERDICT_REJECT_MODE_CONFLICT: return CMD_STATUS_MODE_CONFLICT;
+            case VERDICT_REJECT_WRONG_SOURCE:  return CMD_STATUS_WRONG_SOURCE;
+        }
+    }
+    if (effectiveStop())       return CMD_STATUS_STOPPED;
+    if (!activeCommandValid()) return CMD_STATUS_NO_COMMAND;
     return CMD_STATUS_APPLIED;
 }
 
@@ -191,9 +325,9 @@ bool RoverController::returnRequestActive() const {
 }
 
 void RoverController::commandedOutputs(int16_t& drive, int16_t& steer) const {
-    if (effectiveStop() || !commandAuthorized()) { drive = 0; steer = 0; return; }
-    drive = last_control_.drive_cmd;
-    steer = last_control_.steer_cmd;
+    if (effectiveStop() || !activeCommandValid()) { drive = 0; steer = 0; return; }
+    drive = active_.drive;
+    steer = active_.steer;
 }
 
 bool RoverController::telemetryDue() {
@@ -215,8 +349,10 @@ bool RoverController::recentlyDegraded() const {
     return (now_ms_() - last_degraded_ms_) < LINK_DEGRADED_HOLD_MS;
 }
 
+// Is the Jetson still talking? Separate from the command timeout: a Jetson
+// sending only rejected commands is alive, but has no valid command.
 uint8_t RoverController::jetsonLinkState() const {
-    if (watchdogTripped()) return LINK_LOST;
+    if (!rxFresh()) return LINK_LOST;
     if (recentlyDegraded()) return LINK_DEGRADED;
     return LINK_OK;
 }
@@ -239,6 +375,7 @@ uint16_t RoverController::faultWord(uint16_t sensor_faults, uint16_t extra_fault
     if (seq_gap_)          faults |= FAULT_SEQ_GAP;
     if (c2LinkState() == LINK_LOST) faults |= FAULT_C2_LINK_LOST;
     if (sourceMismatch()) faults |= FAULT_CMD_SOURCE;
+    if (modeConflict())   faults |= FAULT_MODE_CONFLICT;
     return faults;
 }
 
@@ -360,10 +497,9 @@ bool RoverController::steerInvalid() const {
 }
 
 uint8_t RoverController::commandSource() const {
-    if (!have_control_ || watchdogTripped())      return CMD_SOURCE_NONE;
-    if (!modePermitsMotion(activeMode()))          return CMD_SOURCE_NONE;
-    if (!commandAuthorized())                      return CMD_SOURCE_NONE;
-    return last_control_.from_autonomy ? CMD_SOURCE_AUTONOMY : CMD_SOURCE_OPERATOR;
+    if (watchdogTripped() || effectiveStop()) return CMD_SOURCE_NONE;
+    if (!activeCommandValid())                return CMD_SOURCE_NONE;
+    return active_.from_autonomy ? CMD_SOURCE_AUTONOMY : CMD_SOURCE_OPERATOR;
 }
 
 TelemetryFeedback RoverController::buildFeedback() const {

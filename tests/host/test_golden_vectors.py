@@ -342,6 +342,12 @@ class TestPythonValidation(unittest.TestCase):
         self.assertEqual(p.FAULT_CMD_SOURCE, 0x0400)
         self.assertEqual(p.fault_names(0x0400), ["CMD_SOURCE"])
 
+    def test_the_mode_conflict_fault_bit_is_named(self):
+        self.assertEqual(p.FAULT_MODE_CONFLICT, 0x2000)
+        self.assertEqual(p.fault_names(0x2000), ["MODE_CONFLICT"])
+        self.assertEqual(p.CMD_STATUS_NAMES[p.CMD_STATUS_MODE_CONFLICT],
+                         "MODE_CONFLICT")
+
     def test_the_c2_fault_bit_is_named(self):
         self.assertEqual(p.FAULT_C2_LINK_LOST, 0x0080)
         self.assertEqual(p.fault_names(0x0080), ["C2_LINK_LOST"])

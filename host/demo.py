@@ -87,6 +87,10 @@ def main():
               autonomy_abort=True, indicator_request=rp.INDICATOR_AUTONOMOUS,
               from_autonomy=True)
 
+        phase(jl, t0, 0.2, "D: autonomy re-arms at neutral (STOP and abort latch)",
+              drive_cmd=0, steer_cmd=0, mode=rp.MODE_AUTONOMOUS, c2_lost=False,
+              indicator_request=rp.INDICATOR_AUTONOMOUS, from_autonomy=True)
+
         phase(jl, t0, 0.5, "D2: C2 lost while AUTONOMOUS -- keeps driving, fault raised",
               drive_cmd=800, steer_cmd=0, mode=rp.MODE_AUTONOMOUS, c2_lost=True,
               indicator_request=rp.INDICATOR_AUTONOMOUS, from_autonomy=True)
