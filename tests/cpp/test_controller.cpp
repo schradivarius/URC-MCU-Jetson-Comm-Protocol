@@ -1398,8 +1398,164 @@ static void the_feedback_frame_round_trips_on_the_wire() {
     CHECK_EQ(got.flags, sent.flags);
 }
 
+static void an_estop_forces_a_stop_at_full_throttle() {
+    RoverController ctl = freshController(1000);
+    sendControl(ctl, 800, 300, MODE_TELEOP, false);
+    CHECK(!ctl.effectiveStop());
+
+    ctl.updateEstop(true);
+    CHECK(ctl.effectiveStop());
+    int16_t drive = -1, steer = -1;
+    ctl.commandedOutputs(drive, steer);
+    CHECK_EQ(drive, static_cast<int16_t>(0));
+    CHECK_EQ(steer, static_cast<int16_t>(0));
+}
+
+static void an_estop_shows_its_own_mode_and_fault_bit() {
+    RoverController ctl = freshController(1000);
+    sendControl(ctl, 400, 0, MODE_TELEOP, false);
+    ctl.updateEstop(true);
+
+    CHECK_EQ(ctl.activeMode(), MODE_ESTOP);
+    CHECK_EQ(ctl.buildState().mode, MODE_ESTOP);
+    CHECK(ctl.estopActive());
+    CHECK((ctl.faultWord() & FAULT_ESTOP_ACTIVE) != 0);
+    CHECK_EQ(ctl.buildPower(0, 2400).fault_status & FAULT_ESTOP_ACTIVE,
+             static_cast<uint16_t>(FAULT_ESTOP_ACTIVE));
+}
+
+static void an_estopped_rover_never_shows_the_autonomous_indicator() {
+    RoverController ctl = freshController(1000);
+    sendControl(ctl, 400, 0, MODE_AUTONOMOUS, false, false, false,
+                INDICATOR_AUTONOMOUS);
+    CHECK_EQ(ctl.indicatorState(), INDICATOR_AUTONOMOUS);
+
+    ctl.updateEstop(true);
+    CHECK_EQ(ctl.indicatorState(), INDICATOR_FAULT);
+}
+
+static void commands_are_refused_while_the_estop_is_held() {
+    RoverController ctl = freshController(1000);
+    ctl.updateEstop(true);
+    for (int i = 0; i < 5; ++i) {
+        advance(10);
+        sendControl(ctl, 1000, 1000, MODE_TELEOP, false);
+        int16_t drive = -1, steer = -1;
+        ctl.commandedOutputs(drive, steer);
+        CHECK_EQ(drive, static_cast<int16_t>(0));
+        CHECK_EQ(steer, static_cast<int16_t>(0));
+        CHECK_EQ(ctl.activeMode(), MODE_ESTOP);
+    }
+    CHECK_EQ(ctl.commandSource(), CMD_SOURCE_NONE);
+}
+
+static void releasing_the_estop_does_not_resume_motion() {
+    RoverController ctl = freshController(1000);
+    sendControl(ctl, 600, 0, MODE_TELEOP, false);
+    ctl.updateEstop(true);
+    ctl.updateEstop(false);
+
+    CHECK(!ctl.estopActive());
+    CHECK(ctl.estopLatched());
+    CHECK_EQ(ctl.activeMode(), MODE_ESTOP);
+    CHECK(ctl.effectiveStop());
+
+    advance(10);
+    sendControl(ctl, 600, 0, MODE_TELEOP, false);
+    int16_t drive = -1, steer = -1;
+    ctl.commandedOutputs(drive, steer);
+    CHECK_EQ(drive, static_cast<int16_t>(0));
+    CHECK(ctl.estopLatched());
+}
+
+static void a_safe_command_while_still_held_does_not_clear_the_latch() {
+    RoverController ctl = freshController(1000);
+    ctl.updateEstop(true);
+
+    advance(10);
+    sendControl(ctl, 0, 0, MODE_SAFE, true);
+    CHECK(ctl.estopLatched());
+    CHECK_EQ(ctl.activeMode(), MODE_ESTOP);
+
+    ctl.updateEstop(false);
+    CHECK(ctl.estopLatched());
+    CHECK_EQ(ctl.activeMode(), MODE_ESTOP);
+}
+
+static void autonomy_cannot_clear_the_estop_latch() {
+    RoverController ctl = freshController(1000);
+    ctl.updateEstop(true);
+    ctl.updateEstop(false);
+
+    advance(10);
+    sendFrame(ctl, 0, 0, MODE_SAFE, true, false, false, INDICATOR_OFF,
+              false, SRC_AUTONOMY);
+    CHECK(ctl.estopLatched());
+    CHECK_EQ(ctl.activeMode(), MODE_ESTOP);
+}
+
+static void an_operator_safe_command_clears_the_latch_and_restores_motion() {
+    RoverController ctl = freshController(1000);
+    sendControl(ctl, 600, 0, MODE_TELEOP, false);
+    ctl.updateEstop(true);
+    ctl.updateEstop(false);
+
+    advance(10);
+    sendFrame(ctl, 0, 0, MODE_SAFE, true, false, false, INDICATOR_OFF,
+              false, SRC_TELEOP);
+    CHECK(!ctl.estopLatched());
+    CHECK_EQ(ctl.activeMode(), MODE_SAFE);
+    CHECK((ctl.faultWord() & FAULT_ESTOP_ACTIVE) == 0);
+
+    advance(10);
+    sendControl(ctl, 450, 0, MODE_TELEOP, false);
+    int16_t drive = -1, steer = -1;
+    ctl.commandedOutputs(drive, steer);
+    CHECK_EQ(ctl.activeMode(), MODE_TELEOP);
+    CHECK_EQ(drive, static_cast<int16_t>(450));
+}
+
+static void a_second_estop_after_recovery_latches_again() {
+    RoverController ctl = freshController(1000);
+    ctl.updateEstop(true);
+    ctl.updateEstop(false);
+    advance(10);
+    sendFrame(ctl, 0, 0, MODE_SAFE, true, false, false, INDICATOR_OFF,
+              false, SRC_TELEOP);
+    CHECK(!ctl.estopLatched());
+
+    ctl.updateEstop(true);
+    CHECK_EQ(ctl.activeMode(), MODE_ESTOP);
+    ctl.updateEstop(false);
+    CHECK(ctl.estopLatched());
+    CHECK_EQ(ctl.activeMode(), MODE_ESTOP);
+}
+
+static void a_rover_that_boots_estopped_stays_stopped() {
+    RoverController ctl = freshController(1000);
+    ctl.updateEstop(true);
+    CHECK_EQ(ctl.activeMode(), MODE_ESTOP);
+    CHECK(ctl.effectiveStop());
+
+    advance(10);
+    sendControl(ctl, 1000, 0, MODE_AUTONOMOUS, false);
+    int16_t drive = -1, steer = -1;
+    ctl.commandedOutputs(drive, steer);
+    CHECK_EQ(drive, static_cast<int16_t>(0));
+}
+
 int main() {
     std::printf("test_controller\n");
+    RUN_TEST(an_estop_forces_a_stop_at_full_throttle);
+    RUN_TEST(an_estop_shows_its_own_mode_and_fault_bit);
+    RUN_TEST(an_estopped_rover_never_shows_the_autonomous_indicator);
+    RUN_TEST(commands_are_refused_while_the_estop_is_held);
+    RUN_TEST(releasing_the_estop_does_not_resume_motion);
+    RUN_TEST(a_safe_command_while_still_held_does_not_clear_the_latch);
+    RUN_TEST(autonomy_cannot_clear_the_estop_latch);
+    RUN_TEST(an_operator_safe_command_clears_the_latch_and_restores_motion);
+    RUN_TEST(a_second_estop_after_recovery_latches_again);
+    RUN_TEST(a_rover_that_boots_estopped_stays_stopped);
     RUN_TEST(boots_stopped_and_safe);
     RUN_TEST(valid_control_releases_the_stop);
     RUN_TEST(watchdog_trips_exactly_at_the_boundary);
