@@ -10,6 +10,7 @@
 #include "src/rover_feedback_faults.h"
 #include "src/rover_protocol.h"
 #include "src/rover_serial.h"
+#include "src/rover_estop.h"
 
 using namespace rover;
 
@@ -18,10 +19,12 @@ static const int LED_PIN = 13;
 static const int PIN_DRIVE_L = 2;
 static const int PIN_DRIVE_R = 3;
 static const int PIN_STEER   = 4;
+static const int PIN_ESTOP   = 5;
 
 static const int PWM_FREQUENCY_HZ = 50;
 static const int PWM_RESOLUTION_BITS = 12;
 static const bool SIMULATE_SENSORS = true;
+static const bool ESTOP_ACTIVE_LOW = true;
 
 static SerialFrameReader link_reader;
 WDT_T4<WDT1> wdt;
@@ -29,6 +32,7 @@ WDT_T4<WDT1> wdt;
 static RoverController* ctl = nullptr;
 static DriveModule drive_stage;
 static uint16_t g_boot_faults = 0;
+static EstopInput estop_input;
 
 static DriveSim sim_plant;
 static SimulatedEncoder sim_enc_l, sim_enc_r;
@@ -113,6 +117,11 @@ static void setMotorOutputs(const DriveOutputs& out) {
     analogWrite(PIN_STEER,   pulseToDuty(out.steer_pwm_us));
 }
 
+static bool estopRawActive() {
+    const int level = digitalRead(PIN_ESTOP);
+    return ESTOP_ACTIVE_LOW ? (level == LOW) : (level == HIGH);
+}
+
 static uint16_t detectBootFault() {
     const uint32_t srsr = SRC_SRSR;
     SRC_SRSR = srsr;
@@ -175,12 +184,15 @@ void setup() {
         analogWrite(pin, pulseToDuty(PWM_NEUTRAL_US));
     }
 
+    pinMode(PIN_ESTOP, ESTOP_ACTIVE_LOW ? INPUT_PULLUP : INPUT);
     Serial.begin(SERIAL_BAUD_HZ);
     g_boot_faults = detectBootFault();
 
     static RoverController controller(millis, DEFAULT_WATCHDOG_TIMEOUT_MS,
                                       DEFAULT_TELEMETRY_PERIOD_MS);
     ctl = &controller;
+    estop_input.update(estopRawActive(), millis());
+    ctl->updateEstop(estop_input.active());
 
     WDT_timings_t wdt_config;
     wdt_config.trigger = (HW_WATCHDOG_MS / 1000.0) / 2.0;
@@ -192,6 +204,8 @@ void loop() {
     wdt.feed();
 
     linkPoll();
+    estop_input.update(estopRawActive(), millis());
+    ctl->updateEstop(estop_input.active());
 
     int16_t drive, steer;
     ctl->commandedOutputs(drive, steer);
