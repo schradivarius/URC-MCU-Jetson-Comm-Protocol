@@ -12,6 +12,8 @@ RoverController::RoverController(MillisFn now_ms,
       latched_faults_(0),
       hw_faults_(0),
       hw_health_(CTRL_HEALTH_NOT_REPORTED),
+      estop_active_(false),
+      estop_latched_(false),
       have_control_(false),
       last_control_ms_(0),
       next_telemetry_ms_(now_ms ? now_ms() : 0),
@@ -103,7 +105,16 @@ void RoverController:: updateFaults(uint16_t hardware_faults, uint8_t controller
     latchIfFaulted();
 }
 
+void RoverController::updateEstop(bool active) {
+    estop_active_ = active;
+    if(active)
+        estop_latched_ = true;
+}
+
 void RoverController::requestMode(const ControlMsg& msg){
+    if (msg.mode == MODE_SAFE && !msg.from_autonomy && !estop_active_) {
+        estop_latched_ = false;
+    }
     const uint8_t to = msg.mode;
     if(to == mode_) return;
     if(!transitionAllowed(mode_, to, msg.from_autonomy)) return;
@@ -150,7 +161,10 @@ bool RoverController::watchdogTripped() const {
 }
 
 uint8_t RoverController::activeMode() const {
-    if(faultConditionPresent()) return MODE_FAULT;
+    if (estop_active_ || estop_latched_)
+        return MODE_ESTOP;
+    if(faultConditionPresent()) 
+        return MODE_FAULT;
     return mode_;
 }
 
@@ -160,9 +174,9 @@ bool RoverController::modeRefused() const{
 }
 
 bool RoverController::effectiveStop() const {
-    return last_control_.stop
-        || !modePermitsMotion(activeMode())
-        || (last_control_.autonomy_abort && activeMode() == MODE_AUTONOMOUS);
+    return estop_active_ || estop_latched_ || last_control_.stop || 
+        !modePermitsMotion(activeMode()) || (last_control_.autonomy_abort 
+        && activeMode() == MODE_AUTONOMOUS);
 }
 
 bool RoverController::commandAuthorized() const {
@@ -230,6 +244,7 @@ uint8_t RoverController::c2LinkState() const {
 uint16_t RoverController::faultWord(uint16_t sensor_faults, uint16_t extra_faults) const {
     uint16_t faults = static_cast<uint16_t>(sensor_faults | extra_faults);
     if (watchdogTripped()) faults |= FAULT_COMM_TIMEOUT;
+    if (estop_active_ || estop_latched_) faults |= FAULT_ESTOP_ACTIVE;
     faults |= latched_faults_;
     if (encoderStale() || steerStale()) faults |= FAULT_STALE_FEEDBACK;
     if (encoderInvalid())               faults |= FAULT_ENCODER_FAULT;
@@ -244,6 +259,8 @@ uint16_t RoverController::faultWord(uint16_t sensor_faults, uint16_t extra_fault
 
 uint8_t RoverController::indicatorState() const {
     const uint8_t mode = activeMode();
+    if (mode == MODE_ESTOP) return INDICATOR_FAULT;
+
     if (mode == MODE_FAULT) return INDICATOR_FAULT;
 
     if (mode == MODE_SAFE) return INDICATOR_OFF;

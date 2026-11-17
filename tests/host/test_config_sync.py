@@ -31,6 +31,7 @@ SHARED = {
     "MODE_TELEOP":           "MODE_TELEOP",
     "MODE_AUTONOMOUS":       "MODE_AUTONOMOUS",
     "MODE_FAULT":            "MODE_FAULT",
+    "MODE_ESTOP":            "MODE_ESTOP",
     "CMD_MIN":               "CMD_MIN",
     "CMD_MAX":               "CMD_MAX",
     "PWM_NEUTRAL_US":        "PWM_NEUTRAL_US",
@@ -92,6 +93,18 @@ class TestConfigSync(unittest.TestCase):
 
     def test_mode_max_is_the_highest_commandable_mode(self):
         self.assertEqual(cfg.MODE_MAX, max(rp.COMMANDABLE_MODES))
+
+    def test_estop_is_not_a_commandable_mode(self):
+        self.assertNotIn(cfg.MODE_ESTOP, rp.COMMANDABLE_MODES)
+        self.assertNotIn(cfg.MODE_ESTOP, rp.MOTION_MODES)
+        self.assertGreater(cfg.MODE_ESTOP, cfg.MODE_MAX)
+
+    def test_every_mode_has_a_name(self):
+        for mode in (cfg.MODE_SAFE, cfg.MODE_TELEOP, cfg.MODE_AUTONOMOUS,
+                     cfg.MODE_FAULT, cfg.MODE_ESTOP):
+            self.assertIn(mode, rp.MODE_NAMES)
+        self.assertEqual(len(set(rp.MODE_NAMES.values())),
+                         len(rp.MODE_NAMES))
 
     def test_link_timeout_is_longer_than_a_telemetry_period(self):
         self.assertGreater(cfg.LINK_TIMEOUT_S * 1000, cfg.TELEMETRY_PERIOD_MS)

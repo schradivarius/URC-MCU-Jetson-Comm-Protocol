@@ -1,4 +1,4 @@
-# Rover Onboard Computer ↔ Embedded Controller Protocol (v0.8)
+# Rover Onboard Computer ↔ Embedded Controller Protocol (v0.9)
 
 **Scope:** Onboard computer (Jetson Orin Nano, candidate) ↔ embedded controller
 (**Teensy 4.1**, NXP i.MX RT1062, C++ / Teensyduino), over **USB serial (UART)**.
@@ -110,6 +110,30 @@
 > (`0x0800`) and `FAULT_STEERING_FAULT` (`0x1000`) join the fault word, and
 > `FAULT_ENCODER_FAULT` (`0x0008`), defined since v0.3 and never once set by
 > anything, finally has a producer. `PROTOCOL_VERSION` is 8.
+>
+> **v0.9 — the rover knows when it has been E-stopped.** Task 6 Group C. The
+> fault bit `ESTOP_ACTIVE` has existed since v0.3 and nothing ever set it; v0.9
+> gives it a producer, and with it a fifth mode, `ESTOP` (4).
+>
+> The physical E-stop the rules mandate (2.a.v) cuts battery power and owes
+> nothing to this firmware — that has not changed and must not. What is new is
+> that **where the hardware offers a sense signal, the controller reads it**,
+> and two things follow:
+>
+> * **Everything stops, and the operator is told which kind of stop it is.**
+>   `ESTOP` is its own mode rather than another way into `FAULT`, because "a
+>   human hit the button" and "the link died" call for different responses from
+>   whoever is standing next to the rover.
+> * **Releasing the button does not resume motion.** The assertion latches, and
+>   only an operator-sourced `SAFE` command clears it (§5.5). A rover that
+>   springs back to life when the button pops out is the specific hazard Group C
+>   names, and it is a real one wherever logic power outlives actuator power.
+>
+> `ESTOP` is **not commandable**: `MODE_MAX` still stops at `AUTONOMOUS`, so a
+> frame asking for mode 4 is rejected like any undefined mode. Only hardware
+> asserts it. The wire layout is untouched — `TELEM_STATE.mode` has always been
+> a whole byte with 252 values spare — so v0.9 adds no frame and changes no
+> field width. `PROTOCOL_VERSION` is 9.
 >
 > Full field tables with types, units, ranges, meanings and update rates are in
 > section 3.
@@ -293,13 +317,13 @@ would only add a staleness question nobody needs to ask.
 
 #### 3.1.1 `mode` validation
 
-`mode` is a uint8 carrying 256 possible values where four are defined and
+`mode` is a uint8 carrying 256 possible values where five are defined and
 three may be commanded. Two separate questions follow, and conflating them was
 a real bug:
 
 | Question | Answer |
 |---|---|
-| May the Jetson *send* this value? (`isCommandableMode`) | `0`, `1`, `2`. **`SAFE` is valid** — a legitimate command meaning "do not move". `3=FAULT` is not: only the controller enters it. |
+| May the Jetson *send* this value? (`isCommandableMode`) | `0`, `1`, `2`. **`SAFE` is valid** — a legitimate command meaning "do not move". `3=FAULT` is not: only the controller enters it. Nor is `4=ESTOP` (v0.9): only hardware asserts it (§5.5). |
 | May the rover *move*? (`modePermitsMotion`) | `TELEOP` or `AUTONOMOUS` only — a **whitelist**. |
 
 **Requested mode vs. active mode.** `SAFE` means stopped *on purpose*.
@@ -310,6 +334,7 @@ actually running:
 
 | Situation | Active mode |
 |---|---|
+| The E-stop sense line is asserted, or its assertion is still latched (v0.9) | `ESTOP`, **latched** |
 | Boot, before any operator grant | `SAFE` |
 | In `TELEOP` or `AUTONOMOUS`, and no valid `CONTROL` for 300 ms (`COMM_TIMEOUT`) | `FAULT`, **latched** |
 | In `TELEOP`, and a frame reports `c2_lost = 1` | `FAULT`, **latched** |
@@ -645,7 +670,7 @@ left. Bits `0x0001`–`0x0040` keep their v0.3 values.
 |---|---|---|
 | `0x0001` | `COMM_TIMEOUT` | No valid CONTROL frame within the watchdog. In `TELEOP` or `AUTONOMOUS` it also latches `FAULT`, and the bit then stays set until `SAFE` (v0.7) |
 | `0x0002` | `OVER_CURRENT` | Current exceeded a threshold. **Critical** since v0.7: faults a moving rover, and blocks leaving `FAULT` while present |
-| `0x0004` | `ESTOP_ACTIVE` | A **soft** e-stop is engaged. Deliberately *not* the rules-mandated E-stop — see below. **Critical** since v0.7, like `OVER_CURRENT` |
+| `0x0004` | `ESTOP_ACTIVE` | The E-stop sense line is asserted, or its assertion is still latched. **Produced since v0.9** — defined in v0.3 and set by nothing until then (§5.5). Deliberately *not* the rules-mandated E-stop itself — see below |
 | `0x0008` | `ENCODER_FAULT` | Encoder reading invalid or stalled. **Produced since v0.8** — defined in v0.3 and set by nothing until then (§3.7) |
 | `0x0010` | `UNDERVOLTAGE` | Supply voltage below threshold |
 | `0x0020` | `FIRMWARE_FAULT` | This boot followed a watchdog reset (5.2) |
@@ -879,6 +904,7 @@ controller overrides it. Checked top to bottom, first match wins
 
 | # | Condition | Shown | Request |
 |---|---|---|---|
+| 0 | Active mode `ESTOP` (v0.9): the sense line is asserted or still latched (§5.5) | `FAULT` | ignored |
 | 1 | Active mode `FAULT`: a comm timeout, C2 loss or a critical fault in a motion mode, or a `FAULT` still latched from one (§3.1.1) | `FAULT` | ignored |
 | 2 | Mode `SAFE`, including at boot and with a silent Jetson | `OFF` | ignored |
 | 3 | Mode `TELEOP` | `TELEOP` | ignored — a human-driven rover never shows red or green |
@@ -1144,9 +1170,10 @@ resulting stop is diagnosable rather than silent.
 
 ### 5.1 The fail-safe rule
 
-Five triggers — **comm timeout**, **explicit `stop`**, **any mode that does not
-positively permit motion**, **`autonomy_abort` while `AUTONOMOUS`**, and
-**`c2_lost` while `TELEOP`** — all force a stop through a single function,
+Six triggers — **comm timeout**, **explicit `stop`**, **any mode that does not
+positively permit motion**, **`autonomy_abort` while `AUTONOMOUS`**,
+**`c2_lost` while `TELEOP`**, and since v0.9 **an asserted or latched E-stop**
+(§5.5) — all force a stop through a single function,
 `RoverController::effectiveStop()`. (Since v0.7 a critical hardware fault reaches
 it through the same "mode does not permit motion" trigger, by way of `FAULT`;
 see below.) There is exactly one place in the codebase
@@ -1194,6 +1221,93 @@ authorised command arrives, with `FAULT_CMD_SOURCE` and
 hazard, and treating it as a stop would need a timer and more state for no
 behavioural gain. It would also make a mux bug look like a safety event, which
 is the fault-diagnosis mistake this protocol has already fixed once.
+
+### 5.5 E-stop, safe startup and safe reset (v0.9)
+
+Task 6 Group C asks for four things that are easy to conflate, so this section
+separates them.
+
+**Software safe stop is not the E-stop.** A safe stop is the firmware
+deliberately commanding zero: `effectiveStop()` is true, `commandedOutputs()`
+hands the drive stage zeros, and `DriveModule` refuses to energize, putting all
+three channels at `PWM_NEUTRAL_US` (§5.4). The rules-mandated E-stop (2.a.v) is
+a red button that opens the battery path. It stops the rover whether or not any
+code runs, and nothing here may be relied on in its place.
+
+**What the firmware can know.** If — and only if — the power architecture runs
+a sense signal to an MCU pin, `firmware/src/rover_estop.*` reads it.
+`PIN_ESTOP` and `ESTOP_ACTIVE_LOW` in `rover_firmware.cpp` are placeholders in
+the same sense as `PIN_DRIVE_L`: the pin number comes from Systems. Active-low
+with `INPUT_PULLUP` is the intended polarity, so a cut or unconnected sense
+wire reads as *asserted* — the fail-safe direction. Note the consequence on a
+bench rover with nothing wired to that pin: it will sit in `ESTOP` until the
+pin is grounded or the polarity flag is flipped.
+
+`EstopInput` debounces over `ESTOP_DEBOUNCE_MS` (15 ms): a change is believed
+only after the signal has held it continuously, and any flicker restarts the
+window, so contact bounce cannot manufacture a press *or* a release. The first
+reading after boot is taken as truth with no debounce, which is what lets a
+rover powered up with the button already down come out of `setup()` already in
+`ESTOP`. The debounce is affordable here precisely because the firmware is
+reporting rather than stopping; were it ever in the stopping path, the right
+shape would be to assert instantly and debounce only the release.
+
+The module takes a bool and a timestamp and touches no Arduino API, so
+`tests/cpp/test_estop.cpp` exercises it natively, rollover included.
+
+**Recovery is deliberate, never automatic.** The required sequence, and what
+the code does:
+
+| Stage | Active mode | Outputs |
+|---|---|---|
+| Sense line asserted | `ESTOP` | zero, drive stage de-energized |
+| Button physically released | `ESTOP` — still, because the assertion latched | zero |
+| Operator-sourced `SAFE` command accepted | `SAFE` | zero, latch cleared |
+| Operator grants a motion mode, then commands motion | `TELEOP` / `AUTONOMOUS` | commanded |
+
+Three refusals are worth stating, each with a test behind it. A `SAFE` command
+**while the button is still down** does not clear the latch, so a reset cannot
+be pre-armed to spring free on release. An **autonomy-sourced** `SAFE` does not
+clear it either: a robot may not un-E-stop itself. And while latched, any motion
+command is refused and reported, rather than silently queued.
+
+The clearing rule deliberately reuses the `FAULT` recovery shape (§3.1.7) —
+an operator asking for `SAFE` is the one gesture that means "I have looked at
+this". **The final procedure should match the Systems team's outline**; if they
+want a dedicated reset command or a physical key instead, the change is the
+first three lines of `requestMode()`.
+
+**Safe startup.** `RoverController`'s constructor, not a later assignment, sets
+`mode_ = SAFE`, `stop = true`, `c2_lost = true`, the indicator `OFF`, the fault
+word empty and `have_control_ = false` — so the command watchdog reads as
+tripped from the first loop and no command is honoured until a real frame
+arrives. `setup()` writes `PWM_NEUTRAL_US` to all three channels before
+anything else, reads the E-stop pin before arming the watchdog, and
+`detectBootFault()` raises `FIRMWARE_FAULT` if the last reset was the watchdog
+(§5.2). **Nothing in this firmware writes to EEPROM or flash**, so "no previous
+command is retained across a boot" is structural rather than merely intended.
+The controller cannot boot into motion.
+
+**Safe reset.** Pressing the Teensy's reset button mid-motion is the startup
+case plus the link: `setup()` runs again, the SLIP reader resynchronises on the
+next frame boundary (§2.3), the watchdog is tripped until a valid frame
+arrives, and the first frame must be both valid and authorised before
+`commandedOutputs()` returns anything but zero. Group C asks for this to be
+verified on hardware, which no host test can do. The bench procedure:
+
+1. Drive pins disconnected from the drive stage, a scope or logic analyser on
+   `PIN_DRIVE_L`/`R`/`STEER`. Confirm 1500 µs neutral on all three.
+2. Grant `TELEOP` and command motion; confirm the pulse widths move off
+   neutral and telemetry reports `TELEOP`.
+3. Press reset while motion is commanded. Confirm the pulses return to 1500 µs
+   and **stay** there, that telemetry restarts reporting `SAFE`, and that the
+   pre-reset command does not take effect when the host reconnects.
+4. Confirm motion resumes only after a fresh grant and a fresh command.
+
+Until that run happens this is reasoned from the source, not measured. Note
+also that no CI job compiles `firmware/rover_firmware.cpp` (§7), so the entry
+point's own wiring is covered by the host stub build and the bench, nothing
+else.
 
 ### 5.2 Surviving a firmware fault
 
@@ -1299,11 +1413,12 @@ converged, a single radio hiccup would start stopping the rover in `TELEOP`.
 
 | Constant | Value | Notes |
 |---|---|---|
-| `PROTOCOL_VERSION` | 7 | Bump when a message's layout or meaning changes. Not sent on the wire; DLC and the CRC are the runtime mismatch signals, plus *which ids arrive* (§2.2) |
+| `PROTOCOL_VERSION` | 9 | Bump when a message's layout or meaning changes. Not sent on the wire; DLC and the CRC are the runtime mismatch signals, plus *which ids arrive* (§2.2) |
 | `SERIAL_BAUD_HZ` | 115200 | Host and firmware must match; ignored by native USB |
 | `CAN_ID_*` | `0x100`, `0x200`–`0x204` | §2.1 |
 | `FRAME_DLC`, `FRAME_PAYLOAD` | 8, 6 | Plus `FRAME_SEQ_OFFSET` 6 and `FRAME_CRC_OFFSET` 7 |
-| `MODE_*`, `MODE_MAX` | 0, 1, 2, 3 | `MODE_MAX` is 2, the highest commandable mode. `MODE_FAULT` (3) is reported but never commanded (§3.1.1) |
+| `MODE_*`, `MODE_MAX` | 0, 1, 2, 3, 4 | `MODE_MAX` is 2, the highest commandable mode. `MODE_FAULT` (3) and `MODE_ESTOP` (4) are reported but never commanded (§3.1.1) |
+| `ESTOP_DEBOUNCE_MS` | 15 | How long the E-stop sense line must hold a value before it is believed (§5.5) |
 | `CMD_MIN`, `CMD_MAX` | −1000, 1000 | Valid `drive_cmd`/`steer_cmd` range (§3.1.4) |
 | `OVER_CURRENT_CA` | 4000 | 40.00 A, placeholder (C++ only) |
 | `UNDERVOLTAGE_CV` | 2000 | 20.00 V, placeholder (C++ only) |
@@ -1558,15 +1673,23 @@ Verified to fail on an injected endianness change.
   `rover_protocol.cpp` plus `_TRANSITIONS` in `host/rover_protocol.py`, and
   `the_transition_table_matches_the_spec` and the golden vectors will point at
   both.
-- **The Systems spec's newer mode states are not implemented.** v0.7 brings
-  `SAFE`, `TELEOP`, `AUTONOMOUS` and `FAULT` in line with the spec and adds no
-  new states. Adding one is a wire change, since `isCommandableMode()` rejects
+- **The Systems spec's newer mode states are not implemented.** v0.7 brought
+  `SAFE`, `TELEOP`, `AUTONOMOUS` and `FAULT` in line with the spec, and v0.9
+  adds `ESTOP` (§5.5); any others in the spec are still missing. Adding one is a wire change, since `isCommandableMode()` rejects
   any mode a controller does not implement (§3.1.1). Every controller must
   learn a new state before any host sends it.
-- **Nothing produces `ESTOP_ACTIVE` yet.** It is in `FAULT_CRITICAL_MASK`, so
-  the latch is ready for a soft e-stop, but no soft e-stop exists (§3.4).
-  Today the only critical hardware inputs that can actually fire are
-  over-current and a drive-stage `FAULT`.
+- **`PIN_ESTOP` is a placeholder, and the sense line may not exist.** v0.9
+  produces `ESTOP_ACTIVE` from a debounced input (§5.5), but the pin number is
+  a guess and the polarity an assumption until Systems confirms both. The
+  prior question is whether the power design offers the signal at all: if the
+  E-stop kills logic power along with actuator power, the controller simply
+  dies and reboots `SAFE`, and §5.5's latch never runs. It earns its keep only
+  where logic power outlives actuator power.
+- **`ESTOP_ACTIVE` remains in `FAULT_CRITICAL_MASK` but no longer reaches it.**
+  The bit is now raised in `faultWord()` for telemetry, while `MODE_ESTOP`
+  handles the behaviour, so the critical-mask path is not how an E-stop stops
+  the rover. The mask entry is harmless and would matter again only if some
+  future input fed `ESTOP_ACTIVE` in as a hardware fault.
 - **A drive-stage `FAULT` needs a reboot to clear.** `DriveModule` latches its
   range fault for the whole session, and v0.7 refuses `FAULT` → `SAFE` while
   any critical fault is present, so the rover cannot leave `FAULT` again (§3.5).

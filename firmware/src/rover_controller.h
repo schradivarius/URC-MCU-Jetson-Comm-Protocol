@@ -2,7 +2,6 @@
 #define ROVER_CONTROLLER_H
 
 #include <stdint.h>
-
 #include "rover_protocol.h"
 
 namespace rover {
@@ -11,12 +10,15 @@ typedef uint32_t (*MillisFn)();
 class RoverController {
 public:
     explicit RoverController(MillisFn now_ms,
-                             uint32_t watchdog_timeout_ms = DEFAULT_WATCHDOG_TIMEOUT_MS,
-                             uint32_t telemetry_period_ms = DEFAULT_TELEMETRY_PERIOD_MS);
+        uint32_t watchdog_timeout_ms = DEFAULT_WATCHDOG_TIMEOUT_MS,
+        uint32_t telemetry_period_ms = DEFAULT_TELEMETRY_PERIOD_MS);
 
     bool ingestFrame(uint32_t can_id, const uint8_t* buf, uint8_t len);
 
     void updateFaults(uint16_t hardware_faults, uint8_t controller_health);
+    void updateEstop(bool active);
+    bool estopActive() const {return estop_active_;}
+    bool estopLatched() const {return estop_latched_;}
 
     void updateFeedback(uint32_t encoder_update_ms, bool encoder_sane,
                         uint32_t steer_update_ms,  bool steer_sane);
@@ -115,6 +117,9 @@ private:
     uint16_t   latched_faults_;
     uint16_t   hw_faults_;
     uint8_t    hw_health_;
+    
+    bool estop_active_;
+    bool estop_latched_;
 
     ControlMsg last_control_;
     bool       have_control_;
