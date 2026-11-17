@@ -4,7 +4,7 @@
 #include <stdint.h>
 
 namespace rover {
-static const uint8_t PROTOCOL_VERSION = 8;
+static const uint8_t PROTOCOL_VERSION = 9;
 
 static const uint32_t SERIAL_BAUD_HZ = 115200;
 
@@ -36,7 +36,7 @@ enum : uint8_t {
     MODE_TELEOP     = 1,
     MODE_AUTONOMOUS = 2,
     MODE_FAULT      = 3,
-    MODE_ESTOP      = 4;
+    MODE_ESTOP      = 4,
 };
 static const uint8_t MODE_MAX = MODE_AUTONOMOUS;
 

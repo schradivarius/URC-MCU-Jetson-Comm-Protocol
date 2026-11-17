@@ -10,9 +10,9 @@ namespace rover {
         
             EstopInput();
 
-            void update(bool raw_active, uint32-t now_ms)
+            void update(bool raw_active, uint32_t now_ms);
 
-            bool active() const {return stable_active;}
+            bool active() const {return stable_active_;}
 
             bool seeded() const {return seeded_;}
 

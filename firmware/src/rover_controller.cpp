@@ -111,14 +111,10 @@ void RoverController::updateEstop(bool active) {
         estop_latched_ = true;
 }
 
-void RoverController::requestMode(const ControlMsg& msg) {
+void RoverController::requestMode(const ControlMsg& msg){
     if (msg.mode == MODE_SAFE && !msg.from_autonomy && !estop_active_) {
         estop_latched_ = false;
     }
-    const uint8_t to = msg.mode;
-}
-
-void RoverController::requestMode(const ControlMsg& msg){
     const uint8_t to = msg.mode;
     if(to == mode_) return;
     if(!transitionAllowed(mode_, to, msg.from_autonomy)) return;
@@ -263,6 +259,8 @@ uint16_t RoverController::faultWord(uint16_t sensor_faults, uint16_t extra_fault
 
 uint8_t RoverController::indicatorState() const {
     const uint8_t mode = activeMode();
+    if (mode == MODE_ESTOP) return INDICATOR_FAULT;
+
     if (mode == MODE_FAULT) return INDICATOR_FAULT;
 
     if (mode == MODE_SAFE) return INDICATOR_OFF;

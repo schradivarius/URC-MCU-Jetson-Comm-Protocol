@@ -12,7 +12,7 @@ namespace rover {
             candidate_since_ms_ = now_ms;
 
             if (raw_active) 
-                assertions++;
+                assertions_++;
 
             return;
         }
@@ -28,7 +28,7 @@ namespace rover {
         if ((now_ms - candidate_since_ms_) >= ESTOP_DEBOUNCE_MS) {
             stable_active_ = raw_active;
             if (raw_active)
-                assertions++;
+                assertions_++;
         }
     }
 }
