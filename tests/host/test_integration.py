@@ -140,6 +140,24 @@ class TestEndToEnd(RoverFixture):
         self.assertEqual(s["jetson_link"], rp.LINK_OK)
         self.assertEqual(s["indicator_state"], rp.INDICATOR_TELEOP)
 
+    def test_command_timeout_comes_before_jetson_loss(self):
+        self.drive(0.6)
+        seen = []
+        end = time.monotonic() + 0.8
+        while time.monotonic() < end:
+            self.drive(0.02, send=False)
+            s = self.snap()
+            seen.append((s["jetson_link"], s["fault_status"], s["drive_applied"]))
+        stale = [f for jl, f, _ in seen if jl == rp.LINK_DEGRADED]
+        self.assertTrue(stale, "never saw the stale-command stage")
+        self.assertTrue(all(f & rp.FAULT_COMM_TIMEOUT for f in stale))
+        self.assertFalse(any(f & rp.FAULT_JETSON_LINK_LOST for f in stale))
+        jl, faults, drive_applied = seen[-1]
+        self.assertEqual(jl, rp.LINK_LOST)
+        self.assertTrue(faults & rp.FAULT_JETSON_LINK_LOST)
+        self.assertFalse(faults & rp.FAULT_C2_LINK_LOST)
+        self.assertEqual(drive_applied, 0)
+
     def test_link_cut_latches_fault_until_safe_is_commanded(self):
         self.drive(0.6)
         self.assertEqual(self.faults(), [])

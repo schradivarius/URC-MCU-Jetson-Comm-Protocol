@@ -32,6 +32,8 @@ public:
 
     uint16_t cmdAgeMs() const;
     bool watchdogTripped() const;
+    // True when no valid frame has arrived for JETSON_LINK_TIMEOUT_MS, or ever.
+    bool jetsonLinkLost() const;
 
     uint8_t activeMode() const;
 

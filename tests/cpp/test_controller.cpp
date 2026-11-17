@@ -11,7 +11,7 @@ static void advance(uint32_t ms) { g_now += ms; }
 
 static RoverController freshController(uint32_t start_ms = 0) {
     g_now = start_ms;
-    return RoverController(fakeMillis, 300, 50);
+    return RoverController(fakeMillis, COMMAND_TIMEOUT_MS, 50);
 }
 
 enum Source { SRC_OWNER = -1, SRC_TELEOP = 0, SRC_AUTONOMY = 1 };
@@ -68,6 +68,7 @@ static void boots_stopped_and_safe() {
     CHECK_EQ(ctl.lastControl().mode, MODE_SAFE);
     CHECK_EQ(ctl.activeMode(), MODE_SAFE);
     CHECK_EQ(ctl.jetsonLinkState(), LINK_LOST);
+    CHECK(ctl.faultWord() & FAULT_JETSON_LINK_LOST);
     int16_t d, s; ctl.commandedOutputs(d, s);
     CHECK_EQ(d, 0); CHECK_EQ(s, 0);
 }
@@ -89,7 +90,7 @@ static void watchdog_trips_exactly_at_the_boundary() {
     advance(1);
     CHECK(ctl.watchdogTripped());
     CHECK(ctl.effectiveStop());
-    CHECK_EQ(ctl.jetsonLinkState(), LINK_LOST);
+    CHECK_EQ(ctl.jetsonLinkState(), LINK_DEGRADED);
 }
 
 static void watchdog_is_correct_across_millis_wraparound() {
@@ -430,7 +431,7 @@ static void comm_timeout_in_safe_is_reported_but_is_not_a_fault() {
     advance(DEFAULT_WATCHDOG_TIMEOUT_MS);
     CHECK_EQ(ctl.activeMode(), MODE_SAFE);
     CHECK(ctl.faultWord() & FAULT_COMM_TIMEOUT);
-    CHECK_EQ(ctl.jetsonLinkState(), LINK_LOST);
+    CHECK_EQ(ctl.jetsonLinkState(), LINK_DEGRADED);
     CHECK(ctl.effectiveStop());
 }
 
@@ -1398,6 +1399,69 @@ static void the_feedback_frame_round_trips_on_the_wire() {
     CHECK_EQ(got.flags, sent.flags);
 }
 
+static void command_timeout_zeroes_drive_and_steering() {
+    const uint8_t modes[] = {MODE_TELEOP, MODE_AUTONOMOUS};
+    for (uint8_t mode : modes) {
+        RoverController ctl = freshController();
+        sendControl(ctl, 600, 250, mode, false);
+        advance(COMMAND_TIMEOUT_MS - 1);
+        CHECK_EQ(ctl.getCommandedDrive(), 600);
+        advance(1);
+        int16_t d, s; ctl.commandedOutputs(d, s);
+        CHECK_EQ(d, 0); CHECK_EQ(s, 0);
+        CHECK(ctl.faultWord() & FAULT_COMM_TIMEOUT);
+        CHECK(!(ctl.faultWord() & FAULT_JETSON_LINK_LOST));
+        CHECK_EQ(ctl.activeMode(), MODE_FAULT);
+        CHECK(ctl.buildDriveR(0).cmd_age_ms >= COMMAND_TIMEOUT_MS);
+        CHECK_EQ(ctl.commandSource(), CMD_SOURCE_NONE);
+    }
+}
+
+static void jetson_loss_is_declared_after_its_own_timeout() {
+    RoverController ctl = freshController();
+    sendControl(ctl, 500, 0, MODE_TELEOP, false);
+    advance(COMMAND_TIMEOUT_MS);
+    CHECK_EQ(ctl.jetsonLinkState(), LINK_DEGRADED);
+    CHECK(!ctl.jetsonLinkLost());
+    advance(JETSON_LINK_TIMEOUT_MS - COMMAND_TIMEOUT_MS - 1);
+    CHECK(!ctl.jetsonLinkLost());
+    advance(1);
+    CHECK(ctl.jetsonLinkLost());
+    CHECK_EQ(ctl.jetsonLinkState(), LINK_LOST);
+    CHECK(ctl.faultWord() & FAULT_JETSON_LINK_LOST);
+    CHECK_EQ(ctl.activeMode(), MODE_FAULT);
+    CHECK_EQ(ctl.buildState().jetson_link, LINK_LOST);
+}
+
+static void jetson_motion_is_refused_after_loss_until_safe() {
+    RoverController ctl = freshController();
+    sendControl(ctl, 500, 0, MODE_TELEOP, false);
+    advance(JETSON_LINK_TIMEOUT_MS);
+    CHECK(sendFrame(ctl, 500, 0, MODE_TELEOP, false));
+    CHECK_EQ(ctl.jetsonLinkState(), LINK_OK);
+    CHECK_EQ(ctl.getCommandedDrive(), 0);
+    CHECK_EQ(ctl.commandStatus(), CMD_STATUS_MODE_REFUSED);
+
+    CHECK(sendFrame(ctl, 0, 0, MODE_SAFE, false));
+    CHECK(sendFrame(ctl, 500, 0, MODE_TELEOP, false));
+    CHECK_EQ(ctl.getCommandedDrive(), 500);
+}
+
+static void jetson_loss_and_c2_loss_are_reported_separately() {
+    RoverController ctl = freshController();
+    sendControl(ctl, 500, 0, MODE_AUTONOMOUS, false, false, false,
+                INDICATOR_AUTONOMOUS, true);
+    CHECK(ctl.faultWord() & FAULT_C2_LINK_LOST);
+    CHECK(!(ctl.faultWord() & FAULT_JETSON_LINK_LOST));
+    CHECK_EQ(ctl.jetsonLinkState(), LINK_OK);
+    CHECK_EQ(ctl.getCommandedDrive(), 500);
+
+    advance(JETSON_LINK_TIMEOUT_MS);
+    CHECK(ctl.faultWord() & FAULT_JETSON_LINK_LOST);
+    CHECK(!(ctl.faultWord() & FAULT_C2_LINK_LOST));
+    CHECK_EQ(ctl.c2LinkState(), LINK_NOT_REPORTED);
+}
+
 int main() {
     std::printf("test_controller\n");
     RUN_TEST(boots_stopped_and_safe);
@@ -1506,5 +1570,9 @@ int main() {
     RUN_TEST(a_stale_source_is_not_reported);
     RUN_TEST(the_feedback_frame_carries_what_the_accessors_say);
     RUN_TEST(the_feedback_frame_round_trips_on_the_wire);
+    RUN_TEST(command_timeout_zeroes_drive_and_steering);
+    RUN_TEST(jetson_loss_is_declared_after_its_own_timeout);
+    RUN_TEST(jetson_motion_is_refused_after_loss_until_safe);
+    RUN_TEST(jetson_loss_and_c2_loss_are_reported_separately);
     return testing::summary("test_controller");
 }
