@@ -1544,6 +1544,255 @@ static void a_rover_that_boots_estopped_stays_stopped() {
     CHECK_EQ(drive, static_cast<int16_t>(0));
 }
 
+// ===========================================================================
+// NEW (Task 6 E1): the safety status rule table. Each row sets the rover up,
+// then checks safetyStatus(). One row per line of the agreed sorting list.
+// ===========================================================================
+
+static void allHealthy(RoverController& ctl) {
+    ctl.updateFaults(0, CTRL_HEALTH_OK);
+    freshFeedback(ctl);
+}
+
+static void inSafe(RoverController& ctl) {
+    sendFrame(ctl, 0, 0, MODE_SAFE, false);
+    allHealthy(ctl);
+}
+
+static void driving(RoverController& ctl, uint8_t mode) {
+    sendControl(ctl, 500, 0, mode, false);
+    allHealthy(ctl);
+}
+
+static void loseC2(RoverController& ctl, uint8_t mode) {
+    sendFrame(ctl, modePermitsMotion(mode) ? 500 : 0, 0, mode, false, false,
+              false, INDICATOR_OFF, /*c2_lost=*/true);
+}
+
+static void sendDamagedFrame(RoverController& ctl) {
+    ControlMsg m;
+    m.drive_cmd = 0; m.steer_cmd = 0; m.mode = MODE_SAFE;
+    m.stop = false; m.autonomy_abort = false; m.return_request = false;
+    m.c2_lost = false; m.from_autonomy = false;
+    m.indicator_request = INDICATOR_OFF; m.seq = ++g_seq;
+    uint8_t buf[8] = {0};
+    encodeControl(m, buf);
+    buf[0] ^= 0xFF;
+    ctl.ingestFrame(CAN_ID_CONTROL, buf, FRAME_DLC);
+}
+
+struct StatusRow {
+    const char* name;            // printed in the test output
+    void      (*setup)(RoverController&);
+    uint16_t    sensor_faults;   // bits the sensors report, as given to buildPower()
+    uint16_t    extra_faults;    // e.g. FIRMWARE_FAULT after a watchdog reset
+    uint8_t     expect;          // the status we expect
+};
+
+static const StatusRow STATUS_RULES[] = {
+    // Nothing wrong
+    {"status: nothing wrong, in SAFE", inSafe, 0, 0, SAFETY_STATUS_SAFE},
+    {"status: nothing wrong, driving in TELEOP",
+     [](RoverController& c) { driving(c, MODE_TELEOP); }, 0, 0, SAFETY_STATUS_SAFE},
+    {"status: nothing wrong, driving in AUTONOMOUS",
+     [](RoverController& c) { driving(c, MODE_AUTONOMOUS); }, 0, 0, SAFETY_STATUS_SAFE},
+
+    // FAULT
+    {"status: no Jetson yet, just after power-on", allHealthy, 0, 0, SAFETY_STATUS_FAULT},
+    {"status: Jetson goes silent in SAFE",
+     [](RoverController& c) { inSafe(c); advance(300); allHealthy(c); },
+     0, 0, SAFETY_STATUS_FAULT},
+    {"status: Jetson goes silent while driving",
+     [](RoverController& c) { driving(c, MODE_TELEOP); advance(300); allHealthy(c); },
+     0, 0, SAFETY_STATUS_FAULT},
+    {"status: base-station link lost in TELEOP",
+     [](RoverController& c) { driving(c, MODE_TELEOP); loseC2(c, MODE_TELEOP); },
+     0, 0, SAFETY_STATUS_FAULT},
+    {"status: base-station link lost in AUTONOMOUS",
+     [](RoverController& c) { driving(c, MODE_AUTONOMOUS); loseC2(c, MODE_AUTONOMOUS); },
+     0, 0, SAFETY_STATUS_FAULT},
+    {"status: base-station link lost in SAFE",
+     [](RoverController& c) { loseC2(c, MODE_SAFE); allHealthy(c); },
+     0, 0, SAFETY_STATUS_FAULT},
+    {"status: motor current too high while driving",
+     [](RoverController& c) { driving(c, MODE_TELEOP);
+                              c.updateFaults(FAULT_OVER_CURRENT, CTRL_HEALTH_OK); },
+     FAULT_OVER_CURRENT, 0, SAFETY_STATUS_FAULT},
+    {"status: motor current too high in SAFE",
+     [](RoverController& c) { inSafe(c); c.updateFaults(FAULT_OVER_CURRENT, CTRL_HEALTH_OK); },
+     FAULT_OVER_CURRENT, 0, SAFETY_STATUS_FAULT},
+    {"status: motor output reports a fault",
+     [](RoverController& c) { inSafe(c); c.updateFaults(0, CTRL_HEALTH_FAULT); },
+     0, 0, SAFETY_STATUS_FAULT},
+    {"status: E-stop pressed",
+     [](RoverController& c) { driving(c, MODE_TELEOP); c.updateEstop(true); },
+     0, 0, SAFETY_STATUS_FAULT},
+    {"status: E-stop released, not cleared by SAFE yet",
+     [](RoverController& c) { driving(c, MODE_TELEOP); c.updateEstop(true);
+                              c.updateEstop(false); },
+     0, 0, SAFETY_STATUS_FAULT},
+    {"status: still FAULT after the cause cleared",
+     [](RoverController& c) { driving(c, MODE_TELEOP); advance(300);
+                              sendFrame(c, 500, 0, MODE_TELEOP, false); allHealthy(c); },
+     0, 0, SAFETY_STATUS_FAULT},
+
+    // DEGRADED
+    {"status: sensor data stopped updating",
+     [](RoverController& c) { inSafe(c); advance(FEEDBACK_STALE_MS); },
+     0, 0, SAFETY_STATUS_DEGRADED},
+    {"status: impossible steering reading",
+     [](RoverController& c) { inSafe(c); c.updateFeedback(g_now, true, g_now, false); },
+     0, 0, SAFETY_STATUS_DEGRADED},
+    {"status: battery voltage low", inSafe, FAULT_UNDERVOLTAGE, 0, SAFETY_STATUS_DEGRADED},
+    {"status: restarted after a watchdog reset", inSafe, 0, FAULT_FIRMWARE_FAULT,
+     SAFETY_STATUS_DEGRADED},
+    {"status: a damaged frame was rejected",
+     [](RoverController& c) { inSafe(c); sendDamagedFrame(c); },
+     0, 0, SAFETY_STATUS_DEGRADED},
+    {"status: a command from the wrong sender",
+     [](RoverController& c) { driving(c, MODE_TELEOP);
+                              sendFrame(c, 500, 0, MODE_TELEOP, false, false, false,
+                                        INDICATOR_OFF, false, SRC_AUTONOMY); },
+     0, 0, SAFETY_STATUS_DEGRADED},
+    {"status: messages from the Jetson went missing",
+     [](RoverController& c) { sendWithSeq(c, 10, 0); sendWithSeq(c, 20, 0); allHealthy(c); },
+     0, 0, SAFETY_STATUS_DEGRADED},
+    {"status: motor output saturating",
+     [](RoverController& c) { inSafe(c); c.updateFaults(0, CTRL_HEALTH_DEGRADED); },
+     0, 0, SAFETY_STATUS_DEGRADED},
+
+    // When several things are wrong, the worst wins
+    {"status: worst wins, stale data and over-current",
+     [](RoverController& c) { inSafe(c); c.updateFaults(FAULT_OVER_CURRENT, CTRL_HEALTH_OK);
+                              advance(FEEDBACK_STALE_MS); },
+     FAULT_OVER_CURRENT, 0, SAFETY_STATUS_FAULT},
+};
+
+static void runStatusTable() {
+    for (const StatusRow& row : STATUS_RULES) {
+        testing::beginTest(row.name);
+        RoverController ctl = freshController();
+        row.setup(ctl);
+        CHECK_EQ(ctl.safetyStatus(row.sensor_faults, row.extra_faults), row.expect);
+        CHECK_EQ(ctl.buildSafety(row.sensor_faults, row.extra_faults).status, row.expect);
+        testing::endTest();
+    }
+}
+
+// E1: DEGRADED clears by itself once the problem is gone.
+static void a_degraded_status_clears_by_itself() {
+    RoverController ctl = freshController();
+    inSafe(ctl);
+    ctl.updateFeedback(g_now, true, g_now, false);
+    CHECK_EQ(ctl.safetyStatus(), SAFETY_STATUS_DEGRADED);
+    freshFeedback(ctl);
+    CHECK_EQ(ctl.safetyStatus(), SAFETY_STATUS_SAFE);
+}
+
+// E1: a FAULT while driving stays until the operator commands SAFE.
+static void a_fault_while_driving_stays_until_safe() {
+    RoverController ctl = freshController();
+    driving(ctl, MODE_TELEOP);
+    advance(DEFAULT_WATCHDOG_TIMEOUT_MS);
+    CHECK_EQ(ctl.safetyStatus(), SAFETY_STATUS_FAULT);
+    sendFrame(ctl, 500, 0, MODE_TELEOP, false);
+    allHealthy(ctl);
+    CHECK_EQ(ctl.safetyStatus(), SAFETY_STATUS_FAULT);
+    inSafe(ctl);
+    CHECK_EQ(ctl.safetyStatus(), SAFETY_STATUS_SAFE);
+}
+
+// E1: already in SAFE, a FAULT clears when the problem does.
+static void a_fault_in_safe_clears_when_the_problem_does() {
+    RoverController ctl = freshController();
+    inSafe(ctl);
+    advance(DEFAULT_WATCHDOG_TIMEOUT_MS);
+    allHealthy(ctl);
+    CHECK_EQ(ctl.safetyStatus(), SAFETY_STATUS_FAULT);
+    inSafe(ctl);
+    CHECK_EQ(ctl.safetyStatus(), SAFETY_STATUS_SAFE);
+}
+
+// Follow-up 2, default policy (Systems' answer as given): kept until SAFE.
+static void a_c2_fault_in_autonomy_is_held_until_safe() {
+    RoverController ctl = freshController();
+    driving(ctl, MODE_AUTONOMOUS);
+    loseC2(ctl, MODE_AUTONOMOUS);
+    CHECK_EQ(ctl.safetyStatus(), SAFETY_STATUS_FAULT);
+    CHECK(!(ctl.buildSafety().flags & SAFETY_FLAG_FAULT_HELD));
+
+    sendFrame(ctl, 500, 0, MODE_AUTONOMOUS, false);
+    CHECK_EQ(ctl.c2LinkState(), LINK_OK);
+    CHECK(ctl.faultHeld());
+    CHECK_EQ(ctl.safetyStatus(), SAFETY_STATUS_FAULT);
+    CHECK(ctl.buildSafety().flags & SAFETY_FLAG_FAULT_HELD);
+
+    inSafe(ctl);
+    CHECK(!ctl.faultHeld());
+    CHECK_EQ(ctl.safetyStatus(), SAFETY_STATUS_SAFE);
+}
+
+// Follow-up 2, the other policy: FAULT only while the link is down.
+static void a_c2_fault_in_autonomy_can_clear_with_the_link() {
+    RoverController ctl = freshController();
+    ctl.setC2AutonomyFaultPolicy(C2_FAULT_CLEAR_WITH_LINK);
+    driving(ctl, MODE_AUTONOMOUS);
+    loseC2(ctl, MODE_AUTONOMOUS);
+    CHECK_EQ(ctl.safetyStatus(), SAFETY_STATUS_FAULT);
+    sendFrame(ctl, 500, 0, MODE_AUTONOMOUS, false);
+    CHECK(!ctl.faultHeld());
+    CHECK_EQ(ctl.safetyStatus(), SAFETY_STATUS_SAFE);
+    CHECK(!(ctl.buildSafety().flags & SAFETY_FLAG_FAULT_HELD));
+}
+
+// E only reports: a FAULT status never stops a rover the other rules let drive.
+static void the_status_does_not_change_what_the_rover_does() {
+    RoverController ctl = freshController();
+    driving(ctl, MODE_AUTONOMOUS);
+    loseC2(ctl, MODE_AUTONOMOUS);
+    CHECK_EQ(ctl.safetyStatus(), SAFETY_STATUS_FAULT);
+    CHECK(!ctl.effectiveStop());
+    int16_t d, s; ctl.commandedOutputs(d, s);
+    CHECK_EQ(d, 500);
+}
+
+// E2: the frame reports STOP, E-stop and the Jetson's age.
+static void the_safety_frame_carries_what_the_accessors_say() {
+    RoverController ctl = freshController();
+    TelemetrySafety m = ctl.buildSafety();
+    CHECK_EQ(m.jetson_age_ms, CMD_AGE_UNKNOWN);
+    CHECK(m.flags & SAFETY_FLAG_STOP);
+
+    driving(ctl, MODE_TELEOP);
+    advance(120);
+    m = ctl.buildSafety();
+    CHECK_EQ(ctl.jetsonAgeMs(), 120);
+    CHECK_EQ(m.jetson_age_ms, 120);
+    CHECK(!(m.flags & SAFETY_FLAG_STOP));
+
+    sendFrame(ctl, 500, 0, MODE_TELEOP, true);
+    CHECK(ctl.buildSafety().flags & SAFETY_FLAG_STOP);
+
+    ctl.updateEstop(true);
+    m = ctl.buildSafety();
+    CHECK(m.flags & SAFETY_FLAG_ESTOP_ACTIVE);
+    CHECK(m.flags & SAFETY_FLAG_ESTOP_LATCHED);
+    ctl.updateEstop(false);
+    m = ctl.buildSafety();
+    CHECK(!(m.flags & SAFETY_FLAG_ESTOP_ACTIVE));
+    CHECK(m.flags & SAFETY_FLAG_ESTOP_LATCHED);
+    CHECK_EQ(m.status, SAFETY_STATUS_FAULT);
+}
+
+// E2: the status uses the same fault bits as the POWER frame's fault word.
+static void the_status_and_the_fault_word_agree() {
+    RoverController ctl = freshController();
+    inSafe(ctl);
+    CHECK(ctl.buildPower(0, 2400, FAULT_UNDERVOLTAGE).fault_status & FAULT_UNDERVOLTAGE);
+    CHECK_EQ(ctl.buildSafety(FAULT_UNDERVOLTAGE).status, SAFETY_STATUS_DEGRADED);
+    CHECK_EQ(ctl.buildSafety().status, SAFETY_STATUS_SAFE);
+}
+
 int main() {
     std::printf("test_controller\n");
     RUN_TEST(an_estop_forces_a_stop_at_full_throttle);
@@ -1662,5 +1911,14 @@ int main() {
     RUN_TEST(a_stale_source_is_not_reported);
     RUN_TEST(the_feedback_frame_carries_what_the_accessors_say);
     RUN_TEST(the_feedback_frame_round_trips_on_the_wire);
+    RUN_TEST(a_degraded_status_clears_by_itself);
+    RUN_TEST(a_fault_while_driving_stays_until_safe);
+    RUN_TEST(a_fault_in_safe_clears_when_the_problem_does);
+    RUN_TEST(a_c2_fault_in_autonomy_is_held_until_safe);
+    RUN_TEST(a_c2_fault_in_autonomy_can_clear_with_the_link);
+    RUN_TEST(the_status_does_not_change_what_the_rover_does);
+    RUN_TEST(the_safety_frame_carries_what_the_accessors_say);
+    RUN_TEST(the_status_and_the_fault_word_agree);
+    runStatusTable();
     return testing::summary("test_controller");
 }

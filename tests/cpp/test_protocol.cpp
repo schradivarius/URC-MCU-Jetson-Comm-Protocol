@@ -522,6 +522,86 @@ static void the_c2_fault_bit_is_named() {
     CHECK(std::strcmp(names[0], "C2_LINK_LOST") == 0);
 }
 
+// ===========================================================================
+// NEW (Task 6 E): the TELEM_SAFETY frame and the fault-bit levels.
+// ===========================================================================
+
+static void telemetry_safety_round_trips() {
+    TelemetrySafety in;
+    in.status = SAFETY_STATUS_DEGRADED;
+    in.flags = SAFETY_FLAG_STOP | SAFETY_FLAG_FAULT_HELD;
+    in.jetson_age_ms = 1234;
+    uint8_t buf[8] = {0};
+    CHECK_EQ(encodeTelemetrySafety(in, 9, buf), FRAME_DLC);
+    TelemetrySafety out; uint8_t seq = 0;
+    CHECK_EQ(decodeTelemetrySafety(CAN_ID_TELEM_SAFETY, buf, FRAME_DLC, out, seq),
+             DECODE_OK);
+    CHECK_EQ(out.status, SAFETY_STATUS_DEGRADED);
+    CHECK_EQ(out.flags, in.flags);
+    CHECK_EQ(out.jetson_age_ms, 1234);
+    CHECK_EQ(seq, 9);
+}
+
+static void a_safety_frame_on_another_id_is_rejected() {
+    TelemetrySafety in;
+    in.status = SAFETY_STATUS_SAFE; in.flags = 0; in.jetson_age_ms = 0;
+    uint8_t buf[8] = {0};
+    encodeTelemetrySafety(in, 1, buf);
+    TelemetrySafety out; uint8_t seq = 0;
+    CHECK_EQ(decodeTelemetrySafety(CAN_ID_TELEM_STATE, buf, FRAME_DLC, out, seq),
+             DECODE_BAD_CRC);
+}
+
+// Change one byte and re-seal it, so only the value is wrong, not the CRC.
+static DecodeResult decodeWithByte(int index, uint8_t value) {
+    TelemetrySafety in;
+    in.status = SAFETY_STATUS_SAFE; in.flags = 0; in.jetson_age_ms = 5;
+    uint8_t buf[8] = {0};
+    encodeTelemetrySafety(in, 3, buf);
+    buf[index] = value;
+    buf[FRAME_CRC_OFFSET] = frameCrc8(CAN_ID_TELEM_SAFETY, buf, FRAME_SEQ_OFFSET + 1);
+    TelemetrySafety out; uint8_t seq = 0;
+    return decodeTelemetrySafety(CAN_ID_TELEM_SAFETY, buf, FRAME_DLC, out, seq);
+}
+
+static void a_safety_frame_this_version_cannot_mean_is_rejected() {
+    CHECK_EQ(decodeWithByte(0, SAFETY_STATUS_MAX + 1), DECODE_BAD_RANGE);
+    CHECK_EQ(decodeWithByte(1, 0x10), DECODE_BAD_FLAGS);
+    CHECK_EQ(decodeWithByte(4, 1), DECODE_BAD_FLAGS);
+    CHECK_EQ(decodeWithByte(5, 1), DECODE_BAD_FLAGS);
+    CHECK_EQ(decodeWithByte(0, SAFETY_STATUS_FAULT), DECODE_OK);
+}
+
+// The safety net for later changes: a new fault bit must be given a level.
+static void every_named_fault_bit_has_a_level() {
+    CHECK_EQ(FAULT_LEVEL_BITS & DEGRADED_LEVEL_BITS, 0);
+    for (int i = 0; i < 16; ++i) {
+        const uint16_t bit = static_cast<uint16_t>(1u << i);
+        const char* name[1];
+        if (faultNames(bit, name, 1) == 0) continue;
+        const bool sorted = (bit & (FAULT_LEVEL_BITS | DEGRADED_LEVEL_BITS)) != 0;
+        if (!sorted) std::printf("        fault bit with no level: %s\n", name[0]);
+        CHECK(sorted);
+    }
+}
+
+static void the_fault_word_reports_its_worst_bit() {
+    CHECK_EQ(faultWordStatus(0), SAFETY_STATUS_SAFE);
+    CHECK_EQ(faultWordStatus(FAULT_STALE_FEEDBACK), SAFETY_STATUS_DEGRADED);
+    CHECK_EQ(faultWordStatus(FAULT_COMM_TIMEOUT | FAULT_SEQ_GAP), SAFETY_STATUS_DEGRADED);
+    CHECK_EQ(faultWordStatus(FAULT_C2_LINK_LOST), SAFETY_STATUS_FAULT);
+    CHECK_EQ(faultWordStatus(FAULT_STALE_FEEDBACK | FAULT_OVER_CURRENT),
+             SAFETY_STATUS_FAULT);
+    CHECK_EQ(faultWordStatus(0x8000), SAFETY_STATUS_FAULT);
+}
+
+static void every_safety_status_is_named() {
+    CHECK_STREQ(safetyStatusName(SAFETY_STATUS_SAFE), "SAFE");
+    CHECK_STREQ(safetyStatusName(SAFETY_STATUS_DEGRADED), "DEGRADED");
+    CHECK_STREQ(safetyStatusName(SAFETY_STATUS_FAULT), "FAULT");
+    CHECK_STREQ(safetyStatusName(SAFETY_STATUS_MAX + 1), "UNKNOWN");
+}
+
 int main() {
     std::printf("test_protocol\n");
     RUN_TEST(crc8_known_answer_vector);
@@ -567,5 +647,11 @@ int main() {
     RUN_TEST(cmd_age_sentinel_is_distinct_from_saturation);
     RUN_TEST(fault_names_includes_the_new_wide_bits);
     RUN_TEST(the_c2_fault_bit_is_named);
+    RUN_TEST(telemetry_safety_round_trips);
+    RUN_TEST(a_safety_frame_on_another_id_is_rejected);
+    RUN_TEST(a_safety_frame_this_version_cannot_mean_is_rejected);
+    RUN_TEST(every_named_fault_bit_has_a_level);
+    RUN_TEST(the_fault_word_reports_its_worst_bit);
+    RUN_TEST(every_safety_status_is_named);
     return testing::summary("test_protocol");
 }

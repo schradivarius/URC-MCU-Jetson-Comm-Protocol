@@ -26,6 +26,7 @@ SHARED = {
     "CAN_ID_TELEM_STATE":    "CAN_ID_TELEM_STATE",
     "CAN_ID_TELEM_CMD_ECHO": "CAN_ID_TELEM_CMD_ECHO",
     "CAN_ID_TELEM_FEEDBACK": "CAN_ID_TELEM_FEEDBACK",
+    "CAN_ID_TELEM_SAFETY":   "CAN_ID_TELEM_SAFETY",
     "FEEDBACK_STALE_MS":     "FEEDBACK_STALE_MS",
     "MODE_SAFE":             "MODE_SAFE",
     "MODE_TELEOP":           "MODE_TELEOP",
@@ -41,7 +42,8 @@ SHARED = {
 FRAME_GEOMETRY = ("FRAME_DLC", "FRAME_PAYLOAD", "FRAME_SEQ_OFFSET",
                   "FRAME_CRC_OFFSET")
 
-FIRMWARE_ONLY = ("HW_WATCHDOG_MS", "OVER_CURRENT_CA", "UNDERVOLTAGE_CV")
+FIRMWARE_ONLY = ("HW_WATCHDOG_MS", "OVER_CURRENT_CA", "UNDERVOLTAGE_CV",
+                 "C2_FAULT_HOLD_UNTIL_SAFE", "C2_FAULT_CLEAR_WITH_LINK")
 
 
 def cpp_constants():
@@ -80,7 +82,8 @@ class TestConfigSync(unittest.TestCase):
     def test_payload_layouts_fit_the_frame(self):
         import struct
         for name in ("CONTROL_FMT", "DRIVE_L_FMT", "DRIVE_R_FMT",
-                     "POWER_FMT", "STATE_FMT", "ECHO_FMT"):
+                     "POWER_FMT", "STATE_FMT", "ECHO_FMT", "FEEDBACK_FMT",
+                     "SAFETY_FMT"):
             self.assertEqual(struct.calcsize(getattr(rp, name)),
                              self.cpp["FRAME_PAYLOAD"],
                              "%s is not FRAME_PAYLOAD bytes" % name)

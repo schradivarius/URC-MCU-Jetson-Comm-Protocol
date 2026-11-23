@@ -38,7 +38,9 @@ RoverController::RoverController(MillisFn now_ms,
       encoder_update_ms_(0),
       steer_update_ms_(0),
       encoder_sane_(false),
-      steer_sane_(false) {
+      steer_sane_(false),
+      c2_fault_policy_(C2_AUTONOMY_FAULT_POLICY),
+      c2_fault_held_(false) {
     last_control_.drive_cmd         = 0;
     last_control_.steer_cmd         = 0;
     last_control_.mode              = MODE_SAFE;
@@ -95,6 +97,8 @@ bool RoverController::ingestFrame(uint32_t can_id, const uint8_t* buf, uint8_t l
     last_control_ms_ = now_ms_();
     control_frames_accepted_++;
     requestMode(msg);
+    // NEW (Task 6 E): remember a base-station loss seen while AUTONOMOUS.
+    if (mode_ == MODE_AUTONOMOUS && msg.c2_lost) c2_fault_held_ = true;
     latchIfFaulted();
     return true;
 }
@@ -121,7 +125,10 @@ void RoverController::requestMode(const ControlMsg& msg){
     if(mode_ == MODE_FAULT && hardwareFaultActive()) return;
     if(to ==MODE_TELEOP && msg.c2_lost) return;
     mode_ = to;
-    if(to == MODE_SAFE) latched_faults_ = 0;
+    if(to == MODE_SAFE) {
+        latched_faults_ = 0;
+        c2_fault_held_ = false;  // NEW (Task 6 E): SAFE clears a held FAULT
+    }
 }
 
 uint16_t RoverController::faultCauses()const{
@@ -239,6 +246,37 @@ uint8_t RoverController::c2LinkState() const {
     if (!have_control_)    return LINK_NOT_REPORTED;
     if (watchdogTripped()) return LINK_NOT_REPORTED;
     return last_control_.c2_lost ? LINK_LOST : LINK_OK;
+}
+
+// NEW (Task 6 E2): ms since the last frame from the Jetson, CMD_AGE_UNKNOWN
+// before the first one. Today this is the same clock as the command age.
+uint16_t RoverController::jetsonAgeMs() const {
+    if (!have_control_) return CMD_AGE_UNKNOWN;
+    return clampCmdAgeMs(static_cast<int64_t>(elapsedSinceControl()));
+}
+
+// NEW (Task 6 E): a C2 loss seen in AUTONOMOUS keeps the status at FAULT
+// until SAFE, under the HOLD_UNTIL_SAFE policy.
+bool RoverController::faultHeld() const {
+    return c2_fault_policy_ == C2_FAULT_HOLD_UNTIL_SAFE && c2_fault_held_;
+}
+
+// NEW (Task 6 E1): the one place the safety status is decided. Checked from
+// worst to mildest, so the worst condition wins.
+uint8_t RoverController::safetyStatus(uint16_t sensor_faults, uint16_t extra_faults) const {
+    const uint8_t mode = activeMode();
+    if (mode == MODE_FAULT || mode == MODE_ESTOP) return SAFETY_STATUS_FAULT;  // stopped by a fault or E-stop
+    if (jetsonLinkState() == LINK_LOST)            return SAFETY_STATUS_FAULT;  // no Jetson, in any mode
+    if (hardwareFaultActive())                      return SAFETY_STATUS_FAULT;  // over-current, drive stage fault
+    if (faultHeld())                                return SAFETY_STATUS_FAULT;  // C2 lost in AUTONOMOUS, until SAFE
+
+    const uint8_t from_bits = faultWordStatus(faultWord(sensor_faults, extra_faults));
+    if (from_bits != SAFETY_STATUS_SAFE) return from_bits;
+
+    if (jetsonLinkState() == LINK_DEGRADED || hw_health_ == CTRL_HEALTH_DEGRADED) {
+        return SAFETY_STATUS_DEGRADED;  // recent gaps or CRC errors; drive stage saturating
+    }
+    return SAFETY_STATUS_SAFE;
 }
 
 uint16_t RoverController::faultWord(uint16_t sensor_faults, uint16_t extra_faults) const {
@@ -393,6 +431,21 @@ TelemetryFeedback RoverController::buildFeedback() const {
     if (steerStale())     flags |= FB_FLAG_STEER_STALE;
     if (encoderInvalid()) flags |= FB_FLAG_ENCODER_INVALID;
     if (steerInvalid())   flags |= FB_FLAG_STEER_INVALID;
+    m.flags = flags;
+    return m;
+}
+
+// NEW (Task 6 E2): builds the TELEM_SAFETY frame.
+TelemetrySafety RoverController::buildSafety(uint16_t sensor_faults, uint16_t extra_faults) const {
+    TelemetrySafety m;
+    m.status        = safetyStatus(sensor_faults, extra_faults);
+    m.jetson_age_ms = jetsonAgeMs();
+    uint8_t flags = 0;
+    if (stopActive())   flags |= SAFETY_FLAG_STOP;
+    if (estop_active_)  flags |= SAFETY_FLAG_ESTOP_ACTIVE;
+    if (estop_latched_) flags |= SAFETY_FLAG_ESTOP_LATCHED;
+    // Held FAULT whose cause (the C2 loss) has already cleared: send SAFE.
+    if (faultHeld() && c2LinkState() != LINK_LOST) flags |= SAFETY_FLAG_FAULT_HELD;
     m.flags = flags;
     return m;
 }

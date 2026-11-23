@@ -7,7 +7,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from rover_config import (  # noqa: E402,F401
     CAN_ID_CONTROL, CAN_ID_TELEM_DRIVE_L, CAN_ID_TELEM_DRIVE_R,
     CAN_ID_TELEM_POWER, CAN_ID_TELEM_STATE, CAN_ID_TELEM_CMD_ECHO,
-    CAN_ID_TELEM_FEEDBACK,
+    CAN_ID_TELEM_FEEDBACK, CAN_ID_TELEM_SAFETY,
     MODE_SAFE, MODE_TELEOP, MODE_AUTONOMOUS, MODE_FAULT, MODE_ESTOP, MODE_MAX,
     CMD_MIN, CMD_MAX, PROTOCOL_VERSION, PWM_NEUTRAL_US, PWM_SPAN_US,
     FEEDBACK_STALE_MS,
@@ -15,7 +15,7 @@ from rover_config import (  # noqa: E402,F401
 
 TELEM_IDS = (CAN_ID_TELEM_DRIVE_L, CAN_ID_TELEM_DRIVE_R,
              CAN_ID_TELEM_POWER, CAN_ID_TELEM_STATE, CAN_ID_TELEM_CMD_ECHO,
-             CAN_ID_TELEM_FEEDBACK)
+             CAN_ID_TELEM_FEEDBACK, CAN_ID_TELEM_SAFETY)
 
 MODE_NAMES = {MODE_SAFE: "SAFE", MODE_TELEOP: "TELEOP",
               MODE_AUTONOMOUS: "AUTONOMOUS", MODE_FAULT: "FAULT",
@@ -76,6 +76,44 @@ FAULT_NAMES = [
 ]
 
 FAULT_CRITICAL_MASK = FAULT_OVER_CURRENT | FAULT_ESTOP_ACTIVE
+
+# NEW (Task 6 E1): the overall safety status, mirroring rover_protocol.h.
+SAFETY_STATUS_SAFE     = 0
+SAFETY_STATUS_DEGRADED = 1
+SAFETY_STATUS_FAULT    = 2
+SAFETY_STATUS_MAX      = SAFETY_STATUS_FAULT
+SAFETY_STATUS_NAMES = {SAFETY_STATUS_SAFE: "SAFE",
+                       SAFETY_STATUS_DEGRADED: "DEGRADED",
+                       SAFETY_STATUS_FAULT: "FAULT"}
+
+# Which fault bits are FAULT level; a bit in neither list counts as FAULT.
+FAULT_LEVEL_BITS = FAULT_OVER_CURRENT | FAULT_ESTOP_ACTIVE | FAULT_C2_LINK_LOST
+DEGRADED_LEVEL_BITS = (FAULT_COMM_TIMEOUT | FAULT_ENCODER_FAULT |
+                       FAULT_UNDERVOLTAGE | FAULT_FIRMWARE_FAULT |
+                       FAULT_PROTOCOL_ERROR | FAULT_SEQ_GAP | FAULT_CRC_ERROR |
+                       FAULT_CMD_SOURCE | FAULT_STALE_FEEDBACK |
+                       FAULT_STEERING_FAULT)
+
+
+def fault_word_status(faults):
+    if faults & ~DEGRADED_LEVEL_BITS & 0xFFFF:
+        return SAFETY_STATUS_FAULT
+    return SAFETY_STATUS_DEGRADED if faults else SAFETY_STATUS_SAFE
+
+
+SAFETY_FLAG_STOP          = 0x01
+SAFETY_FLAG_ESTOP_ACTIVE  = 0x02
+SAFETY_FLAG_ESTOP_LATCHED = 0x04
+SAFETY_FLAG_FAULT_HELD    = 0x08
+SAFETY_FLAGS_MASK         = 0x0F
+SAFETY_FLAG_NAMES = ((SAFETY_FLAG_STOP, "STOP"),
+                     (SAFETY_FLAG_ESTOP_ACTIVE, "ESTOP_ACTIVE"),
+                     (SAFETY_FLAG_ESTOP_LATCHED, "ESTOP_LATCHED"),
+                     (SAFETY_FLAG_FAULT_HELD, "FAULT_HELD"))
+
+
+def safety_flag_names(flags):
+    return [name for bit, name in SAFETY_FLAG_NAMES if flags & bit]
 
 LINK_OK           = 0
 LINK_DEGRADED     = 1
@@ -151,6 +189,7 @@ POWER_FMT   = "<hhH"
 STATE_FMT   = "<6B"
 ECHO_FMT    = "<hhBB"
 FEEDBACK_FMT = "<HHBB"
+SAFETY_FMT   = "<BBHH"  # NEW (Task 6 E2): status, flags, Jetson age, reserved
 
 INT32_MIN = -(2 ** 31)
 INT32_MAX = 2 ** 31 - 1
@@ -432,6 +471,33 @@ def decode_telemetry_feedback(frame, can_id=CAN_ID_TELEM_FEEDBACK):
     }
 
 
+def encode_telemetry_safety(status, flags, jetson_age_ms, seq=0):
+    return _seal(CAN_ID_TELEM_SAFETY,
+                 struct.pack(SAFETY_FMT, status, flags & SAFETY_FLAGS_MASK,
+                             jetson_age_ms, 0), seq)
+
+
+# NEW (Task 6 E2): rejects values this protocol version can't mean.
+def decode_telemetry_safety(frame, can_id=CAN_ID_TELEM_SAFETY):
+    result, payload, seq = _open(can_id, frame)
+    if result != DECODE_OK:
+        return result, None
+    status, flags, jetson_age, reserved = struct.unpack(SAFETY_FMT, payload)
+    if status > SAFETY_STATUS_MAX:
+        return DECODE_BAD_RANGE, None
+    if flags & ~SAFETY_FLAGS_MASK or reserved:
+        return DECODE_BAD_FLAGS, None
+    return DECODE_OK, {
+        "safety_status": status, "safety_flags": flags,
+        "jetson_age_ms": jetson_age,
+        "stop_active": bool(flags & SAFETY_FLAG_STOP),
+        "estop_active": bool(flags & SAFETY_FLAG_ESTOP_ACTIVE),
+        "estop_latched": bool(flags & SAFETY_FLAG_ESTOP_LATCHED),
+        "fault_held": bool(flags & SAFETY_FLAG_FAULT_HELD),
+        "seq": seq,
+    }
+
+
 DECODERS = {
     CAN_ID_TELEM_DRIVE_L: decode_telemetry_drive_l,
     CAN_ID_TELEM_DRIVE_R: decode_telemetry_drive_r,
@@ -439,4 +505,5 @@ DECODERS = {
     CAN_ID_TELEM_STATE:   decode_telemetry_state,
     CAN_ID_TELEM_CMD_ECHO: decode_telemetry_cmd_echo,
     CAN_ID_TELEM_FEEDBACK: decode_telemetry_feedback,
+    CAN_ID_TELEM_SAFETY:  decode_telemetry_safety,
 }

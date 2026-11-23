@@ -54,6 +54,30 @@ enum : uint16_t {
     FAULT_STEERING_FAULT = 0x1000,
 };
 static const uint16_t FAULT_CRITICAL_MASK = FAULT_OVER_CURRENT | FAULT_ESTOP_ACTIVE;
+
+// NEW (Task 6 E1): the rover's overall safety status, Systems' model.
+//   SAFE      nothing is wrong (this is not the SAFE mode; mode is its own field)
+//   DEGRADED  something is off but the rover still works; clears by itself
+//   FAULT     the rover is stopped, or something it needs is gone
+enum : uint8_t {
+    SAFETY_STATUS_SAFE     = 0,
+    SAFETY_STATUS_DEGRADED = 1,
+    SAFETY_STATUS_FAULT    = 2,
+    SAFETY_STATUS_MAX      = SAFETY_STATUS_FAULT,
+};
+
+// NEW (Task 6 E1): which fault bits are FAULT level and which are DEGRADED.
+// A bit in neither list counts as FAULT, so a new bit is never under-reported.
+static const uint16_t FAULT_LEVEL_BITS =
+    FAULT_OVER_CURRENT | FAULT_ESTOP_ACTIVE | FAULT_C2_LINK_LOST;
+static const uint16_t DEGRADED_LEVEL_BITS =
+    FAULT_COMM_TIMEOUT | FAULT_ENCODER_FAULT | FAULT_UNDERVOLTAGE |
+    FAULT_FIRMWARE_FAULT | FAULT_PROTOCOL_ERROR | FAULT_SEQ_GAP |
+    FAULT_CRC_ERROR | FAULT_CMD_SOURCE | FAULT_STALE_FEEDBACK |
+    FAULT_STEERING_FAULT;
+
+uint8_t     faultWordStatus(uint16_t faults);
+const char* safetyStatusName(uint8_t status);
 enum : uint8_t {
     LINK_OK           = 0,
     LINK_DEGRADED     = 1,
@@ -173,6 +197,21 @@ struct TelemetryFeedback {
     uint8_t  flags;
 };
 
+// NEW (Task 6 E2): the TELEM_SAFETY frame. Bytes 4-5 are reserved and must be 0.
+struct TelemetrySafety {
+    uint8_t  status;         // SAFETY_STATUS_*
+    uint8_t  flags;          // SAFETY_FLAG_*
+    uint16_t jetson_age_ms;  // ms since the last frame from the Jetson
+};
+
+enum : uint8_t {
+    SAFETY_FLAG_STOP          = 0x01,  // the operator's STOP is in effect
+    SAFETY_FLAG_ESTOP_ACTIVE  = 0x02,  // the E-stop input reads pressed
+    SAFETY_FLAG_ESTOP_LATCHED = 0x04,  // E-stop seen, not yet cleared by SAFE
+    SAFETY_FLAG_FAULT_HELD    = 0x08,  // FAULT kept from a problem that has cleared
+    SAFETY_FLAGS_MASK         = 0x0F,
+};
+
 enum DecodeResult : uint8_t {
     DECODE_OK = 0,
     DECODE_BAD_DLC,
@@ -226,6 +265,10 @@ DecodeResult decodeTelemetryCmdEcho(uint32_t can_id, const uint8_t* buf, uint8_t
 uint8_t      encodeTelemetryFeedback(const TelemetryFeedback& msg, uint8_t seq, uint8_t* buf);
 DecodeResult decodeTelemetryFeedback(uint32_t can_id, const uint8_t* buf, uint8_t len,
                                      TelemetryFeedback& out, uint8_t& seq_out);
+
+uint8_t      encodeTelemetrySafety(const TelemetrySafety& msg, uint8_t seq, uint8_t* buf);
+DecodeResult decodeTelemetrySafety(uint32_t can_id, const uint8_t* buf, uint8_t len,
+                                   TelemetrySafety& out, uint8_t& seq_out);
 }
 
 #endif

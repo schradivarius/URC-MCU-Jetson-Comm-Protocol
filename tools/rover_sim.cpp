@@ -143,6 +143,10 @@ int main(int argc, char** argv) {
             TelemetryFeedback fb = ctl.buildFeedback();
             emitFrame(CAN_ID_TELEM_FEEDBACK, buf, encodeTelemetryFeedback(fb, seq, buf));
 
+            // NEW (Task 6 E2): same as the firmware's seventh frame.
+            TelemetrySafety sf = ctl.buildSafety(hw_faults);
+            emitFrame(CAN_ID_TELEM_SAFETY, buf, encodeTelemetrySafety(sf, seq, buf));
+
             if (verbose) {
                 std::fprintf(stderr,
                              "drive: %-12s ack=%3u cmd=(%+5d,%+5d) "
