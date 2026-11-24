@@ -4,7 +4,7 @@
 #include <stdint.h>
 
 namespace rover {
-static const uint8_t PROTOCOL_VERSION = 9;
+static const uint8_t PROTOCOL_VERSION = 10;
 
 static const uint32_t SERIAL_BAUD_HZ = 115200;
 
@@ -22,6 +22,7 @@ enum : uint32_t {
     CAN_ID_TELEM_STATE    = 0x203,
     CAN_ID_TELEM_CMD_ECHO = 0x204,
     CAN_ID_TELEM_FEEDBACK = 0x205,
+    CAN_ID_TELEM_SAFETY   = 0x206,  // NEW (Task 6 E): overall safety status
 };
 
 enum : uint8_t {
@@ -45,6 +46,17 @@ static const int16_t UNDERVOLTAGE_CV = 2000;
 
 static const uint32_t FEEDBACK_STALE_MS = 150;
 static const uint32_t ESTOP_DEBOUNCE_MS = 15;
+
+// NEW (Task 6 E): base-station link lost while AUTONOMOUS. The rover keeps
+// driving either way; this only decides what the safety status reports.
+// WAITING ON SYSTEMS (follow-up 2). The default follows their answer as given.
+//   HOLD_UNTIL_SAFE  status stays FAULT until the operator commands SAFE
+//   CLEAR_WITH_LINK  status is FAULT only while the link is down
+enum : uint8_t {
+    C2_FAULT_HOLD_UNTIL_SAFE = 0,
+    C2_FAULT_CLEAR_WITH_LINK = 1,
+};
+static const uint8_t C2_AUTONOMY_FAULT_POLICY = C2_FAULT_HOLD_UNTIL_SAFE;
 
 static const uint16_t PWM_NEUTRAL_US = 1500;
 static const uint16_t PWM_SPAN_US    = 500;

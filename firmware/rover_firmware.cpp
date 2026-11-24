@@ -171,6 +171,11 @@ static void sendTelemetry(const SensorReading& s) {
 
     TelemetryFeedback fb = ctl->buildFeedback();
     linkSend(CAN_ID_TELEM_FEEDBACK, buf, encodeTelemetryFeedback(fb, seq, buf));
+
+    // NEW (Task 6 E2): the safety status, from the same fault bits as POWER.
+    TelemetrySafety sf =
+        ctl->buildSafety(s.fault_bits, g_boot_faults);
+    linkSend(CAN_ID_TELEM_SAFETY, buf, encodeTelemetrySafety(sf, seq, buf));
 }
 
 void setup() {

@@ -9,7 +9,7 @@ jetson_test.py -- Jetson-side test harness for the rover serial link.
     python3 host/jetson_test.py --port /dev/ttyACM0
 
 Sends CONTROL at 20 Hz with an incrementing sequence number, and reassembles
-the six telemetry frames into coherent snapshots.
+the seven telemetry frames into coherent snapshots.
 
 Declares the LINK down if no telemetry has arrived within LINK_TIMEOUT_S --
 separate from, and no substitute for, the controller's own command-age

@@ -181,10 +181,12 @@ class TestFrameAgreement(GoldenBase):
         if kind == "FEEDBACK":
             return p.encode_telemetry_feedback(n[0], n[1], n[2], n[3],
                                                seq=n[4])
+        if kind == "SAFETY":
+            return p.encode_telemetry_safety(n[0], n[1], n[2], seq=n[3])
         self.fail("unknown vector kind %r" % kind)
 
     FRAME_KINDS = ("CONTROL", "DRIVE_L", "DRIVE_R", "POWER", "STATE",
-                   "CMD_ECHO", "FEEDBACK")
+                   "CMD_ECHO", "FEEDBACK", "SAFETY")
 
     def test_every_frame_encodes_identically(self):
         checked = 0
@@ -208,6 +210,7 @@ class TestFrameAgreement(GoldenBase):
             "STATE":   lambda f: p.decode_telemetry_state(f),
             "CMD_ECHO": lambda f: p.decode_telemetry_cmd_echo(f),
             "FEEDBACK": lambda f: p.decode_telemetry_feedback(f),
+            "SAFETY": lambda f: p.decode_telemetry_safety(f),
         }
         for kind in self.FRAME_KINDS:
             for _, args, frame_hex in self.rowsOf(kind):
@@ -216,6 +219,41 @@ class TestFrameAgreement(GoldenBase):
                                  "Python rejected a valid C++ %s frame (%s): %s"
                                  % (kind, args, p.DECODE_NAMES[result]))
                 self.assertIsNotNone(decoded)
+
+    # NEW (Task 6 E2): every field of the safety frame survives C++ -> Python.
+    def test_the_safety_frame_unpacks_to_what_cpp_packed(self):
+        statuses = set()
+        for _, args, frame_hex in self.rowsOf("SAFETY"):
+            n = [int(a) for a in args.split(",")]
+            _, decoded = p.decode_telemetry_safety(bytes.fromhex(frame_hex))
+            self.assertEqual(decoded["safety_status"], n[0])
+            self.assertEqual(decoded["safety_flags"], n[1])
+            self.assertEqual(decoded["jetson_age_ms"], n[2])
+            self.assertEqual(decoded["seq"], n[3])
+            self.assertEqual(decoded["stop_active"], bool(n[1] & p.SAFETY_FLAG_STOP))
+            self.assertEqual(decoded["fault_held"], bool(n[1] & p.SAFETY_FLAG_FAULT_HELD))
+            statuses.add(n[0])
+        self.assertEqual(statuses, set(p.SAFETY_STATUS_NAMES),
+                         "the vectors should cover every status")
+
+    # NEW (Task 6 E1): both languages sort every fault word the same way.
+    def test_the_fault_bit_sorting_agrees_with_cpp(self):
+        self.assertEqual(p.FAULT_LEVEL_BITS & p.DEGRADED_LEVEL_BITS, 0)
+        for bit in range(16):
+            mask = 1 << bit
+            expected = (p.SAFETY_STATUS_DEGRADED if mask & p.DEGRADED_LEVEL_BITS
+                        else p.SAFETY_STATUS_FAULT)
+            self.assertEqual(p.fault_word_status(mask), expected, hex(mask))
+
+    def test_a_safety_frame_with_an_unknown_status_is_rejected(self):
+        frame = p._seal(p.CAN_ID_TELEM_SAFETY, bytes((3, 0, 0, 0, 0, 0)), 0)
+        self.assertEqual(p.decode_telemetry_safety(frame)[0], p.DECODE_BAD_RANGE)
+
+    def test_a_safety_frame_with_reserved_bits_set_is_rejected(self):
+        for payload in ((0, 0x10, 0, 0, 0, 0), (0, 0, 0, 0, 1, 0), (0, 0, 0, 0, 0, 1)):
+            frame = p._seal(p.CAN_ID_TELEM_SAFETY, bytes(payload), 0)
+            self.assertEqual(p.decode_telemetry_safety(frame)[0], p.DECODE_BAD_FLAGS,
+                             payload)
 
     def test_the_feedback_frame_unpacks_to_what_cpp_packed(self):
         sources, flagsets = set(), set()

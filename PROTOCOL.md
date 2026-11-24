@@ -1,4 +1,4 @@
-# Rover Onboard Computer ↔ Embedded Controller Protocol (v0.9)
+# Rover Onboard Computer ↔ Embedded Controller Protocol (v0.10)
 
 **Scope:** Onboard computer (Jetson Orin Nano, candidate) ↔ embedded controller
 (**Teensy 4.1**, NXP i.MX RT1062, C++ / Teensyduino), over **USB serial (UART)**.
@@ -135,6 +135,21 @@
 > a whole byte with 252 values spare — so v0.9 adds no frame and changes no
 > field width. `PROTOCOL_VERSION` is 9.
 >
+> **v0.10 — one status the base station can read at a glance.** Task 6 Group E.
+> Every problem the rover detects is sorted into Systems' three levels:
+>
+> * **SAFE** — nothing is wrong. This is a status, not the `SAFE` mode: a
+>   healthy rover driving in `TELEOP` reports mode `TELEOP`, status `SAFE`.
+> * **DEGRADED** — something is off but the rover still works. Clears by itself.
+> * **FAULT** — the rover is stopped, or something it needs is gone. Stays until
+>   the operator commands `SAFE`.
+>
+> The status rides in a new seventh frame, `TELEM_SAFETY` (`0x206`, §3.8),
+> together with the STOP and E-stop state and how long ago the Jetson was last
+> heard. That completes Task 6 E2's list. Telemetry is therefore **seven
+> frames** per cycle. The status only reports: it never changes what the rover
+> does. `PROTOCOL_VERSION` is 10.
+>
 > Full field tables with types, units, ranges, meanings and update rates are in
 > section 3.
 
@@ -158,11 +173,12 @@
 | Framing | SLIP (RFC 1055) around `id_low, id_high, <8 frame bytes>` (§2.3) |
 | Frame format | 11-bit message identifiers, **every frame 8 bytes** |
 | CONTROL rate | 20 Hz (1 frame per cycle) |
-| TELEMETRY rate | 20 Hz (6 frames per cycle = 120 frames/s) |
+| TELEMETRY rate | 20 Hz (7 frames per cycle = 140 frames/s) |
 | Byte order | Little-endian, written byte-by-byte (not struct-punned) |
 
-A framed message is at most 22 bytes on the wire, so seven per cycle is under
-3,100 bytes/s, far below what the link carries.
+A framed message is at most 22 bytes on the wire, so eight per cycle (one
+`CONTROL`, seven telemetry) is about 3,520 bytes/s, far below what the link
+carries.
 
 ### 2.1 Identifiers
 
@@ -180,6 +196,7 @@ still seed the CRC (§4.1).
 | **`0x203`** | `TELEM_STATE` | controller → Jetson | 8 | 20 Hz |
 | **`0x204`** | `TELEM_CMD_ECHO` | controller → Jetson | 8 | 20 Hz |
 | **`0x205`** | `TELEM_FEEDBACK` | controller → Jetson | 8 | 20 Hz |
+| **`0x206`** | `TELEM_SAFETY` *(v0.10)* | controller → Jetson | 8 | 20 Hz |
 
 ### 2.2 Frame envelope
 
@@ -197,12 +214,12 @@ Every frame, both directions, has the same shape:
 | `seq` | uint8 | frames | 0–255, **wraps** | Increments once per transmitted cycle. Receiver uses the delta: 1 healthy, 0 duplicate, >1 frames lost. |
 | `crc8` | uint8 | — | 0–255 | CRC-8/SAE-J1850 over the message id then bytes 0–6. See section 4. |
 
-**Why six 8-byte telemetry frames.** The 8-byte size is inherited from
-Classic CAN. Serial has no such limit, and collapsing the six frames into one
+**Why seven 8-byte telemetry frames.** The 8-byte size is inherited from
+Classic CAN. Serial has no such limit, and collapsing the seven frames into one
 packet is planned as the next protocol revision.
 
-**Snapshot tearing.** All six telemetry frames of one cycle carry the **same
-`seq`**. The Jetson therefore knows whether the six frames it holds came from
+**Snapshot tearing.** All seven telemetry frames of one cycle carry the **same
+`seq`**. The Jetson therefore knows whether the seven frames it holds came from
 one cycle or straddle two, and can discard or flag a torn snapshot instead of
 silently mixing a fresh encoder reading with a stale fault word.
 `host/jetson_test.py` counts torn snapshots; a clean link produces zero.
@@ -257,12 +274,12 @@ Nothing in either direction is "to be added later".
 | command source (Task 4) | `flags` bit 7 | bool |
 | checksum / CRC | `CONTROL` byte 7 | uint8 CRC-8 |
 
-**MCU → Jetson telemetry packet** — one logical packet, sent as six frames of
-a shared cycle (§2.2, §3.2–3.7):
+**MCU → Jetson telemetry packet** — one logical packet, sent as seven frames of
+a shared cycle (§2.2, §3.2–3.8):
 
 | Required field | Where | Type |
 |---|---|---|
-| sequence number | byte 6 of all six frames | uint8 |
+| sequence number | byte 6 of all seven frames | uint8 |
 | encoder values | `TELEM_DRIVE_L` / `_R` bytes 0–3 | int32 ×2 |
 | steering feedback | `TELEM_DRIVE_L` bytes 4–5 | int16 |
 | current status | `TELEM_POWER` bytes 0–1 | int16 |
@@ -282,7 +299,10 @@ a shared cycle (§2.2, §3.2–3.7):
 | encoder feedback age (Task 5) | `TELEM_FEEDBACK` bytes 0–1 | uint16 |
 | steering feedback age (Task 5) | `TELEM_FEEDBACK` bytes 2–3 | uint16 |
 | stale / invalid feedback (Task 5) | `TELEM_FEEDBACK` byte 5 | uint8 bitfield |
-| checksum / CRC | byte 7 of all six frames | uint8 CRC-8 |
+| overall safety status (Task 6 E) | `TELEM_SAFETY` byte 0 | uint8 enum |
+| STOP and E-stop state (Task 6 E) | `TELEM_SAFETY` byte 1 | uint8 bitfield |
+| Jetson heartbeat age (Task 6 E) | `TELEM_SAFETY` bytes 2–3 | uint16 |
+| checksum / CRC | byte 7 of all seven frames | uint8 CRC-8 |
 
 Task 4's feedback loop asks for six fields by name. Five were already here —
 current mode, controller health, command age and fault state, plus the
@@ -1112,6 +1132,82 @@ CRC — and the only unclaimed byte in the whole set is `TELEM_STATE` byte 5,
 which cannot hold a source and two 16-bit ages. §2.1's priority ordering puts
 `0x205` last, which is right: it is the least urgent frame in the cycle.
 
+### 3.8 `TELEM_SAFETY` — `0x206`, DLC 8, 20 Hz *(v0.10)*
+
+The rover's overall safety status in one byte, in Systems' SAFE / DEGRADED /
+FAULT model, plus the STOP and E-stop state and how long ago the Jetson was
+last heard. Task 6 Group E.
+
+| Byte | Field | Type | Values | Meaning |
+|---|---|---|---|---|
+| 0 | `status` | uint8 | 0–2 | `0=SAFE` nothing is wrong, `1=DEGRADED` something is off but the rover still works, `2=FAULT` the rover is stopped or something it needs is gone. **3–255 reject the frame.** |
+| 1 | `flags` | uint8 | bits 0–3 | bit 0 `STOP`: the operator's STOP is in effect (also before the first command). bit 1 `ESTOP_ACTIVE`: the E-stop sense line reads pressed. bit 2 `ESTOP_LATCHED`: an E-stop was seen and not yet cleared by `SAFE`. bit 3 `FAULT_HELD`: the status is `FAULT` only because of a problem that has since cleared; send `SAFE`. Bits 4–7 are reserved and must be 0. |
+| 2–3 | `jetson_age_ms` | uint16 | 0…65534, `0xFFFF` = never | ms since the last frame from the Jetson, with the same reserved values as `cmd_age_ms`. Today it runs on the same clock as `cmd_age_ms`. It is its own field so the two can split later (Group A separates "the Jetson is talking" from "it sent a valid command") without changing this frame. |
+| 4–5 | reserved | — | 0 | Must be 0. Anything else rejects the frame. |
+
+**How the status is decided.** One function, `RoverController::safetyStatus()`,
+checks from worst to mildest, so the worst condition wins:
+
+| Condition | Status |
+|---|---|
+| Active mode `FAULT` or `ESTOP`: stopped by a fault, or by the E-stop | FAULT |
+| No Jetson connection (`jetson_link` = `LOST`), in any mode, including just after power-on | FAULT |
+| Over-current, or the drive stage reports `FAULT`, in any mode | FAULT |
+| Base-station link lost, in any mode, or a C2 loss held from `AUTONOMOUS` (below) | FAULT |
+| Any other fault bit: stale or impossible feedback, low battery, damaged or malformed frames, lost frames, a wrong-source command, a watchdog restart | DEGRADED |
+| `jetson_link` = `DEGRADED`, or the drive stage reports `DEGRADED` | DEGRADED |
+| None of the above | SAFE |
+
+The fault bits are sorted by `FAULT_LEVEL_BITS` and `DEGRADED_LEVEL_BITS` in
+`rover_protocol.h`. A bit in neither list counts as `FAULT`, so a new bit is
+never under-reported, and the test `every_named_fault_bit_has_a_level` fails
+until someone gives it a level. Each row above is also a row of the
+`STATUS_RULES` table in `tests/cpp/test_controller.cpp` (the `status:` lines in
+`make test-cpp`).
+
+**Clearing (Systems).** `DEGRADED` clears by itself when the problem goes away.
+`FAULT` stays until the operator commands `SAFE`; if the rover is already in
+`SAFE`, it clears when the problem does. Most `FAULT` causes already latch the
+`FAULT` or `ESTOP` mode, so they stay without anything new. The one that does
+not is a base-station link lost while `AUTONOMOUS`, where the rover is built to
+keep driving.
+
+**Base-station link lost while `AUTONOMOUS` — pending Systems.**
+`C2_AUTONOMY_FAULT_POLICY` in `rover_config.h`:
+
+| Policy | Status after the link comes back |
+|---|---|
+| `C2_FAULT_HOLD_UNTIL_SAFE` *(current: Systems' answer as given)* | stays `FAULT`, with `FAULT_HELD` set, until the operator commands `SAFE` |
+| `C2_FAULT_CLEAR_WITH_LINK` | back to `SAFE` (or whatever else applies) |
+
+Either way the rover keeps driving: the status reports, it never stops the
+rover (`the_status_does_not_change_what_the_rover_does`). Under the current
+policy, one radio dropout leaves the status at `FAULT` for the rest of an
+autonomous run, because the only way to clear it, `SAFE`, also ends the run.
+That trade-off is the open question for Systems.
+
+**The E-stop.** Systems: pressing the E-stop cuts all power, the Teensy
+included, so in practice the base station sees every frame stop. The
+`ESTOP_ACTIVE` and `ESTOP_LATCHED` flags can only show while the Teensy still
+has power, which is the case Group C's sense line covers (§5.5).
+
+**Task 6 E2 checklist.** Where each item E2 asks for is reported (new in bold):
+
+| Task 6 E2 item | Where |
+|---|---|
+| current operating mode | `TELEM_STATE.mode` |
+| active command source | `TELEM_FEEDBACK.cmd_source` |
+| commanded drive / steering | `TELEM_CMD_ECHO.drive_applied` / `steer_applied` |
+| measured drive / encoder feedback | `TELEM_DRIVE_L.enc_left`, `TELEM_DRIVE_R.enc_right` |
+| measured steering | `TELEM_DRIVE_L.steer_fb` |
+| command age | `TELEM_DRIVE_R.cmd_age_ms` |
+| Jetson heartbeat age / status | **`TELEM_SAFETY.jetson_age_ms`** / `TELEM_STATE.jetson_link` |
+| encoder age / steering age | `TELEM_FEEDBACK.encoder_age_ms` / `steer_age_ms` |
+| STOP state | **`TELEM_SAFETY.flags` bit 0** |
+| E-stop state | `TELEM_STATE.mode` = `ESTOP` and **`TELEM_SAFETY.flags` bits 1–2**; every frame stops when power is cut |
+| warning / fault flags | `TELEM_POWER.fault_status` |
+| current safe / degraded / fault status | **`TELEM_SAFETY.status`** |
+
 ## 4. Integrity
 
 | Concern | Provided by |
@@ -1394,7 +1490,7 @@ in `rover_protocol.h` beside the structs they describe.
 | Constant | Value | Notes |
 |---|---|---|
 | `CONTROL` rate | 20 Hz | 1 frame per cycle (`CONTROL_RATE_HZ`, Jetson side) |
-| `TELEMETRY` rate | 20 Hz | 6 frames per cycle |
+| `TELEMETRY` rate | 20 Hz | 7 frames per cycle |
 | `WATCHDOG_TIMEOUT_MS` | 300 | 6× the control period. `DEFAULT_WATCHDOG_TIMEOUT_MS` in C++ |
 | `TELEMETRY_PERIOD_MS` | 50 | `DEFAULT_TELEMETRY_PERIOD_MS` in C++ |
 | `LINK_DEGRADED_HOLD_MS` | 1000 | How long a gap or CRC error keeps the link `DEGRADED` |
@@ -1413,7 +1509,7 @@ converged, a single radio hiccup would start stopping the rover in `TELEOP`.
 
 | Constant | Value | Notes |
 |---|---|---|
-| `PROTOCOL_VERSION` | 9 | Bump when a message's layout or meaning changes. Not sent on the wire; DLC and the CRC are the runtime mismatch signals, plus *which ids arrive* (§2.2) |
+| `PROTOCOL_VERSION` | 10 | Bump when a message's layout or meaning changes. Not sent on the wire; DLC and the CRC are the runtime mismatch signals, plus *which ids arrive* (§2.2) |
 | `SERIAL_BAUD_HZ` | 115200 | Host and firmware must match; ignored by native USB |
 | `CAN_ID_*` | `0x100`, `0x200`–`0x204` | §2.1 |
 | `FRAME_DLC`, `FRAME_PAYLOAD` | 8, 6 | Plus `FRAME_SEQ_OFFSET` 6 and `FRAME_CRC_OFFSET` 7 |
@@ -1424,6 +1520,7 @@ converged, a single radio hiccup would start stopping the rover in `TELEOP`.
 | `UNDERVOLTAGE_CV` | 2000 | 20.00 V, placeholder (C++ only) |
 | `PWM_NEUTRAL_US` | 1500 | Servo/ESC neutral pulse width (§5.4) |
 | `PWM_SPAN_US` | 500 | Full scale either side of neutral, so `CMD_MIN..CMD_MAX` maps onto 1000–2000 µs |
+| `C2_AUTONOMY_FAULT_POLICY` | `C2_FAULT_HOLD_UNTIL_SAFE` | **v0.10, pending Systems.** Whether the safety status stays `FAULT` after a base-station link lost in `AUTONOMOUS` comes back (§3.8). Reporting only (C++ only) |
 
 ## 7. Demonstration and tests — no hardware required
 

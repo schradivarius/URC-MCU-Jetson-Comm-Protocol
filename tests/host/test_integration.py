@@ -11,6 +11,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 sys.path.insert(0, os.path.join(REPO, "host"))
 
 import sim_link  # noqa: E402
+import rover_config as cfg  # noqa: E402
 import rover_protocol as rp  # noqa: E402
 from jetson_test import JetsonLink  # noqa: E402
 
@@ -126,6 +127,50 @@ class TestSnapshotAssembly(RoverFixture):
         self.drive(0.6, mode=rp.MODE_TELEOP, from_autonomy=True)
         self.assertEqual(self.snap()["cmd_source"], rp.CMD_SOURCE_NONE)
         self.assertEqual(self.snap()["cmd_status"], rp.CMD_STATUS_WRONG_SOURCE)
+
+
+# NEW (Task 6 E): the seventh frame reaches the Jetson and says the right thing.
+class TestSafetyStatus(RoverFixture):
+    def test_a_healthy_driving_rover_reports_safe(self):
+        self.drive(0.6)
+        s = self.snap()
+        self.assertEqual(s["safety_status"], rp.SAFETY_STATUS_SAFE)
+        self.assertFalse(s["stop_active"])
+        self.assertLess(s["jetson_age_ms"], 200)
+
+    def test_a_silent_jetson_reports_fault_and_its_age_keeps_growing(self):
+        self.drive(0.6)
+        self.drive(0.5, send=False)
+        first = self.snap()
+        self.assertEqual(first["safety_status"], rp.SAFETY_STATUS_FAULT)
+        self.assertGreaterEqual(first["jetson_age_ms"], cfg.WATCHDOG_TIMEOUT_MS)
+        self.drive(0.3, send=False)
+        self.assertGreater(self.snap()["jetson_age_ms"], first["jetson_age_ms"])
+
+    def test_the_fault_stays_until_the_operator_commands_safe(self):
+        self.drive(0.6)
+        self.drive(0.5, send=False)
+        self.drive(0.4)
+        self.assertEqual(self.snap()["safety_status"], rp.SAFETY_STATUS_FAULT,
+                         "the Jetson came back, but nobody commanded SAFE yet")
+        self.drive(0.4, mode=rp.MODE_SAFE, drive_cmd=0, steer_cmd=0)
+        self.assertEqual(self.snap()["safety_status"], rp.SAFETY_STATUS_SAFE)
+
+    def test_stop_is_reported(self):
+        self.drive(0.4)
+        self.drive(0.4, stop=True)
+        self.assertTrue(self.snap()["stop_active"])
+        self.assertTrue(self.snap()["safety_flags"] & rp.SAFETY_FLAG_STOP)
+
+    def test_c2_loss_in_autonomy_is_a_fault_while_the_rover_keeps_driving(self):
+        self.drive(0.6, mode=rp.MODE_AUTONOMOUS, drive_cmd=600, steer_cmd=0)
+        moving = self.snap()["enc_left"]
+        self.drive(0.5, mode=rp.MODE_AUTONOMOUS, drive_cmd=600, steer_cmd=0,
+                   c2_lost=True)
+        s = self.snap()
+        self.assertEqual(s["safety_status"], rp.SAFETY_STATUS_FAULT)
+        self.assertEqual(s["mode"], rp.MODE_AUTONOMOUS)
+        self.assertGreater(s["enc_left"], moving, "a status change stopped the rover")
 
 
 class TestEndToEnd(RoverFixture):

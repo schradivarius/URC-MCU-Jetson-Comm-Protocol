@@ -383,4 +383,46 @@ DecodeResult decodeTelemetryFeedback(uint32_t can_id, const uint8_t* buf, uint8_
     out.flags          = static_cast<uint8_t>(buf[5] & FB_FLAGS_MASK);
     return DECODE_OK;
 }
+
+// NEW (Task 6 E1): the worst level among the bits that are set.
+uint8_t faultWordStatus(uint16_t faults) {
+    const uint16_t not_degraded = static_cast<uint16_t>(faults & ~DEGRADED_LEVEL_BITS);
+    if (not_degraded != 0) return SAFETY_STATUS_FAULT;
+    if (faults != 0)       return SAFETY_STATUS_DEGRADED;
+    return SAFETY_STATUS_SAFE;
+}
+
+const char* safetyStatusName(uint8_t status) {
+    switch (status) {
+        case SAFETY_STATUS_SAFE:     return "SAFE";
+        case SAFETY_STATUS_DEGRADED: return "DEGRADED";
+        case SAFETY_STATUS_FAULT:    return "FAULT";
+    }
+    return "UNKNOWN";
+}
+
+// NEW (Task 6 E2): TELEM_SAFETY, bytes 0 status, 1 flags, 2-3 Jetson age.
+uint8_t encodeTelemetrySafety(const TelemetrySafety& msg, uint8_t seq, uint8_t* buf) {
+    buf[0] = msg.status;
+    buf[1] = static_cast<uint8_t>(msg.flags & SAFETY_FLAGS_MASK);
+    putU16(buf + 2, msg.jetson_age_ms);
+    buf[4] = 0;
+    buf[5] = 0;
+    return sealFrame(CAN_ID_TELEM_SAFETY, seq, buf);
+}
+
+// Rejects values this protocol version can't mean, like gate 2 does for commands.
+DecodeResult decodeTelemetrySafety(uint32_t can_id, const uint8_t* buf, uint8_t len,
+                                   TelemetrySafety& out, uint8_t& seq_out) {
+    DecodeResult r = openFrame(can_id, buf, len, seq_out);
+    if (r != DECODE_OK) return r;
+    if (buf[0] > SAFETY_STATUS_MAX) return DECODE_BAD_RANGE;
+    if ((buf[1] & ~SAFETY_FLAGS_MASK) != 0 || buf[4] != 0 || buf[5] != 0) {
+        return DECODE_BAD_FLAGS;
+    }
+    out.status        = buf[0];
+    out.flags         = buf[1];
+    out.jetson_age_ms = getU16(buf + 2);
+    return DECODE_OK;
+}
 }

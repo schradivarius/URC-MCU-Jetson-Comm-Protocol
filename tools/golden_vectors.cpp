@@ -204,5 +204,25 @@ int main() {
                       f.enc_age, f.steer_age, f.src, f.flags, f.seq);
         emitHex("FEEDBACK", args, buf, n);
     }
+
+    // NEW (Task 6 E2): the safety frame, every status and flag at least once.
+    struct SF { uint8_t status, flags; uint16_t age; uint8_t seq; };
+    const SF sfs[] = {
+        {SAFETY_STATUS_SAFE,     0,                          0,               0},
+        {SAFETY_STATUS_SAFE,     SAFETY_FLAG_STOP,           25,              41},
+        {SAFETY_STATUS_DEGRADED, 0,                          310,             42},
+        {SAFETY_STATUS_FAULT,    SAFETY_FLAG_ESTOP_ACTIVE | SAFETY_FLAG_ESTOP_LATCHED,
+                                                             CMD_AGE_UNKNOWN, 43},
+        {SAFETY_STATUS_FAULT,    SAFETY_FLAG_FAULT_HELD,     CMD_AGE_MAX,     44},
+        {SAFETY_STATUS_FAULT,    SAFETY_FLAGS_MASK,          1000,            255},
+    };
+    for (const SF& f : sfs) {
+        TelemetrySafety m;
+        m.status = f.status; m.flags = f.flags; m.jetson_age_ms = f.age;
+        uint8_t n = encodeTelemetrySafety(m, f.seq, buf);
+        std::snprintf(args, sizeof(args), "%u,%u,%u,%u",
+                      f.status, f.flags, f.age, f.seq);
+        emitHex("SAFETY", args, buf, n);
+    }
     return 0;
 }

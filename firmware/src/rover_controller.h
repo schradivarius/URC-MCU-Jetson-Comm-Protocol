@@ -20,6 +20,19 @@ public:
     bool estopActive() const {return estop_active_;}
     bool estopLatched() const {return estop_latched_;}
 
+    // NEW (Task 6 E1): the rover's overall safety status (SAFETY_STATUS_*).
+    // Give it the same fault bits as buildPower(), so both report the same.
+    uint8_t  safetyStatus(uint16_t sensor_faults = 0, uint16_t extra_faults = 0) const;
+
+    // NEW (Task 6 E2): the other things the TELEM_SAFETY frame reports.
+    uint16_t jetsonAgeMs() const;
+    bool     stopActive() const { return last_control_.stop; }
+    bool     faultHeld() const;
+
+    // NEW: picks a C2_FAULT_* policy; the default comes from rover_config.h.
+    // Used by tests, and for switching once Systems answers.
+    void     setC2AutonomyFaultPolicy(uint8_t policy) { c2_fault_policy_ = policy; }
+
     void updateFeedback(uint32_t encoder_update_ms, bool encoder_sane,
                         uint32_t steer_update_ms,  bool steer_sane);
 
@@ -68,6 +81,9 @@ public:
     TelemetryCmdEcho buildCmdEcho(int16_t drive_applied, int16_t steer_applied) const;
 
     TelemetryFeedback buildFeedback() const;
+
+    // NEW (Task 6 E2): the seventh telemetry frame.
+    TelemetrySafety buildSafety(uint16_t sensor_faults = 0, uint16_t extra_faults = 0) const;
 
     uint16_t faultWord(uint16_t sensor_faults = 0, uint16_t extra_faults = 0) const;
 
@@ -152,6 +168,9 @@ private:
     uint32_t   steer_update_ms_;
     bool       encoder_sane_;
     bool       steer_sane_;
+
+    uint8_t    c2_fault_policy_;  // NEW (Task 6 E)
+    bool       c2_fault_held_;    // NEW: C2 lost while AUTONOMOUS, kept until SAFE
 };
 }
 

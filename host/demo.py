@@ -18,10 +18,12 @@ def line(jl, t0):
     faults = ",".join(rp.fault_names(s["fault_status"])) or "none"
     age = s["cmd_age_ms"]
     age_txt = "never" if age == rp.CMD_AGE_UNKNOWN else "%dms" % age
+    # CHANGED (Task 6 E2): also shows the overall safety status.
     return ("  t=%5.2fs  seq=%3d  enc=%+8d  %+7.2fA %6.2fV  mode=%-10s "
-            "jet=%-8s c2=%-12s ind=%-10s age=%-7s faults=%s"
+            "status=%-8s jet=%-8s c2=%-12s ind=%-10s age=%-7s faults=%s"
             % (time.monotonic() - t0, s["seq"], s["enc_left"], s["current_a"],
                s["voltage_v"], rp.MODE_NAMES.get(s["mode"], "?"),
+               rp.SAFETY_STATUS_NAMES.get(s["safety_status"], "?"),
                rp.LINK_NAMES.get(s["jetson_link"], "?"),
                rp.LINK_NAMES.get(s["c2_link"], "?"),
                rp.INDICATOR_NAMES.get(s["indicator_state"], "?"),
@@ -128,7 +130,7 @@ def main():
         assert jl.tele.complete_count > 10, "too few complete snapshots"
         assert jl.unknown_frames == 0, "unexpected CAN id seen"
         print()
-        print("PASS: snapshots reassembled from six frames throughout; the")
+        print("PASS: snapshots reassembled from seven frames throughout; the")
         print("watchdog, stop flag and autonomy abort each forced a stop; C2")
         print("loss stopped a teleoperated rover but not an autonomous one; the")
         print("application-layer CRC rejected a corrupted frame; and a")

@@ -49,6 +49,13 @@ class InjectionFixture(unittest.TestCase):
             time.sleep(0.02)
         jl.poll()
 
+    # NEW (Task 6 E1): the overall safety status the Jetson reads.
+    def assertStatus(self, snap, expected, why):
+        self.assertEqual(snap["safety_status"], expected,
+                         "%s: status %s, expected %s"
+                         % (why, rp.SAFETY_STATUS_NAMES.get(snap["safety_status"]),
+                            rp.SAFETY_STATUS_NAMES[expected]))
+
     def assertStillDriving(self, snap, why):
         self.assertEqual(snap["mode"], rp.MODE_TELEOP, why)
         self.assertNotEqual(snap["drive_applied"], 0, why)
@@ -67,6 +74,7 @@ class TestHealthyBaseline(InjectionFixture):
         self.assertLess(snap["encoder_age_ms"], rp.FEEDBACK_STALE_MS)
         self.assertLess(snap["steer_age_ms"], rp.FEEDBACK_STALE_MS)
         self.assertStillDriving(snap, "a healthy plant stopped the rover")
+        self.assertStatus(snap, rp.SAFETY_STATUS_SAFE, "a healthy plant")
 
 
 class TestEncoderStopsUpdating(InjectionFixture):
@@ -81,6 +89,7 @@ class TestEncoderStopsUpdating(InjectionFixture):
         self.assertFalse(snap["steer_stale"])
         self.assertLess(snap["steer_age_ms"], rp.FEEDBACK_STALE_MS)
         self.assertStillDriving(snap, "a frozen encoder stopped the rover")
+        self.assertStatus(snap, rp.SAFETY_STATUS_DEGRADED, "a frozen encoder")
 
 
 class TestSteeringStopsUpdating(InjectionFixture):
@@ -95,6 +104,7 @@ class TestSteeringStopsUpdating(InjectionFixture):
         self.assertFalse(snap["encoder_stale"])
         self.assertNotEqual(snap["steer_fb"], STEER)
         self.assertStillDriving(snap, "frozen steering stopped the rover")
+        self.assertStatus(snap, rp.SAFETY_STATUS_DEGRADED, "frozen steering")
 
 
 class TestImpossibleValues(InjectionFixture):
@@ -107,6 +117,7 @@ class TestImpossibleValues(InjectionFixture):
         self.assertLess(snap["encoder_age_ms"], rp.FEEDBACK_STALE_MS)
         self.assertEqual(snap["fault_status"] & rp.FAULT_STALE_FEEDBACK, 0)
         self.assertStillDriving(snap, "an impossible encoder value stopped the rover")
+        self.assertStatus(snap, rp.SAFETY_STATUS_DEGRADED, "an impossible encoder value")
 
     def test_an_impossible_steering_value_is_reported_as_invalid(self):
         snap = self.snapshot_with("steer-impossible")
@@ -117,6 +128,7 @@ class TestImpossibleValues(InjectionFixture):
         self.assertEqual(snap["fault_status"] & rp.FAULT_STALE_FEEDBACK, 0)
         self.assertGreater(snap["steer_fb"], rp.CMD_MAX)
         self.assertStillDriving(snap, "an impossible steering value stopped the rover")
+        self.assertStatus(snap, rp.SAFETY_STATUS_DEGRADED, "an impossible steering value")
 
 
 class TestDelayedFeedback(InjectionFixture):
@@ -131,6 +143,7 @@ class TestDelayedFeedback(InjectionFixture):
         self.assertEqual(snap["fault_status"] & rp.FAULT_ENCODER_FAULT, 0)
         self.assertEqual(snap["fault_status"] & rp.FAULT_STEERING_FAULT, 0)
         self.assertStillDriving(snap, "delayed feedback stopped the rover")
+        self.assertStatus(snap, rp.SAFETY_STATUS_DEGRADED, "delayed feedback")
 
     def test_a_delayed_channel_is_the_delay_asked_for(self):
         delayed = self.snapshot_with("delayed")
